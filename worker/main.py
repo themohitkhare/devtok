@@ -227,7 +227,7 @@ from generate_mock_content import (
 
 # --- Config ---
 SPACETIMEDB_BASE = "http://localhost:3000"
-MODULE_NAME = "synapse"
+MODULE_NAME = "synapse-backend-g9cee"
 INITIAL_AGENTS = [
     {"name": "Frontend UI Agent", "specialty": "React/TypeScript/CSS", "avatar_seed": "frontend-001"},
     {"name": "DB Migration Agent", "specialty": "PostgreSQL/Schema", "avatar_seed": "db-002"},
@@ -258,7 +258,6 @@ class SpacetimeDBClient:
                 base_url=self.base_url,
                 timeout=30.0,
                 headers={
-                    "Authorization": "Bearer ",
                     "Content-Type": "application/json",
                 },
             )
@@ -311,23 +310,18 @@ def insert_action_card(
     visual_type: str,
     content: str,
     task_summary: str,
-    status: str = "running",
     project_id: int = 1,
     priority: int = 0,
 ) -> None:
-    """Call insert_action_card reducer. Timestamps can be set by the module."""
-    now_ms = int(time.time() * 1000)
+    """Call insert_action_card(agent_id, project_id, visual_type, content, task_summary, priority)."""
     client.call_reducer(
         "insert_action_card",
         agent_id,
-        status,
+        project_id,
         visual_type,
         content,
         task_summary,
-        project_id,
         priority,
-        now_ms,
-        now_ms,
     )
 
 
@@ -338,15 +332,12 @@ def insert_concurrent_task(
     status: str = "running",
     color: str = "#0ea5e9",
 ) -> int | None:
-    """Call insert_concurrent_task; return new task id if present in response."""
-    now_ms = int(time.time() * 1000)
+    """Call insert_concurrent_task(agent_id, task_type, status) — color+timestamp set by module."""
     out = client.call_reducer(
         "insert_concurrent_task",
         agent_id,
         task_type,
         status,
-        color,
-        now_ms,
     )
     if isinstance(out, dict) and "id" in out:
         return int(out["id"])
@@ -372,13 +363,12 @@ def run_loop(client: SpacetimeDBClient, agent_ids: list[int], running_task_ids: 
         content = random.choice(MOCK_TERMINAL_OUTPUTS)
     summaries = MOCK_TASK_SUMMARIES.get(visual_type, MOCK_TASK_SUMMARIES["CodeDiff"])
     task_summary = random.choice(summaries)
-    status = random.choice(["running", "thinking", "success"])
     try:
         insert_action_card(
             client, agent_id, visual_type, content, task_summary,
-            status=status, project_id=1, priority=random.randint(0, 2),
+            project_id=1, priority=random.randint(0, 2),
         )
-        print(f"[insert_action_card] agent_id={agent_id} visual_type={visual_type} status={status} summary={task_summary!r}")
+        print(f"[insert_action_card] agent_id={agent_id} visual_type={visual_type} summary={task_summary!r}")
     except SpacetimeDBError as e:
         print(f"[insert_action_card] ERROR: {e}", file=sys.stderr)
 

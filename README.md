@@ -59,13 +59,24 @@ npm run dev
 
 ### 2. Start SpacetimeDB (for live data)
 ```bash
-# Install spacetime CLI (already done if backend was set up)
+# Start the local server (keep this terminal open)
 spacetime start
 
-# In another terminal, publish the module:
+# In another terminal — ensure rustup cargo is in PATH, then publish:
+export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$PATH"
 cd backend/synapse-backend
-spacetime publish synapse --server local
+spacetime publish synapse-backend-g9cee --server local
+
+# Seed demo data (3 agents + 5 action cards):
+curl -X POST http://localhost:3000/v1/database/synapse-backend-g9cee/call/seed_demo_data \
+  -H "Content-Type: application/json" -d '[]'
+
+# Verify — should return 3 agents:
+curl -X POST http://localhost:3000/v1/database/synapse-backend-g9cee/sql \
+  -H "Content-Type: text/plain" -d 'SELECT * FROM agent'
 ```
+
+> **PATH note:** `spacetime publish` calls `cargo` internally. If it errors with `wasm32-unknown-unknown not installed`, add rustup's bin to PATH: `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"`
 
 ### 3. Run the mock agent worker
 ```bash
