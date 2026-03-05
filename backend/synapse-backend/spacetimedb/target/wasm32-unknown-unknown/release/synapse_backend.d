@@ -1,0 +1,1 @@
+/Users/mkhare/Development/devtok/backend/synapse-backend/spacetimedb/target/wasm32-unknown-unknown/release/synapse_backend.wasm: /Users/mkhare/Development/devtok/backend/synapse-backend/spacetimedb/src/lib.rs
