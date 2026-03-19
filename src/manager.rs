@@ -54,7 +54,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config) -> Result<()> {
         for ticket in review_tickets {
             {
                 let guard = db.lock().unwrap();
-                guard.update_ticket(&ticket.id, "completed", Some("Auto-reviewed by manager"), None)?;
+                guard.update_ticket(&ticket.id, "completed", Some("Auto-reviewed by manager"), None, None)?;
                 guard.log_event(
                     Some("mgr"),
                     "ticket_reviewed",
@@ -135,7 +135,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config) -> Result<()> {
 
                 {
                     let guard = db.lock().unwrap();
-                    guard.update_ticket(&ticket_id, "completed", None, None)?;
+                    guard.update_ticket(&ticket_id, "completed", None, None, None)?;
                     guard.log_event(
                         Some(&msg.sender),
                         "ticket_completed",
@@ -178,9 +178,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config) -> Result<()> {
                     // Reset to pending, clear assignee and blocked_by
                     {
                         let guard = db.lock().unwrap();
-                        // update_ticket only sets status/notes/blocked_by; we also need
-                        // to clear assignee. Use the underlying update with blocked_by=None.
-                        guard.update_ticket(&ticket.id, "pending", None, Some(""))?;
+                        guard.update_ticket(&ticket.id, "pending", None, None, Some(None))?;
                         guard.log_event(
                             Some("mgr"),
                             "ticket_unblocked",
