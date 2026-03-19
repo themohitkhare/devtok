@@ -1,24 +1,24 @@
-pub mod ticket;
-pub mod kb;
+pub mod acs_dir;
+pub mod approve;
+pub mod check;
+pub mod cleanup;
+pub mod cost;
+pub mod evolve;
+pub mod health;
 pub mod inbox;
 pub mod init;
-pub mod plan;
-pub mod run;
-pub mod cleanup;
-pub mod status;
+pub mod kb;
 pub mod log;
-pub mod restart;
-pub mod acs_dir;
-pub mod evolve;
-pub mod report;
-pub mod cost;
 pub mod milestone;
-pub mod check;
-pub mod approve;
-pub mod reject;
+pub mod plan;
 pub mod quality;
+pub mod reject;
+pub mod report;
+pub mod restart;
+pub mod run;
+pub mod status;
 pub mod status_live;
-pub mod health;
+pub mod ticket;
 
 use clap::{Parser, Subcommand};
 
@@ -115,6 +115,9 @@ pub enum Commands {
         /// Filter events by worker/agent id (e.g. w-8, mgr)
         #[arg(long)]
         worker: Option<String>,
+        /// Additional filter key=value (supported: worker, ticket). Repeatable.
+        #[arg(long = "filter")]
+        filters: Vec<String>,
     },
     /// Manage tickets
     #[command(subcommand)]

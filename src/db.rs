@@ -126,7 +126,7 @@ impl Db {
             "ALTER TABLE events ADD COLUMN input_tokens INTEGER DEFAULT 0;
              ALTER TABLE events ADD COLUMN output_tokens INTEGER DEFAULT 0;
              ALTER TABLE events ADD COLUMN ticket_id TEXT;
-             ALTER TABLE events ADD COLUMN model TEXT;"
+             ALTER TABLE events ADD COLUMN model TEXT;",
         );
 
         Ok(())
@@ -134,7 +134,13 @@ impl Db {
 
     // --- Tickets ---
 
-    pub fn create_ticket(&self, title: &str, desc: &str, domain: &str, priority: i32) -> Result<String> {
+    pub fn create_ticket(
+        &self,
+        title: &str,
+        desc: &str,
+        domain: &str,
+        priority: i32,
+    ) -> Result<String> {
         let now = Utc::now().to_rfc3339();
         let id: String = self.conn.query_row(
             "UPDATE counters SET value = value + 1 WHERE name = 'ticket_id' RETURNING value",
@@ -157,14 +163,23 @@ impl Db {
             "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at
              FROM tickets WHERE id = ?1"
         )?;
-        let ticket = stmt.query_row(params![id], |row| {
-            Ok(Ticket {
-                id: row.get(0)?, title: row.get(1)?, description: row.get(2)?,
-                domain: row.get(3)?, priority: row.get(4)?, status: row.get(5)?,
-                assignee: row.get(6)?, blocked_by: row.get(7)?, notes: row.get(8)?,
-                created_at: row.get(9)?, updated_at: row.get(10)?,
+        let ticket = stmt
+            .query_row(params![id], |row| {
+                Ok(Ticket {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    description: row.get(2)?,
+                    domain: row.get(3)?,
+                    priority: row.get(4)?,
+                    status: row.get(5)?,
+                    assignee: row.get(6)?,
+                    blocked_by: row.get(7)?,
+                    notes: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                })
             })
-        }).optional()?;
+            .optional()?;
         Ok(ticket)
     }
 
@@ -229,17 +244,26 @@ impl Db {
     }
 
     pub fn count_by_status(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare("SELECT status, COUNT(*) FROM tickets GROUP BY status")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT status, COUNT(*) FROM tickets GROUP BY status")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
     fn row_to_ticket(row: &rusqlite::Row) -> rusqlite::Result<Ticket> {
         Ok(Ticket {
-            id: row.get(0)?, title: row.get(1)?, description: row.get(2)?,
-            domain: row.get(3)?, priority: row.get(4)?, status: row.get(5)?,
-            assignee: row.get(6)?, blocked_by: row.get(7)?, notes: row.get(8)?,
-            created_at: row.get(9)?, updated_at: row.get(10)?,
+            id: row.get(0)?,
+            title: row.get(1)?,
+            description: row.get(2)?,
+            domain: row.get(3)?,
+            priority: row.get(4)?,
+            status: row.get(5)?,
+            assignee: row.get(6)?,
+            blocked_by: row.get(7)?,
+            notes: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
         })
     }
 
@@ -249,13 +273,12 @@ impl Db {
     /// filter stop words and short tokens.
     pub fn extract_keywords(text: &str) -> std::collections::HashSet<String> {
         const STOP_WORDS: &[&str] = &[
-            "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
-            "of", "with", "by", "from", "is", "it", "as", "be", "was", "are",
-            "that", "this", "not", "can", "will", "has", "have", "had", "do",
-            "does", "did", "should", "would", "could", "may", "might", "shall",
-            "its", "into", "than", "then", "also", "just", "so", "if", "when",
-            "use", "using", "via", "e.g", "etc", "new", "all", "each", "any",
-            "about", "over", "after", "before", "between", "through", "during",
+            "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with",
+            "by", "from", "is", "it", "as", "be", "was", "are", "that", "this", "not", "can",
+            "will", "has", "have", "had", "do", "does", "did", "should", "would", "could", "may",
+            "might", "shall", "its", "into", "than", "then", "also", "just", "so", "if", "when",
+            "use", "using", "via", "e.g", "etc", "new", "all", "each", "any", "about", "over",
+            "after", "before", "between", "through", "during",
         ];
         text.to_lowercase()
             .split(|c: char| !c.is_alphanumeric())
@@ -265,11 +288,16 @@ impl Db {
     }
 
     /// Store keywords for a ticket.
-    pub fn store_ticket_keywords(&self, ticket_id: &str, title: &str, description: &str) -> Result<()> {
+    pub fn store_ticket_keywords(
+        &self,
+        ticket_id: &str,
+        title: &str,
+        description: &str,
+    ) -> Result<()> {
         let mut keywords = Self::extract_keywords(title);
         keywords.extend(Self::extract_keywords(description));
         let mut stmt = self.conn.prepare(
-            "INSERT OR IGNORE INTO ticket_keywords (ticket_id, keyword) VALUES (?1, ?2)"
+            "INSERT OR IGNORE INTO ticket_keywords (ticket_id, keyword) VALUES (?1, ?2)",
         )?;
         for kw in &keywords {
             stmt.execute(params![ticket_id, kw])?;
@@ -279,18 +307,26 @@ impl Db {
 
     /// Find tickets that share keywords with the given text and compute Jaccard similarity.
     /// Returns vec of (ticket_id, title, similarity_score) sorted by score descending.
-    pub fn find_similar_tickets(&self, title: &str, description: &str) -> Result<Vec<(String, String, f64)>> {
+    pub fn find_similar_tickets(
+        &self,
+        title: &str,
+        description: &str,
+    ) -> Result<Vec<(String, String, f64)>> {
         let input_keywords = Self::extract_keywords(title);
         let input_desc_keywords = Self::extract_keywords(description);
-        let all_input: std::collections::HashSet<String> =
-            input_keywords.union(&input_desc_keywords).cloned().collect();
+        let all_input: std::collections::HashSet<String> = input_keywords
+            .union(&input_desc_keywords)
+            .cloned()
+            .collect();
 
         if all_input.is_empty() {
             return Ok(vec![]);
         }
 
         // Find candidate ticket IDs that share at least one keyword
-        let placeholders: Vec<String> = (0..all_input.len()).map(|i| format!("?{}", i + 1)).collect();
+        let placeholders: Vec<String> = (0..all_input.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
         let sql = format!(
             "SELECT DISTINCT ticket_id FROM ticket_keywords WHERE keyword IN ({})",
             placeholders.join(", ")
@@ -305,9 +341,9 @@ impl Db {
         let mut results = Vec::new();
         for cid in candidate_ids {
             // Get this candidate's keywords
-            let mut kw_stmt = self.conn.prepare(
-                "SELECT keyword FROM ticket_keywords WHERE ticket_id = ?1"
-            )?;
+            let mut kw_stmt = self
+                .conn
+                .prepare("SELECT keyword FROM ticket_keywords WHERE ticket_id = ?1")?;
             let candidate_keywords: std::collections::HashSet<String> = kw_stmt
                 .query_map(params![cid], |row| row.get(0))?
                 .filter_map(|r| r.ok())
@@ -316,7 +352,11 @@ impl Db {
             // Jaccard similarity
             let intersection = all_input.intersection(&candidate_keywords).count() as f64;
             let union = all_input.union(&candidate_keywords).count() as f64;
-            let similarity = if union > 0.0 { intersection / union } else { 0.0 };
+            let similarity = if union > 0.0 {
+                intersection / union
+            } else {
+                0.0
+            };
 
             if similarity > 0.0 {
                 // Get ticket title
@@ -335,7 +375,13 @@ impl Db {
 
     // --- Inbox ---
 
-    pub fn push_inbox(&self, recipient: &str, msg_type: &str, payload: &str, sender: &str) -> Result<()> {
+    pub fn push_inbox(
+        &self,
+        recipient: &str,
+        msg_type: &str,
+        payload: &str,
+        sender: &str,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO inbox (recipient, msg_type, payload, sender, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -376,21 +422,28 @@ impl Db {
 
     pub fn list_all_knowledge(&self) -> Result<Vec<KnowledgeEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT domain, key, value, version, updated_at FROM knowledge ORDER BY domain, key"
+            "SELECT domain, key, value, version, updated_at FROM knowledge ORDER BY domain, key",
         )?;
-        let rows = stmt.query_map([], |row| Ok(KnowledgeEntry {
-            domain: row.get(0)?, key: row.get(1)?, value: row.get(2)?,
-            version: row.get(3)?, updated_at: row.get(4)?,
-        }))?;
+        let rows = stmt.query_map([], |row| {
+            Ok(KnowledgeEntry {
+                domain: row.get(0)?,
+                key: row.get(1)?,
+                value: row.get(2)?,
+                version: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
     pub fn total_tokens_used(&self) -> Result<i64> {
-        self.conn.query_row(
-            "SELECT COALESCE(SUM(tokens_used), 0) FROM events",
-            [],
-            |row| row.get(0),
-        ).map_err(Into::into)
+        self.conn
+            .query_row(
+                "SELECT COALESCE(SUM(tokens_used), 0) FROM events",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn write_knowledge(&self, domain: &str, key: &str, value: &str) -> Result<()> {
@@ -413,7 +466,13 @@ impl Db {
         Ok(())
     }
 
-    pub fn update_agent(&self, id: &str, status: &str, ticket: Option<&str>, pid: Option<u32>) -> Result<()> {
+    pub fn update_agent(
+        &self,
+        id: &str,
+        status: &str,
+        ticket: Option<&str>,
+        pid: Option<u32>,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
             "UPDATE agents SET status = ?2, current_ticket = ?3, pid = ?4, last_heartbeat = ?5 WHERE id = ?1",
@@ -424,24 +483,37 @@ impl Db {
 
     pub fn list_agents(&self) -> Result<Vec<Agent>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, persona, status, current_ticket, pid, last_heartbeat FROM agents"
+            "SELECT id, role, persona, status, current_ticket, pid, last_heartbeat FROM agents",
         )?;
-        let rows = stmt.query_map([], |row| Ok(Agent {
-            id: row.get(0)?, role: row.get(1)?, persona: row.get(2)?,
-            status: row.get(3)?, current_ticket: row.get(4)?,
-            pid: row.get(5)?, last_heartbeat: row.get(6)?,
-        }))?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Agent {
+                id: row.get(0)?,
+                role: row.get(1)?,
+                persona: row.get(2)?,
+                status: row.get(3)?,
+                current_ticket: row.get(4)?,
+                pid: row.get(5)?,
+                last_heartbeat: row.get(6)?,
+            })
+        })?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
     pub fn deregister_agent(&self, id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM agents WHERE id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM agents WHERE id = ?1", params![id])?;
         Ok(())
     }
 
     // --- Events ---
 
-    pub fn log_event(&self, agent: Option<&str>, event_type: &str, detail: &str, tokens: Option<i64>) -> Result<()> {
+    pub fn log_event(
+        &self,
+        agent: Option<&str>,
+        event_type: &str,
+        detail: &str,
+        tokens: Option<i64>,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO events (timestamp, agent, event_type, detail, tokens_used, input_tokens, output_tokens) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0)",
@@ -476,12 +548,20 @@ impl Db {
             "SELECT id, timestamp, agent, event_type, detail, tokens_used, input_tokens, output_tokens, ticket_id, model
              FROM events ORDER BY id DESC LIMIT ?1"
         )?;
-        let rows = stmt.query_map(params![limit as i64], |row| Ok(Event {
-            id: row.get(0)?, timestamp: row.get(1)?, agent: row.get(2)?,
-            event_type: row.get(3)?, detail: row.get(4)?, tokens_used: row.get(5)?,
-            input_tokens: row.get(6)?, output_tokens: row.get(7)?,
-            ticket_id: row.get(8)?, model: row.get(9)?,
-        }))?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(Event {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                agent: row.get(2)?,
+                event_type: row.get(3)?,
+                detail: row.get(4)?,
+                tokens_used: row.get(5)?,
+                input_tokens: row.get(6)?,
+                output_tokens: row.get(7)?,
+                ticket_id: row.get(8)?,
+                model: row.get(9)?,
+            })
+        })?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
@@ -493,12 +573,20 @@ impl Db {
              ORDER BY id DESC
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![agent, limit as i64], |row| Ok(Event {
-            id: row.get(0)?, timestamp: row.get(1)?, agent: row.get(2)?,
-            event_type: row.get(3)?, detail: row.get(4)?, tokens_used: row.get(5)?,
-            input_tokens: row.get(6)?, output_tokens: row.get(7)?,
-            ticket_id: row.get(8)?, model: row.get(9)?,
-        }))?;
+        let rows = stmt.query_map(params![agent, limit as i64], |row| {
+            Ok(Event {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                agent: row.get(2)?,
+                event_type: row.get(3)?,
+                detail: row.get(4)?,
+                tokens_used: row.get(5)?,
+                input_tokens: row.get(6)?,
+                output_tokens: row.get(7)?,
+                ticket_id: row.get(8)?,
+                model: row.get(9)?,
+            })
+        })?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
@@ -509,13 +597,44 @@ impl Db {
              FROM events
              WHERE ticket_id IS NOT NULL
              GROUP BY ticket_id
-             ORDER BY ticket_id"
+             ORDER BY ticket_id",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(crate::models::TicketTokenUsage {
                 ticket_id: row.get(0)?,
                 input_tokens: row.get(1)?,
                 output_tokens: row.get(2)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    pub fn recent_events_filtered(
+        &self,
+        worker: Option<&str>,
+        ticket: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, agent, event_type, detail, tokens_used, input_tokens, output_tokens, ticket_id, model
+             FROM events
+             WHERE (?1 IS NULL OR agent = ?1)
+               AND (?2 IS NULL OR ticket_id = ?2)
+             ORDER BY id DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![worker, ticket, limit as i64], |row| {
+            Ok(Event {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                agent: row.get(2)?,
+                event_type: row.get(3)?,
+                detail: row.get(4)?,
+                tokens_used: row.get(5)?,
+                input_tokens: row.get(6)?,
+                output_tokens: row.get(7)?,
+                ticket_id: row.get(8)?,
+                model: row.get(9)?,
             })
         })?;
         rows.map(|r| r.map_err(Into::into)).collect()
@@ -542,7 +661,7 @@ impl Db {
 
     pub fn list_milestones(&self) -> Result<Vec<crate::models::Milestone>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, goal, status, created_at, updated_at FROM milestones ORDER BY id"
+            "SELECT id, name, goal, status, created_at, updated_at FROM milestones ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(crate::models::Milestone {
@@ -555,9 +674,8 @@ impl Db {
                 tickets: vec![],
             })
         })?;
-        let mut milestones: Vec<crate::models::Milestone> = rows
-            .map(|r| r.map_err(Into::into))
-            .collect::<Result<_>>()?;
+        let mut milestones: Vec<crate::models::Milestone> =
+            rows.map(|r| r.map_err(Into::into)).collect::<Result<_>>()?;
         // Populate tickets for each milestone
         for ms in &mut milestones {
             ms.tickets = self.get_milestone_ticket_ids(ms.id)?;
@@ -567,19 +685,21 @@ impl Db {
 
     pub fn get_milestone(&self, id: i64) -> Result<Option<crate::models::Milestone>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, goal, status, created_at, updated_at FROM milestones WHERE id = ?1"
+            "SELECT id, name, goal, status, created_at, updated_at FROM milestones WHERE id = ?1",
         )?;
-        let ms = stmt.query_row(params![id], |row| {
-            Ok(crate::models::Milestone {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                goal: row.get(2)?,
-                status: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                tickets: vec![],
+        let ms = stmt
+            .query_row(params![id], |row| {
+                Ok(crate::models::Milestone {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    goal: row.get(2)?,
+                    status: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                    tickets: vec![],
+                })
             })
-        }).optional()?;
+            .optional()?;
         if let Some(mut ms) = ms {
             ms.tickets = self.get_milestone_ticket_ids(ms.id)?;
             return Ok(Some(ms));
@@ -591,17 +711,19 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, goal, status, created_at, updated_at FROM milestones WHERE status = 'active' ORDER BY id LIMIT 1"
         )?;
-        let ms = stmt.query_row([], |row| {
-            Ok(crate::models::Milestone {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                goal: row.get(2)?,
-                status: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                tickets: vec![],
+        let ms = stmt
+            .query_row([], |row| {
+                Ok(crate::models::Milestone {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    goal: row.get(2)?,
+                    status: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                    tickets: vec![],
+                })
             })
-        }).optional()?;
+            .optional()?;
         if let Some(mut ms) = ms {
             ms.tickets = self.get_milestone_ticket_ids(ms.id)?;
             return Ok(Some(ms));
@@ -613,17 +735,19 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, goal, status, created_at, updated_at FROM milestones WHERE status = 'awaiting_approval' ORDER BY id LIMIT 1"
         )?;
-        let ms = stmt.query_row([], |row| {
-            Ok(crate::models::Milestone {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                goal: row.get(2)?,
-                status: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                tickets: vec![],
+        let ms = stmt
+            .query_row([], |row| {
+                Ok(crate::models::Milestone {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    goal: row.get(2)?,
+                    status: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                    tickets: vec![],
+                })
             })
-        }).optional()?;
+            .optional()?;
         if let Some(mut ms) = ms {
             ms.tickets = self.get_milestone_ticket_ids(ms.id)?;
             return Ok(Some(ms));
@@ -644,20 +768,26 @@ impl Db {
     /// Returns the activated milestone id, or None if already have an active one.
     pub fn activate_first_pending_milestone(&self) -> Result<Option<i64>> {
         // If there's already an active milestone, do nothing
-        let active: Option<i64> = self.conn.query_row(
-            "SELECT id FROM milestones WHERE status = 'active' LIMIT 1",
-            [],
-            |row| row.get(0),
-        ).optional()?;
+        let active: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM milestones WHERE status = 'active' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
         if active.is_some() {
             return Ok(None);
         }
         // Activate the lowest-id pending milestone
-        let next: Option<i64> = self.conn.query_row(
-            "SELECT id FROM milestones WHERE status = 'pending' ORDER BY id LIMIT 1",
-            [],
-            |row| row.get(0),
-        ).optional()?;
+        let next: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM milestones WHERE status = 'pending' ORDER BY id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
         if let Some(next_id) = next {
             self.update_milestone_status(next_id, "active")?;
             return Ok(Some(next_id));
@@ -690,7 +820,7 @@ impl Db {
 
     pub fn get_milestone_ticket_ids(&self, milestone_id: i64) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT ticket_id FROM milestone_tickets WHERE milestone_id = ?1 ORDER BY ticket_id"
+            "SELECT ticket_id FROM milestone_tickets WHERE milestone_id = ?1 ORDER BY ticket_id",
         )?;
         let rows = stmt.query_map(params![milestone_id], |row| row.get(0))?;
         rows.map(|r| r.map_err(Into::into)).collect()
@@ -720,16 +850,18 @@ impl Db {
 
     /// Check whether any milestones exist in the DB.
     pub fn has_milestones(&self) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM milestones",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM milestones", [], |row| row.get(0))?;
         Ok(count > 0)
     }
 
     /// Claim the next pending ticket within a specific milestone for an agent.
-    pub fn claim_next_milestone_ticket(&self, agent_id: &str, milestone_id: i64) -> Result<Option<Ticket>> {
+    pub fn claim_next_milestone_ticket(
+        &self,
+        agent_id: &str,
+        milestone_id: i64,
+    ) -> Result<Option<Ticket>> {
         let now = Utc::now().to_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
         let ticket: Option<Ticket> = tx.query_row(
