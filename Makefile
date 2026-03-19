@@ -3,7 +3,7 @@
 # Self-evolve dev loop:
 #   1. Run `make install` to build and install the acs binary
 #   2. Run `acs init --auto` to bootstrap ticket backlog from the repo
-#   3. Run `make evolve` to start the self-evolve loop (manager + workers)
+#   3. Run `make evolve` to start the self-evolve loop (bounded manager + workers)
 #      Workers pick up tickets, execute them in isolated git worktrees, and
 #      commit changes to feature branches. The manager reviews and merges.
 #   4. Run `make status` at any time to check ticket progress
@@ -110,5 +110,5 @@ help:
 	@echo "Self-evolve dev loop:"
 	@echo "  1. make install    # build and install acs"
 	@echo "  2. acs init --auto # bootstrap ticket backlog"
-	@echo "  3. make evolve     # start manager + workers"
+	@echo "  3. make evolve     # start bounded manager + workers"
 	@echo "  4. make status     # monitor progress"
