@@ -11,6 +11,10 @@ pub mod acs_dir;
 pub mod evolve;
 pub mod report;
 pub mod cost;
+pub mod milestone;
+pub mod check;
+pub mod approve;
+pub mod reject;
 
 use clap::{Parser, Subcommand};
 
@@ -100,4 +104,16 @@ pub enum Commands {
     Report,
     /// Show token usage and estimated cost breakdown
     Cost,
+    /// Manage milestones
+    #[command(subcommand)]
+    Milestone(milestone::MilestoneCommands),
+    /// Show milestones awaiting CEO approval
+    Check,
+    /// Approve the current awaiting-approval milestone
+    Approve,
+    /// Reject the current awaiting-approval milestone with a reason
+    Reject {
+        #[arg(long)]
+        reason: String,
+    },
 }

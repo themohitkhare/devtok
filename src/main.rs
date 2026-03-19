@@ -52,6 +52,10 @@ fn main() -> ExitCode {
         cli::Commands::Log { follow, limit } => cli::log::execute(follow, limit),
         cli::Commands::Report => cli::report::execute(),
         cli::Commands::Cost => cli::cost::execute(),
+        cli::Commands::Milestone(cmd) => cli::milestone::execute(cmd),
+        cli::Commands::Check => cli::check::execute(),
+        cli::Commands::Approve => cli::approve::execute(),
+        cli::Commands::Reject { reason } => cli::reject::execute(reason),
     };
 
     match result {

@@ -4,41 +4,173 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// A named backend definition with a command template.
+/// A named backend definition — either a simple whitespace-split command
+/// string (legacy) or a structured `command` + `args` list (new-style).
 ///
-/// The `command` field is a whitespace-split command template where `{prompt}`
-/// and `{system_prompt}` are expanded at spawn time. Example:
-///
+/// **New-style** (preferred — handles prompts with spaces correctly):
 /// ```toml
-/// [backends.my-claude]
-/// command = "claude -p {prompt} --append-system-prompt {system_prompt} --dangerously-skip-permissions --output-format json"
+/// [backends.claude]
+/// command = "claude"
+/// args = ["-p", "{prompt}", "--append-system-prompt", "{system_prompt}",
+///         "--dangerously-skip-permissions", "--output-format", "json"]
+/// cwd_in_worktree = true
+/// output_format = "json"
 /// ```
+///
+/// **Legacy** (whitespace-split, kept for backward compat):
+/// ```toml
+/// [backends.my-tool]
+/// command = "mytool --task {prompt} --sys {system_prompt}"
+/// ```
+///
+/// Placeholders recognised: `{prompt}`, `{system_prompt}`, `{model}`.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct BackendTemplate {
-    /// Command template. Whitespace-tokenised; `{prompt}` and `{system_prompt}`
-    /// tokens are replaced with the actual values before spawning.
+    /// Executable name or absolute path. In legacy mode this is the full
+    /// whitespace-split command; in new-style mode only the binary name.
     pub command: String,
+    /// Argument list (new-style). Each element may contain `{prompt}`,
+    /// `{system_prompt}`, or `{model}` placeholders.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Set the child process working directory to the ticket worktree.
+    /// Defaults to `true`.
+    #[serde(default = "default_cwd_in_worktree")]
+    pub cwd_in_worktree: bool,
+    /// Output format hint: `"json"` for Claude-style JSONL, `"text"` otherwise.
+    #[serde(default = "default_output_format")]
+    pub output_format: String,
 }
 
 impl BackendTemplate {
-    /// Expand `{prompt}` and `{system_prompt}` in the command template and
-    /// return `(program, args)` ready to pass to `std::process::Command`.
+    /// Return `(program, expanded_args)` ready for `std::process::Command`.
     ///
-    /// Returns `None` when the command template is empty.
+    /// * If `args` is non-empty, uses `command` as the program and expands
+    ///   each arg (new-style, handles spaces in prompts correctly).
+    /// * If `args` is empty, whitespace-splits `command` and expands tokens
+    ///   (legacy mode).
+    ///
+    /// Returns `None` when `command` is empty/blank.
     pub fn expand(&self, prompt: &str, system_prompt: &str) -> Option<(String, Vec<String>)> {
-        let tokens: Vec<String> = self
-            .command
-            .split_whitespace()
-            .map(|tok| match tok {
-                "{prompt}" => prompt.to_string(),
-                "{system_prompt}" => system_prompt.to_string(),
-                other => other.to_string(),
-            })
-            .collect();
+        self.expand_with_model(prompt, system_prompt, None)
+    }
 
-        let mut it = tokens.into_iter();
-        let program = it.next()?;
-        Some((program, it.collect()))
+    /// Like [`expand`] but also substitutes `{model}`.
+    pub fn expand_with_model(
+        &self,
+        prompt: &str,
+        system_prompt: &str,
+        model: Option<&str>,
+    ) -> Option<(String, Vec<String>)> {
+        let command = self.command.trim().to_string();
+        if command.is_empty() {
+            return None;
+        }
+
+        if self.args.is_empty() {
+            // Legacy: whitespace-split the command string
+            let model_s = model.unwrap_or("");
+            let tokens: Vec<String> = command
+                .split_whitespace()
+                .map(|tok| match tok {
+                    "{prompt}" => prompt.to_string(),
+                    "{system_prompt}" => system_prompt.to_string(),
+                    "{model}" => model_s.to_string(),
+                    other => other.to_string(),
+                })
+                .collect();
+            let mut it = tokens.into_iter();
+            let program = it.next()?;
+            Some((program, it.collect()))
+        } else {
+            // New-style: command is the binary, args are expanded separately
+            let model_s = model.unwrap_or("");
+            let expanded = self
+                .args
+                .iter()
+                .map(|a| {
+                    a.replace("{prompt}", prompt)
+                        .replace("{system_prompt}", system_prompt)
+                        .replace("{model}", model_s)
+                })
+                .collect();
+            Some((command, expanded))
+        }
+    }
+}
+
+fn default_cwd_in_worktree() -> bool { true }
+fn default_output_format() -> String { "text".into() }
+
+/// Top-level `[backends]` configuration section.
+///
+/// ```toml
+/// [backends]
+/// default = "claude"
+///
+/// [backends.claude]
+/// command = "claude"
+/// args = ["-p", "{prompt}", "--append-system-prompt", "{system_prompt}",
+///         "--dangerously-skip-permissions", "--output-format", "json"]
+/// cwd_in_worktree = true
+///
+/// [backends.cursor]
+/// command = "agent"
+/// args = ["{prompt}"]
+/// cwd_in_worktree = true
+///
+/// [backends.custom]
+/// command = "/path/to/my-agent"
+/// args = ["--task", "{prompt}", "--context", "{system_prompt}"]
+/// cwd_in_worktree = true
+/// ```
+#[derive(Debug, Clone)]
+pub struct BackendsConfig {
+    /// Default backend name (used when `--backend` is not specified and no
+    /// domain mapping applies). Defaults to `"claude"`.
+    pub default: String,
+    /// Named backend definitions. Keys match the `--backend` flag value.
+    pub definitions: HashMap<String, BackendTemplate>,
+}
+
+impl Default for BackendsConfig {
+    fn default() -> Self {
+        Self { default: "claude".into(), definitions: HashMap::new() }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BackendsConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as DeError;
+
+        // Deserialise as a raw TOML value map so we can handle the mixed
+        // structure: a scalar "default" key alongside sub-tables for each
+        // backend definition.
+        let raw: HashMap<String, toml::Value> = HashMap::deserialize(deserializer)?;
+
+        let default = raw
+            .get("default")
+            .and_then(|v| v.as_str())
+            .unwrap_or("claude")
+            .to_string();
+
+        let mut definitions = HashMap::new();
+        for (k, v) in &raw {
+            if k == "default" {
+                continue;
+            }
+            // Each backend value must be a TOML table
+            let bt: BackendTemplate = v
+                .clone()
+                .try_into()
+                .map_err(|e| DeError::custom(format!("backend '{}': {}", k, e)))?;
+            definitions.insert(k.clone(), bt);
+        }
+
+        Ok(BackendsConfig { default, definitions })
     }
 }
 
@@ -51,10 +183,10 @@ pub struct Config {
     pub personas: PersonaConfig,
     #[serde(default)]
     pub agents: AgentConfig,
-    /// Named backend definitions with command templates.
-    /// Keys are backend names; values define the command template to run.
+    /// Structured backend configuration (new-style `[backends]` section).
+    /// When present, overrides `[agents]` per-path fields for provider selection.
     #[serde(default)]
-    pub backends: HashMap<String, BackendTemplate>,
+    pub backends: BackendsConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -78,6 +210,12 @@ pub struct ManagerConfig {
 pub struct PersonaConfig {
     #[serde(default = "default_persona_mapping")]
     pub mapping: HashMap<String, String>,
+    /// Optional domain → backend mapping.
+    /// Example: `{ frontend = "cursor", backend = "claude" }`
+    /// Workers handling a ticket in a mapped domain will use the specified
+    /// backend instead of the global default.
+    #[serde(default)]
+    pub domain_backends: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -122,9 +260,13 @@ fn default_persona_mapping() -> HashMap<String, String> {
     m.insert("backend".into(), "backend-dev".into());
     m.insert("devops".into(), "devops".into());
     m.insert("qa".into(), "qa".into());
+    m.insert("qa-lead".into(), "qa-lead".into());
     m.insert("infra".into(), "devops".into());
     m.insert("core".into(), "tech-lead".into());
     m.insert("general".into(), "backend-dev".into());
+    // New specialist personas
+    m.insert("pm".into(), "pm".into());
+    m.insert("management".into(), "senior-manager".into());
     m
 }
 
@@ -136,7 +278,7 @@ impl Default for ManagerConfig {
 
 impl Default for PersonaConfig {
     fn default() -> Self {
-        Self { mapping: default_persona_mapping() }
+        Self { mapping: default_persona_mapping(), domain_backends: HashMap::new() }
     }
 }
 
@@ -167,7 +309,7 @@ impl Config {
             manager: ManagerConfig::default(),
             personas: PersonaConfig::default(),
             agents: AgentConfig::default(),
-            backends: HashMap::new(),
+            backends: BackendsConfig::default(),
         }
     }
 
@@ -248,10 +390,10 @@ claude_path = "{}"
         }
 
         // Serialize [backends.*] sections
-        let mut backend_names: Vec<&String> = self.backends.keys().collect();
+        let mut backend_names: Vec<&String> = self.backends.definitions.keys().collect();
         backend_names.sort(); // deterministic output
         for name in backend_names {
-            let tpl = &self.backends[name];
+            let tpl = &self.backends.definitions[name];
             if !tpl.command.is_empty() {
                 out.push_str(&format!(
                     "\n\n[backends.{}]\ncommand = \"{}\"",
@@ -301,6 +443,14 @@ mod tests {
         let cfg = Config::default_for("test");
         assert_eq!(cfg.persona_for_domain("nonexistent"), "backend-dev");
         assert_eq!(cfg.persona_for_domain(""), "backend-dev");
+    }
+
+    #[test]
+    fn persona_for_domain_returns_new_specialist_mappings() {
+        let cfg = Config::default_for("test");
+        assert_eq!(cfg.persona_for_domain("pm"), "pm");
+        assert_eq!(cfg.persona_for_domain("management"), "senior-manager");
+        assert_eq!(cfg.persona_for_domain("qa-lead"), "qa-lead");
     }
 
     #[test]
@@ -379,5 +529,102 @@ name = "minimal"
 
         let result = Config::load(tmp.path());
         assert!(result.is_err());
+    }
+
+    // ── BackendTemplate::expand ──────────────────────────────────────
+
+    #[test]
+    fn backend_template_expand_basic() {
+        let t = BackendTemplate {
+            command: "mytool --task {prompt} --ctx {system_prompt}".to_string(),
+            ..Default::default()
+        };
+        let (prog, args) = t.expand("do the thing", "you are an AI").unwrap();
+        assert_eq!(prog, "mytool");
+        assert_eq!(args, vec!["--task", "do the thing", "--ctx", "you are an AI"]);
+    }
+
+    #[test]
+    fn backend_template_expand_prompt_with_spaces() {
+        let t = BackendTemplate {
+            command: "echo {prompt}".to_string(),
+            ..Default::default()
+        };
+        // The full prompt string (including spaces) replaces the {prompt} token as one arg.
+        let (prog, args) = t.expand("hello world foo", "sys").unwrap();
+        assert_eq!(prog, "echo");
+        assert_eq!(args, vec!["hello world foo"]);
+    }
+
+    #[test]
+    fn backend_template_expand_no_placeholders() {
+        let t = BackendTemplate {
+            command: "echo static".to_string(),
+            ..Default::default()
+        };
+        let (prog, args) = t.expand("unused", "unused").unwrap();
+        assert_eq!(prog, "echo");
+        assert_eq!(args, vec!["static"]);
+    }
+
+    #[test]
+    fn backend_template_expand_empty_returns_none() {
+        let t = BackendTemplate { command: "".to_string(), ..Default::default() };
+        assert!(t.expand("p", "s").is_none());
+    }
+
+    // ── [backends] config round-trip ────────────────────────────────
+
+    #[test]
+    fn backends_round_trip_via_toml() {
+        let toml_content = r#"
+[project]
+name = "backend-test"
+
+[backends.my-claude]
+command = "claude -p {prompt} --append-system-prompt {system_prompt}"
+
+[backends.custom]
+command = "/usr/local/bin/myai --task {prompt}"
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "{}", toml_content).unwrap();
+        let cfg = Config::load(tmp.path()).expect("should parse");
+
+        assert_eq!(cfg.backends.definitions.len(), 2);
+        assert!(cfg.backends.definitions.contains_key("my-claude"));
+        assert!(cfg.backends.definitions.contains_key("custom"));
+
+        let mc = &cfg.backends.definitions["my-claude"];
+        assert!(mc.command.contains("{prompt}"));
+        assert!(mc.command.contains("{system_prompt}"));
+
+        let cu = &cfg.backends.definitions["custom"];
+        assert!(cu.command.contains("{prompt}"));
+    }
+
+    #[test]
+    fn to_toml_serializes_backends() {
+        let mut cfg = Config::default_for("proj");
+        cfg.backends.definitions.insert("my-backend".to_string(), BackendTemplate {
+            command: "mytool {prompt} {system_prompt}".to_string(),
+            ..Default::default()
+        });
+        let toml_str = cfg.to_toml();
+        assert!(toml_str.contains("[backends.my-backend]"), "missing backends section");
+        assert!(toml_str.contains("command = \"mytool {prompt} {system_prompt}\""), "missing command");
+
+        // Should round-trip
+        let reparsed: Config = toml::from_str(&toml_str).expect("should parse generated TOML");
+        assert_eq!(reparsed.backends.definitions["my-backend"].command, "mytool {prompt} {system_prompt}");
+    }
+
+    #[test]
+    fn config_without_backends_section_defaults_to_empty_map() {
+        let toml_content = "[project]\nname = \"minimal\"\n";
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "{}", toml_content).unwrap();
+        let cfg = Config::load(tmp.path()).expect("should load");
+        assert!(cfg.backends.definitions.is_empty());
     }
 }

@@ -8,6 +8,23 @@ use rand::Rng;
 
 use crate::config::{AgentConfig, BackendTemplate};
 
+/// Abstraction over subprocess spawning so worker logic can be unit-tested
+/// without invoking the real Claude Code binary.
+pub trait SpawnProvider {
+    fn create_worktree(&self, worker_id: &str, ticket_id: &str) -> Result<PathBuf>;
+    fn remove_worktree(&self, worker_id: &str) -> Result<()>;
+    fn spawn_provider(
+        &self,
+        provider: &str,
+        model: Option<&str>,
+        worker_id: &str,
+        worktree: &Path,
+        prompt: &str,
+        system_prompt: &str,
+    ) -> Result<Child>;
+    fn log_path(&self, worker_id: &str) -> PathBuf;
+}
+
 pub struct Spawner {
     project_dir: PathBuf,
     acs_dir: PathBuf,
@@ -101,6 +118,53 @@ impl Spawner {
                 "git worktree add failed for worker '{}' on branch '{}'",
                 worker_id,
                 branch_name
+            );
+        }
+
+        Ok(worktree_path)
+    }
+
+    /// Creates a git worktree at `.acs/worktrees/{reviewer_id}` checking out an
+    /// *existing* branch (no `-b`). Used by the Tech Lead review flow to review
+    /// a worker's branch without creating a new one.
+    pub fn create_review_worktree(&self, reviewer_id: &str, branch: &str) -> Result<PathBuf> {
+        let worktree_path = self.acs_dir.join("worktrees").join(reviewer_id);
+
+        // Ensure parent directory exists
+        if let Some(parent) = worktree_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create worktrees directory: {}", parent.display()))?;
+        }
+
+        // Remove any stale worktree at this path before creating a new one.
+        if worktree_path.exists() {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&worktree_path)
+                .current_dir(&self.project_dir)
+                .status();
+            let _ = std::fs::remove_dir_all(&worktree_path);
+            let _ = Command::new("git")
+                .args(["worktree", "prune"])
+                .current_dir(&self.project_dir)
+                .status();
+        }
+
+        // Checkout the existing branch — no -b flag.
+        let status = Command::new("git")
+            .arg("worktree")
+            .arg("add")
+            .arg(&worktree_path)
+            .arg(branch)
+            .current_dir(&self.project_dir)
+            .status()
+            .with_context(|| format!("Failed to run git worktree add for branch '{}'", branch))?;
+
+        if !status.success() {
+            bail!(
+                "git worktree add failed for reviewer '{}' on branch '{}'",
+                reviewer_id,
+                branch
             );
         }
 
@@ -395,6 +459,29 @@ impl Spawner {
     }
 }
 
+impl SpawnProvider for Spawner {
+    fn create_worktree(&self, worker_id: &str, ticket_id: &str) -> Result<PathBuf> {
+        self.create_worktree(worker_id, ticket_id)
+    }
+    fn remove_worktree(&self, worker_id: &str) -> Result<()> {
+        self.remove_worktree(worker_id)
+    }
+    fn spawn_provider(
+        &self,
+        provider: &str,
+        model: Option<&str>,
+        worker_id: &str,
+        worktree: &Path,
+        prompt: &str,
+        system_prompt: &str,
+    ) -> Result<Child> {
+        self.spawn_provider(provider, model, worker_id, worktree, prompt, system_prompt)
+    }
+    fn log_path(&self, worker_id: &str) -> PathBuf {
+        self.log_path(worker_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,5 +675,90 @@ mod tests {
 
         let result = s.spawn_claude("w-bad", tmp.path(), "hi", "sys");
         assert!(result.is_err(), "should fail when binary does not exist");
+    }
+
+    // ── Custom backend via [backends] config ─────────────────────────
+
+    #[test]
+    fn spawn_provider_uses_custom_backend_when_defined() {
+        use crate::config::BackendTemplate;
+
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+
+        let mut backends = HashMap::new();
+        backends.insert(
+            "my-echo".to_string(),
+            BackendTemplate {
+                // Use `echo` so the process succeeds without a real AI binary.
+                // Template: echo {prompt} {system_prompt}
+                command: "echo {prompt} {system_prompt}".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let s = Spawner::new(project, "claude", "acs").with_backends(backends);
+
+        let mut child = s
+            .spawn_provider("my-echo", None, "w-cust", tmp.path(), "hello prompt", "sys context")
+            .expect("custom backend should spawn");
+        child.wait().unwrap();
+
+        let log = s.log_path("w-cust");
+        assert!(log.exists(), "log file should exist");
+        let content = fs::read_to_string(&log).unwrap();
+        assert!(content.contains("hello prompt"), "log should contain expanded prompt");
+        assert!(content.contains("sys context"), "log should contain expanded system_prompt");
+    }
+
+    #[test]
+    fn spawn_provider_custom_backend_takes_priority_over_builtin_name() {
+        use crate::config::BackendTemplate;
+
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+
+        // Register a custom backend named "claude" — it should override the built-in
+        let mut backends = HashMap::new();
+        backends.insert(
+            "claude".to_string(),
+            BackendTemplate {
+                command: "echo custom-override {prompt}".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let s = Spawner::new(project, "/nonexistent/real-claude", "acs").with_backends(backends);
+
+        // Should use the custom backend (echo), not the nonexistent real claude path.
+        let mut child = s
+            .spawn_provider("claude", None, "w-override", tmp.path(), "my task", "sys")
+            .expect("custom override should use echo, not real claude");
+        child.wait().unwrap();
+
+        let log = s.log_path("w-override");
+        let content = fs::read_to_string(&log).unwrap();
+        assert!(content.contains("custom-override"), "should have used custom template");
+        assert!(content.contains("my task"), "should have expanded the prompt placeholder");
+    }
+
+    #[test]
+    fn spawn_provider_unknown_without_backend_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let s = Spawner::new(tmp.path(), "claude", "acs");
+        let result = s.spawn_provider("totally-unknown", None, "w-unk", tmp.path(), "p", "s");
+        assert!(result.is_err(), "unknown provider with no backend entry should fail");
+    }
+
+    #[test]
+    fn with_backends_sets_backends_map() {
+        use crate::config::BackendTemplate;
+
+        let tmp = TempDir::new().unwrap();
+        let mut backends = HashMap::new();
+        backends.insert("foo".to_string(), BackendTemplate { command: "foo {prompt}".to_string(), ..Default::default() });
+
+        let s = Spawner::new(tmp.path(), "claude", "acs").with_backends(backends);
+        assert!(s.backends.contains_key("foo"));
     }
 }
