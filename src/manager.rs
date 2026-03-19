@@ -126,7 +126,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config) -> Result<()> {
 
         match msg_opt {
             None => break,
-            Some(msg) if msg.msg_type == "completion" || msg.msg_type == "ticket_completed" => {
+            Some(msg) if msg.msg_type == "ticket_completed" => {
                 // Payload is expected to be JSON with at least { "ticket_id": "..." }
                 let ticket_id: String = serde_json::from_str::<serde_json::Value>(&msg.payload)
                     .ok()
