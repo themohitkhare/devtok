@@ -7,16 +7,18 @@ use tokio::time::{sleep, Duration};
 use crate::config::Config;
 use crate::db::Db;
 use crate::models::*;
+use crate::spawner::Spawner;
 
 pub async fn run_loop(
     db: Arc<Mutex<Db>>,
     config: &Config,
+    project_dir: std::path::PathBuf,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let cycle = Duration::from_secs(config.manager.cycle_seconds);
 
     loop {
-        if let Err(e) = run_cycle(&db, config) {
+        if let Err(e) = run_cycle(&db, config, &project_dir) {
             eprintln!("[manager] cycle error: {}", e);
         }
 
@@ -36,11 +38,12 @@ pub async fn run_loop(
     }
 }
 
-fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config) -> Result<()> {
+fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path) -> Result<()> {
     let mut assignments = 0usize;
     let mut completions = 0usize;
     let mut unblocked = 0usize;
     let mut reviewed = 0usize;
+    let mut merged = 0usize;
 
     // -----------------------------------------------------------------------
     // 0. Auto-review: promote review_pending → completed (v1 — no code review)
@@ -149,6 +152,69 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config) -> Result<()> {
                     ticket_id, msg.sender
                 );
                 completions += 1;
+
+                // Attempt to merge the worker branch into main
+                let spawner = Spawner::new(project_dir, &config.agents.claude_path, &config.agents.tool_path);
+                match spawner.find_branch_for_ticket(&ticket_id) {
+                    Ok(Some(branch)) => {
+                        match spawner.merge_branch(&branch) {
+                            Ok(true) => {
+                                // Merge succeeded — clean up the branch
+                                spawner.delete_branch(&branch);
+                                {
+                                    let guard = db.lock().unwrap();
+                                    guard.log_event(
+                                        Some("mgr"),
+                                        "branch_merged",
+                                        &format!("merged {} into main for ticket {}", branch, ticket_id),
+                                        None,
+                                    )?;
+                                }
+                                eprintln!("[manager] merged branch {} for ticket {}", branch, ticket_id);
+                                merged += 1;
+                            }
+                            Ok(false) => {
+                                // Merge conflict — block the ticket and re-assign
+                                {
+                                    let guard = db.lock().unwrap();
+                                    guard.update_ticket(
+                                        &ticket_id,
+                                        "blocked",
+                                        Some(&format!("Merge conflict on branch {}", branch)),
+                                        None,
+                                    )?;
+                                    guard.log_event(
+                                        Some("mgr"),
+                                        "merge_conflict",
+                                        &format!("merge conflict for ticket {} on branch {}", ticket_id, branch),
+                                        None,
+                                    )?;
+                                }
+                                eprintln!(
+                                    "[manager] merge conflict for ticket {} on branch {}",
+                                    ticket_id, branch
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[manager] merge error for ticket {}: {}", ticket_id, e);
+                                let guard = db.lock().unwrap();
+                                guard.log_event(
+                                    Some("mgr"),
+                                    "merge_error",
+                                    &format!("merge error for ticket {}: {}", ticket_id, e),
+                                    None,
+                                )?;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // No branch found — nothing to merge (may have been manually merged)
+                        eprintln!("[manager] no branch found for ticket {}, skipping merge", ticket_id);
+                    }
+                    Err(e) => {
+                        eprintln!("[manager] error finding branch for ticket {}: {}", ticket_id, e);
+                    }
+                }
             }
             Some(_) => {
                 // Unknown message type — ignore
@@ -201,8 +267,8 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config) -> Result<()> {
     // 4. Log summary
     // -----------------------------------------------------------------------
     eprintln!(
-        "[manager] cycle complete — assigned: {}, reviewed: {}, completions: {}, unblocked: {}",
-        assignments, reviewed, completions, unblocked
+        "[manager] cycle complete — assigned: {}, reviewed: {}, completions: {}, merged: {}, unblocked: {}",
+        assignments, reviewed, completions, merged, unblocked
     );
 
     Ok(())
