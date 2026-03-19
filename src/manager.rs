@@ -40,6 +40,32 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config) -> Result<()> {
     let mut assignments = 0usize;
     let mut completions = 0usize;
     let mut unblocked = 0usize;
+    let mut reviewed = 0usize;
+
+    // -----------------------------------------------------------------------
+    // 0. Auto-review: promote review_pending → completed (v1 — no code review)
+    // -----------------------------------------------------------------------
+    {
+        let review_tickets = {
+            let guard = db.lock().unwrap();
+            guard.list_tickets(Some("review_pending"))?
+        };
+
+        for ticket in review_tickets {
+            {
+                let guard = db.lock().unwrap();
+                guard.update_ticket(&ticket.id, "completed", Some("Auto-reviewed by manager"), None)?;
+                guard.log_event(
+                    Some("mgr"),
+                    "ticket_reviewed",
+                    &format!("ticket {} auto-reviewed and completed", ticket.id),
+                    None,
+                )?;
+            }
+            eprintln!("[manager] auto-reviewed ticket {} → completed", ticket.id);
+            reviewed += 1;
+        }
+    }
 
     // -----------------------------------------------------------------------
     // 1. Claim and assign tickets to idle workers
@@ -100,7 +126,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config) -> Result<()> {
 
         match msg_opt {
             None => break,
-            Some(msg) if msg.msg_type == "completion" => {
+            Some(msg) if msg.msg_type == "completion" || msg.msg_type == "ticket_completed" => {
                 // Payload is expected to be JSON with at least { "ticket_id": "..." }
                 let ticket_id: String = serde_json::from_str::<serde_json::Value>(&msg.payload)
                     .ok()
@@ -177,8 +203,8 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config) -> Result<()> {
     // 4. Log summary
     // -----------------------------------------------------------------------
     eprintln!(
-        "[manager] cycle complete — assigned: {}, completions: {}, unblocked: {}",
-        assignments, completions, unblocked
+        "[manager] cycle complete — assigned: {}, reviewed: {}, completions: {}, unblocked: {}",
+        assignments, reviewed, completions, unblocked
     );
 
     Ok(())
