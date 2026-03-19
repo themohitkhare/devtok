@@ -1,4 +1,4 @@
-// src/config.rs
+// src/config.rs — MARKER_T017
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -102,6 +102,15 @@ impl BackendTemplate {
 fn default_cwd_in_worktree() -> bool { true }
 fn default_output_format() -> String { "text".into() }
 
+/// Quality / code-review settings loaded from `[quality]` in `acs.toml`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct QualityConfig {
+    /// When `true` the manager spawns a Tech Lead agent to review each
+    /// `review_pending` ticket instead of auto-approving.
+    #[serde(default)]
+    pub code_review: bool,
+}
+
 /// Top-level `[backends]` configuration section.
 ///
 /// ```toml
@@ -187,6 +196,9 @@ pub struct Config {
     /// When present, overrides `[agents]` per-path fields for provider selection.
     #[serde(default)]
     pub backends: BackendsConfig,
+    /// Code-quality / review settings (`[quality]` section).
+    #[serde(default)]
+    pub quality: QualityConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -310,6 +322,7 @@ impl Config {
             personas: PersonaConfig::default(),
             agents: AgentConfig::default(),
             backends: BackendsConfig::default(),
+            quality: QualityConfig::default(),
         }
     }
 
@@ -318,6 +331,11 @@ impl Config {
     }
 
     pub fn to_toml(&self) -> String {
+        fn escape_toml_string(s: &str) -> String {
+            // Minimal TOML-string escaping for our usage (we emit "..." strings).
+            s.replace('\\', "\\\\").replace('"', "\\\"")
+        }
+
         let mut out = format!(
             r#"[project]
 name = "{}"
@@ -340,6 +358,54 @@ claude_path = "{}"
             self.agents.tool_path,
             self.agents.claude_path,
         );
+
+        // Serialize [personas] (domain -> persona mapping, and optional
+        // per-domain backend overrides).
+        //
+        // This is required so `acs init` produces a config.toml that users can
+        // edit to customize which persona gets assigned to each ticket domain.
+        let mut persona_keys: Vec<&String> = self.personas.mapping.keys().collect();
+        persona_keys.sort();
+        if !persona_keys.is_empty() {
+            let parts = persona_keys
+                .iter()
+                .map(|k| {
+                    let v = self.personas.mapping.get(*k).expect("key should exist");
+                    format!(
+                        "\"{}\" = \"{}\"",
+                        escape_toml_string(k),
+                        escape_toml_string(v)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("\n[personas]\nmapping = {{{}}}", parts));
+        }
+
+        let mut backend_keys: Vec<&String> = self.personas.domain_backends.keys().collect();
+        backend_keys.sort();
+        if !backend_keys.is_empty() {
+            let parts = backend_keys
+                .iter()
+                .map(|k| {
+                    let v = self.personas.domain_backends.get(*k).expect("key should exist");
+                    format!(
+                        "\"{}\" = \"{}\"",
+                        escape_toml_string(k),
+                        escape_toml_string(v)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            // If we already emitted a [personas] table for mapping above,
+            // extend it with domain_backends. Otherwise create the table first.
+            if out.contains("\n[personas]\n") || out.contains("\n[personas]") {
+                out.push_str(&format!("\ndomain_backends = {{{}}}", parts));
+            } else {
+                out.push_str(&format!("\n[personas]\ndomain_backends = {{{}}}", parts));
+            }
+        }
 
         if !self.agents.codex_path.is_empty() {
             out.push_str(&format!("\ncodex_path = \"{}\"", self.agents.codex_path));
@@ -401,6 +467,11 @@ claude_path = "{}"
                     tpl.command.replace('\\', "\\\\").replace('"', "\\\""),
                 ));
             }
+        }
+
+        // Serialize [quality] section (only when non-default)
+        if self.quality.code_review {
+            out.push_str("\n\n[quality]\ncode_review = true");
         }
 
         out
@@ -468,6 +539,44 @@ mod tests {
         assert_eq!(parsed.agents.claude_models, original.agents.claude_models);
         assert_eq!(parsed.agents.codex_models, original.agents.codex_models);
         assert_eq!(parsed.agents.agent_models, original.agents.agent_models);
+
+        assert_eq!(parsed.personas.mapping, original.personas.mapping);
+        assert_eq!(parsed.personas.domain_backends, original.personas.domain_backends);
+    }
+
+    #[test]
+    fn config_load_parses_personas_mapping_and_domain_backends() {
+        let toml_content = r#"
+[project]
+name = "file-test"
+default_workers = 4
+
+[manager]
+cycle_seconds = 30
+worker_timeout_seconds = 600
+worker_poll_seconds = 5
+
+[agents]
+tool_path = "/usr/bin/acs"
+claude_path = "/usr/bin/claude"
+
+[personas]
+mapping = { core = "pm", "qa-lead" = "qa-lead", management = "senior-manager" }
+domain_backends = { core = "cursor" }
+"#;
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "{}", toml_content).unwrap();
+
+        let cfg = Config::load(tmp.path()).expect("should load config from file");
+        assert_eq!(cfg.persona_for_domain("core"), "pm");
+        assert_eq!(cfg.persona_for_domain("qa-lead"), "qa-lead");
+        assert_eq!(cfg.persona_for_domain("management"), "senior-manager");
+
+        assert_eq!(
+            cfg.personas.domain_backends.get("core").map(|s| s.as_str()),
+            Some("cursor")
+        );
     }
 
     #[test]
@@ -626,5 +735,60 @@ command = "/usr/local/bin/myai --task {prompt}"
         write!(tmp, "{}", toml_content).unwrap();
         let cfg = Config::load(tmp.path()).expect("should load");
         assert!(cfg.backends.definitions.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // QualityConfig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quality_config_defaults_to_no_code_review() {
+        let cfg = Config::default_for("test-project");
+        assert!(!cfg.quality.code_review, "code_review should default to false");
+    }
+
+    #[test]
+    fn quality_config_code_review_can_be_enabled_via_toml() {
+        let toml_content = r#"
+[project]
+name = "review-enabled"
+
+[quality]
+code_review = true
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "{}", toml_content).unwrap();
+
+        let cfg = Config::load(tmp.path()).expect("should parse quality config");
+        assert!(cfg.quality.code_review, "code_review should be enabled");
+    }
+
+    #[test]
+    fn quality_config_false_when_section_absent() {
+        let toml_content = "[project]\nname = \"no-quality\"\n";
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "{}", toml_content).unwrap();
+
+        let cfg = Config::load(tmp.path()).expect("should load without quality section");
+        assert!(!cfg.quality.code_review);
+    }
+
+    #[test]
+    fn to_toml_includes_quality_section_when_code_review_enabled() {
+        let mut cfg = Config::default_for("proj");
+        cfg.quality.code_review = true;
+        let toml_str = cfg.to_toml();
+        assert!(
+            toml_str.contains("[quality]"),
+            "serialized TOML should include [quality] section"
+        );
+        assert!(
+            toml_str.contains("code_review = true"),
+            "serialized TOML should include code_review = true"
+        );
+
+        // And it should round-trip
+        let reparsed: Config = toml::from_str(&toml_str).expect("should re-parse");
+        assert!(reparsed.quality.code_review);
     }
 }

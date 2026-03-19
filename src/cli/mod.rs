@@ -7,6 +7,7 @@ pub mod run;
 pub mod cleanup;
 pub mod status;
 pub mod log;
+pub mod restart;
 pub mod acs_dir;
 pub mod evolve;
 pub mod report;
@@ -15,6 +16,9 @@ pub mod milestone;
 pub mod check;
 pub mod approve;
 pub mod reject;
+pub mod quality;
+pub mod status_live;
+pub mod health;
 
 use clap::{Parser, Subcommand};
 
@@ -79,9 +83,27 @@ pub enum Commands {
         backend: Option<String>,
     },
     /// Show project status
-    Status,
+    Status {
+        /// Live TUI dashboard (refreshes every 2s, Ctrl+C to exit)
+        #[arg(long)]
+        live: bool,
+    },
     /// Remove stale acs/* branches and orphaned worktrees
     Cleanup,
+    /// Gracefully restart a running ACS instance
+    Restart {
+        /// Number of worker agents (defaults to config project.default_workers)
+        #[arg(long)]
+        workers: Option<usize>,
+        /// Backend provider: claude, cursor, codex, or mixed
+        #[arg(long)]
+        backend: Option<String>,
+        /// Seconds to wait for graceful shutdown before SIGKILL
+        #[arg(long, default_value = "20")]
+        wait_seconds: u64,
+    },
+    /// Run system diagnostics health checks (DB/workers/worktrees/git/blocked-tickets)
+    Health,
     /// Show event log
     Log {
         /// Follow mode (like tail -f)
@@ -90,6 +112,9 @@ pub enum Commands {
         /// Max entries to show
         #[arg(long, default_value = "20")]
         limit: usize,
+        /// Filter events by worker/agent id (e.g. w-8, mgr)
+        #[arg(long)]
+        worker: Option<String>,
     },
     /// Manage tickets
     #[command(subcommand)]
@@ -116,4 +141,7 @@ pub enum Commands {
         #[arg(long)]
         reason: String,
     },
+    /// Quality scoring and North Star metrics
+    #[command(subcommand)]
+    Quality(quality::QualityCommands),
 }

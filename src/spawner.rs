@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -6,7 +5,7 @@ use std::process::{Child, Command, Stdio};
 use anyhow::{bail, Context, Result};
 use rand::Rng;
 
-use crate::config::{AgentConfig, BackendTemplate};
+use crate::config::{AgentConfig, BackendTemplate, BackendsConfig};
 
 /// Abstraction over subprocess spawning so worker logic can be unit-tested
 /// without invoking the real Claude Code binary.
@@ -32,7 +31,7 @@ pub struct Spawner {
     codex_path: Option<String>,
     agent_path: Option<String>,
     /// Custom backend templates keyed by backend name (from `[backends.*]` config).
-    backends: HashMap<String, BackendTemplate>,
+    backends: BackendsConfig,
     tool_path: String,
 }
 
@@ -47,7 +46,7 @@ impl Spawner {
             codex_path: None,
             agent_path: None,
             tool_path: tool_path.to_string(),
-            backends: HashMap::new(),
+            backends: BackendsConfig::default(),
         }
     }
 
@@ -63,12 +62,12 @@ impl Spawner {
             codex_path,
             agent_path,
             tool_path: agents.tool_path.clone(),
-            backends: HashMap::new(),
+            backends: BackendsConfig::default(),
         }
     }
 
     /// Attach custom backend templates loaded from `config.backends`.
-    pub fn with_backends(mut self, backends: HashMap<String, BackendTemplate>) -> Self {
+    pub fn with_backends(mut self, backends: BackendsConfig) -> Self {
         self.backends = backends;
         self
     }
@@ -234,9 +233,9 @@ impl Spawner {
         let combined_prompt = format!("{}\n\n{}", system_prompt, prompt);
 
         // --- Custom backend via [backends.*] config section ---
-        if let Some(template) = self.backends.get(provider) {
+        if let Some(template) = self.backends.definitions.get(provider) {
             let (program, args) = template
-                .expand(prompt, system_prompt)
+                .expand_with_model(prompt, system_prompt, model)
                 .ok_or_else(|| anyhow::anyhow!("backend '{}' has an empty command template", provider))?;
             let mut cmd = Command::new(&program);
             cmd.args(&args)
@@ -329,6 +328,45 @@ impl Spawner {
         system_prompt: &str,
     ) -> Result<Child> {
         self.spawn_provider("claude", None, worker_id, worktree, prompt, system_prompt)
+    }
+
+    /// Spawn a generic agent backend, using the template's command/args directly.
+    /// This is the preferred path for new [backends.*] config entries.
+    pub fn spawn_agent(
+        &self,
+        backend: &BackendTemplate,
+        model: Option<&str>,
+        worker_id: &str,
+        worktree: &std::path::Path,
+        prompt: &str,
+        system_prompt: &str,
+    ) -> Result<std::process::Child> {
+        let log_path = self.log_path(worker_id);
+        if let Some(parent) = log_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create logs directory: {}", parent.display()))?;
+        }
+        let log_file = OpenOptions::new()
+            .create(true).append(true).open(&log_path)
+            .with_context(|| format!("open log {}", log_path.display()))?;
+        let log_file_stderr = log_file.try_clone()
+            .with_context(|| "clone log fd")?;
+
+        let (program, expanded_args) = backend
+            .expand_with_model(prompt, system_prompt, model)
+            .ok_or_else(|| anyhow::anyhow!("backend has an empty command template"))?;
+
+        let mut cmd = Command::new(&program);
+        cmd.args(&expanded_args)
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_stderr));
+
+        if backend.cwd_in_worktree {
+            cmd.current_dir(worktree);
+        }
+
+        cmd.spawn()
+            .with_context(|| format!("spawn backend command '{}'", program))
     }
 
     /// Sends SIGTERM to the given PID, waits up to 5 seconds, then sends
@@ -686,8 +724,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let project = tmp.path();
 
-        let mut backends = HashMap::new();
-        backends.insert(
+        let mut backends = BackendsConfig::default();
+        backends.definitions.insert(
             "my-echo".to_string(),
             BackendTemplate {
                 // Use `echo` so the process succeeds without a real AI binary.
@@ -719,8 +757,8 @@ mod tests {
         let project = tmp.path();
 
         // Register a custom backend named "claude" — it should override the built-in
-        let mut backends = HashMap::new();
-        backends.insert(
+        let mut backends = BackendsConfig::default();
+        backends.definitions.insert(
             "claude".to_string(),
             BackendTemplate {
                 command: "echo custom-override {prompt}".to_string(),
@@ -755,10 +793,38 @@ mod tests {
         use crate::config::BackendTemplate;
 
         let tmp = TempDir::new().unwrap();
-        let mut backends = HashMap::new();
-        backends.insert("foo".to_string(), BackendTemplate { command: "foo {prompt}".to_string(), ..Default::default() });
+        let mut backends = BackendsConfig::default();
+        backends.definitions.insert("foo".to_string(), BackendTemplate { command: "foo {prompt}".to_string(), ..Default::default() });
 
         let s = Spawner::new(tmp.path(), "claude", "acs").with_backends(backends);
-        assert!(s.backends.contains_key("foo"));
+        assert!(s.backends.definitions.contains_key("foo"));
+    }
+
+    // -- spawn_agent --
+
+    #[test]
+    fn spawn_agent_uses_backend_template_directly() {
+        use crate::config::BackendTemplate;
+
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        let s = Spawner::new(project, "claude", "acs");
+
+        let backend = BackendTemplate {
+            command: "echo".to_string(),
+            args: vec!["{prompt}".to_string()],
+            cwd_in_worktree: false,
+            output_format: "text".to_string(),
+        };
+
+        let mut child = s
+            .spawn_agent(&backend, None, "w-agent", tmp.path(), "agent-prompt", "sys")
+            .expect("spawn_agent should work with echo");
+        child.wait().unwrap();
+
+        let log = s.log_path("w-agent");
+        assert!(log.exists(), "log file should exist");
+        let content = fs::read_to_string(&log).unwrap();
+        assert!(content.contains("agent-prompt"), "log should contain the prompt");
     }
 }

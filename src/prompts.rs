@@ -237,6 +237,43 @@ Begin by reading all tickets and knowledge base entries.
     )
 }
 
+/// Returns a system prompt for the Tech Lead (code-review) agent.
+///
+/// The manager spawns this agent when `config.quality.code_review` is enabled.
+/// The reviewer validates the worker branch and then notifies the manager
+/// via `acs inbox push` with `tests_passed` set appropriately.
+pub fn tech_lead_review_prompt(ticket_id: &str, branch: &str, tool_path: &str) -> String {
+    format!(
+        r#"You are a Tech Lead reviewer for ACS (Auto Consulting Service).
+
+You must review the changes for ticket `{ticket_id}` on git branch `{branch}`.
+
+Your tasks:
+1. Inspect the diff (at minimum review `git diff main...{branch}`).
+2. Run tests if available:
+   - If `Cargo.toml` exists, run `cargo test`.
+   - Otherwise, if `package.json` exists, run `npm test`.
+3. Decide whether the branch is safe to merge.
+
+## How to Notify the Manager
+If the review passes, push:
+```bash
+{tool_path} inbox push --recipient mgr --type ticket_completed --payload '{{"ticket_id":"{ticket_id}","tests_passed":true}}' --sender {ticket_id}
+```
+
+If tests fail or the review is not safe, push:
+```bash
+{tool_path} inbox push --recipient mgr --type ticket_completed --payload '{{"ticket_id":"{ticket_id}","tests_passed":false}}' --sender {ticket_id}
+```
+
+Do not block for user input. Provide only the CLI commands needed to complete the inbox push.
+"#,
+        ticket_id = ticket_id,
+        branch = branch,
+        tool_path = tool_path,
+    )
+}
+
 /// Returns a system prompt for a worker agent.
 ///
 /// The worker agent receives a specific ticket assignment and executes it
@@ -295,6 +332,7 @@ Use the Bash tool to run these commands:
 ### Read from the knowledge base (REQUIRED before coding)
 ```bash
 {tool_path} kb read --domain {domain} --key stack
+{tool_path} kb read --domain {domain} --key api-contracts
 {tool_path} kb read --domain general --key architecture
 {tool_path} kb read --domain general --key conventions
 {tool_path} kb read --domain architecture --key api-contracts
@@ -322,9 +360,10 @@ Follow these steps in order:
    {tool_path} ticket update --id {ticket_id} --status in_progress
    ```
 
-2. **READ the knowledge base — REQUIRED before writing any code:**
+2. **READ the knowledge base — REQUIRED before writing any code (STOP if you haven't run these):**
    ```bash
    {tool_path} kb read --domain {domain} --key stack
+   {tool_path} kb read --domain {domain} --key api-contracts
    {tool_path} kb read --domain general --key architecture
    {tool_path} kb read --domain general --key conventions
    {tool_path} kb read --domain architecture --key api-contracts
@@ -342,10 +381,11 @@ Follow these steps in order:
    ```
 
 6. **WRITE your findings to the KB — REQUIRED after completing work:**
-   Document anything you discovered about the codebase, tech stack, conventions, or API contracts that future workers should know. At minimum update the domain stack entry, and write dedicated entries for significant discoveries:
+   Document anything you discovered about the codebase, tech stack, conventions, or API contracts that future workers should know. At minimum update the domain stack entry, and write dedicated entries for significant discoveries (use the `ticket_id` to make keys unique):
    ```bash
    {tool_path} kb write --domain {domain} --key stack --value "<updated stack info>"
-   {tool_path} kb write --domain {domain} --key <topic> --value "<your findings>"
+   {tool_path} kb write --domain {domain} --key worker-findings-{ticket_id} --value "<your findings>"
+   {tool_path} kb write --domain architecture --key api-contracts --value "<updated api contracts if relevant>"
    ```
 
 7. **Mark as review_pending**

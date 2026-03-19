@@ -485,6 +485,23 @@ impl Db {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    pub fn recent_events_for_agent(&self, agent: &str, limit: usize) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, agent, event_type, detail, tokens_used, input_tokens, output_tokens, ticket_id, model
+             FROM events
+             WHERE agent = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![agent, limit as i64], |row| Ok(Event {
+            id: row.get(0)?, timestamp: row.get(1)?, agent: row.get(2)?,
+            event_type: row.get(3)?, detail: row.get(4)?, tokens_used: row.get(5)?,
+            input_tokens: row.get(6)?, output_tokens: row.get(7)?,
+            ticket_id: row.get(8)?, model: row.get(9)?,
+        }))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
     /// Returns per-ticket token usage (summed across all events for each ticket).
     pub fn token_breakdown_by_ticket(&self) -> Result<Vec<crate::models::TicketTokenUsage>> {
         let mut stmt = self.conn.prepare(
