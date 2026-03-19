@@ -1,5 +1,5 @@
-use clap::Parser;
 use acs::cli;
+use clap::Parser;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -49,11 +49,18 @@ fn main() -> ExitCode {
             backend,
         ),
         cli::Commands::Cleanup => cli::cleanup::execute(),
-        cli::Commands::Restart { workers, backend, wait_seconds } => {
-            cli::restart::execute(workers, backend, wait_seconds)
-        }
+        cli::Commands::Restart {
+            workers,
+            backend,
+            wait_seconds,
+        } => cli::restart::execute(workers, backend, wait_seconds),
         cli::Commands::Status { live } => cli::status::execute(live),
-        cli::Commands::Log { follow, limit, worker } => cli::log::execute(follow, limit, worker),
+        cli::Commands::Log {
+            follow,
+            limit,
+            worker,
+            filters,
+        } => cli::log::execute(follow, limit, worker, filters),
         cli::Commands::Report => cli::report::execute(),
         cli::Commands::Cost => cli::cost::execute(),
         cli::Commands::Milestone(cmd) => cli::milestone::execute(cmd),
