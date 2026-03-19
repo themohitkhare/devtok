@@ -101,7 +101,7 @@ async fn handle_ticket_assignment(
     forced_provider: Option<String>,
 ) -> Result<()> {
     let spawner = Spawner::new_with_agent_config(project_dir, &config.agents)
-        .with_backends(config.backends.clone());
+        .with_backends(config.backends.definitions.clone());
     handle_ticket_with_spawner(&spawner, worker_id, payload, db, config, shutdown, forced_provider).await
 }
 
