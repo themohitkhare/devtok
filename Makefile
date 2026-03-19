@@ -10,7 +10,7 @@
 #   5. Run `make test` / `make check` to validate changes
 #   6. Run `make clean` to reset the .acs/ workspace (drops DB and worktrees)
 
-.PHONY: all test check evolve status install clean help
+.PHONY: all test check evolve status install clean help install-nextest fmt clean-build
 
 # Default target
 all: check test
@@ -51,9 +51,10 @@ fmt:
 
 # Start the ACS self-evolve loop with default worker count.
 # Set WORKERS env var to control parallelism, e.g.: make evolve WORKERS=4
+# The evolve command iterates manager/worker runs and ticket generation.
 WORKERS ?= 2
 evolve:
-	acs run --workers $(WORKERS)
+	acs evolve --workers $(WORKERS)
 
 # Show current ticket progress and agent status.
 status:
@@ -64,8 +65,10 @@ status:
 # ---------------------------------------------------------------------------
 
 # Build and install the acs binary into ~/.cargo/bin/.
+# Also installs cargo-nextest so `make test` uses parallel execution.
 install:
 	cargo install --path .
+	cargo install cargo-nextest --locked
 
 # Install cargo-nextest for parallel test execution.
 install-nextest:
@@ -78,7 +81,8 @@ install-nextest:
 # Remove the .acs/ workspace directory (database, worktrees, logs).
 # WARNING: This destroys all ticket state and in-progress work.
 clean:
-	@echo "Removing .acs/ workspace (tickets, worktrees, logs)..."
+	@echo "Removing .acs workspace and pruning worktrees..."
+	git worktree prune
 	rm -rf .acs/
 	@echo "Done. Run 'acs init' to start fresh."
 
@@ -98,7 +102,7 @@ help:
 	@echo "  make fmt           Auto-format source code"
 	@echo "  make install       Install acs binary via cargo install"
 	@echo "  make install-nextest  Install cargo-nextest for parallel tests"
-	@echo "  make evolve        Start the ACS self-evolve loop (acs run)"
+	@echo "  make evolve        Start the ACS self-evolve loop (acs evolve)"
 	@echo "  make status        Show ticket progress (acs status)"
 	@echo "  make clean         Remove .acs/ workspace (destructive)"
 	@echo "  make clean-build   Remove Rust build artifacts (cargo clean)"
