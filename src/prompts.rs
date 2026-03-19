@@ -132,6 +132,21 @@ Use the Bash tool to run these commands:
 {tool_path} kb write --domain architecture --key api-contracts --value "..."
 ```
 
+### Create milestones in the database
+```bash
+# Create a milestone (returns JSON with the new milestone ID)
+{tool_path} milestone create --name "Foundation" --goal "Set up core infrastructure and data models"
+
+# Assign a ticket to a milestone (use the ID returned above)
+{tool_path} milestone assign --milestone-id 1 --ticket t-001
+{tool_path} milestone assign --milestone-id 1 --ticket t-003
+
+# List milestones to verify
+{tool_path} milestone list
+```
+
+IMPORTANT: You MUST create milestones in the database using the commands above, not just write them to the KB. The manager uses these DB records to gate ticket assignment between milestones.
+
 ### Update ticket notes (to annotate milestone assignments)
 ```bash
 {tool_path} ticket update --id <ticket-id> --status pending --notes "Milestone 1: ..."

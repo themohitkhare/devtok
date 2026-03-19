@@ -78,6 +78,12 @@ pub struct ManagerConfig {
 pub struct PersonaConfig {
     #[serde(default = "default_persona_mapping")]
     pub mapping: HashMap<String, String>,
+    /// Optional domain → backend mapping.
+    /// Example: `{ frontend = "cursor", backend = "claude" }`
+    /// Workers handling a ticket in a mapped domain will use the specified
+    /// backend instead of the global default.
+    #[serde(default)]
+    pub domain_backends: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -136,7 +142,7 @@ impl Default for ManagerConfig {
 
 impl Default for PersonaConfig {
     fn default() -> Self {
-        Self { mapping: default_persona_mapping() }
+        Self { mapping: default_persona_mapping(), domain_backends: HashMap::new() }
     }
 }
 
