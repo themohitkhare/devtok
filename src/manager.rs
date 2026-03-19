@@ -38,6 +38,77 @@ pub async fn run_loop(
     }
 }
 
+fn priority_tier_index(priority: i32) -> usize {
+    // Lower number = higher priority.
+    if priority <= 2 {
+        0
+    } else if priority <= 5 {
+        1
+    } else {
+        2
+    }
+}
+
+fn simple_hash(s: &str) -> u64 {
+    s.as_bytes().iter().map(|b| *b as u64).sum()
+}
+
+fn enabled_provider_order(agents: &crate::config::AgentConfig) -> Vec<String> {
+    let mut enabled = Vec::new();
+
+    // Always have Claude as a baseline provider.
+    enabled.push("claude".to_string());
+    if !agents.codex_path.trim().is_empty() {
+        enabled.push("codex".to_string());
+    }
+    if !agents.agent_path.trim().is_empty() {
+        enabled.push("agent".to_string());
+    }
+
+    // If user specified an explicit order, filter it to the enabled subset.
+    if !agents.providers.is_empty() {
+        let mut ordered = Vec::new();
+        for p in agents.providers.iter() {
+            if enabled.iter().any(|e| e == p) {
+                ordered.push(p.clone());
+            }
+        }
+        if !ordered.is_empty() {
+            return ordered;
+        }
+    }
+
+    enabled
+}
+
+fn select_provider_for_ticket(
+    agents: &crate::config::AgentConfig,
+    worker_id: &str,
+    ticket_id: &str,
+) -> String {
+    let order = enabled_provider_order(agents);
+    let seed = simple_hash(worker_id) + simple_hash(ticket_id);
+    order[seed as usize % order.len()].clone()
+}
+
+fn pick_model_from_offers(models: &[String], tier_idx: usize) -> Option<String> {
+    models.get(tier_idx).cloned().or_else(|| models.last().cloned())
+}
+
+fn select_model_for_provider(
+    provider: &str,
+    agents: &crate::config::AgentConfig,
+    ticket_priority: i32,
+) -> Option<String> {
+    let tier = priority_tier_index(ticket_priority);
+    match provider {
+        "claude" => pick_model_from_offers(&agents.claude_models, tier),
+        "codex" => pick_model_from_offers(&agents.codex_models, tier),
+        "agent" => pick_model_from_offers(&agents.agent_models, tier),
+        _ => None,
+    }
+}
+
 fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path) -> Result<()> {
     let mut assignments = 0usize;
     let mut completions = 0usize;
@@ -91,12 +162,21 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
 
             if let Some(ticket) = ticket_opt {
                 let persona = config.persona_for_domain(&ticket.domain).to_string();
-                let payload = json!({
+                let work_type = select_provider_for_ticket(&config.agents, &worker.id, &ticket.id);
+                let model = select_model_for_provider(&work_type, &config.agents, ticket.priority);
+
+                let mut payload = json!({
                     "ticket_id":   ticket.id,
                     "title":       ticket.title,
                     "description": ticket.description,
+                    "domain":      ticket.domain,
                     "persona":     persona,
-                }).to_string();
+                    "work_type":   work_type,
+                });
+                if let Some(m) = model {
+                    payload["model"] = json!(m);
+                }
+                let payload = payload.to_string();
 
                 {
                     let guard = db.lock().unwrap();
@@ -130,90 +210,168 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
         match msg_opt {
             None => break,
             Some(msg) if msg.msg_type == "ticket_completed" || msg.msg_type == "completion" => {
-                // Payload is expected to be JSON with at least { "ticket_id": "..." }
-                let ticket_id: String = serde_json::from_str::<serde_json::Value>(&msg.payload)
-                    .ok()
-                    .and_then(|v| v.get("ticket_id").and_then(|t| t.as_str()).map(|s| s.to_string()))
-                    .unwrap_or_else(|| msg.payload.trim().to_string());
-
-                {
-                    let guard = db.lock().unwrap();
-                    guard.update_ticket(&ticket_id, "completed", None, None, None)?;
-                    guard.log_event(
-                        Some(&msg.sender),
-                        "ticket_completed",
-                        &format!("ticket {} completed by {}", ticket_id, msg.sender),
+                // Payload is expected to be JSON with at least { "ticket_id": "..." }.
+                // Newer workers also include: { "tests_passed": bool }.
+                let (ticket_id, tests_passed, work_type, model) =
+                    match serde_json::from_str::<serde_json::Value>(&msg.payload) {
+                    Ok(v) => {
+                        let tid = v.get("ticket_id")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| msg.payload.trim().to_string());
+                        let ok = v.get("tests_passed")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(true);
+                        let wt = v.get("work_type")
+                            .or_else(|| v.get("provider"))
+                            .and_then(|w| w.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let model = v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
+                        (tid, ok, wt, model)
+                    }
+                    Err(_) => (
+                        msg.payload.trim().to_string(),
+                        true,
+                        "unknown".to_string(),
                         None,
-                    )?;
-                }
+                    ),
+                };
 
-                eprintln!(
-                    "[manager] ticket {} completed by {}",
-                    ticket_id, msg.sender
-                );
-                completions += 1;
+                let via = match model {
+                    Some(m) => format!("{}:{}", work_type, m),
+                    None => work_type,
+                };
 
-                // Attempt to merge the worker branch into main
                 let spawner = Spawner::new(project_dir, &config.agents.claude_path, &config.agents.tool_path);
-                match spawner.find_branch_for_ticket(&ticket_id) {
-                    Ok(Some(branch)) => {
-                        match spawner.merge_branch(&branch) {
-                            Ok(true) => {
-                                // Merge succeeded — clean up the branch
-                                spawner.delete_branch(&branch);
-                                {
+
+                if tests_passed {
+                    {
+                        let guard = db.lock().unwrap();
+                        guard.update_ticket(&ticket_id, "completed", None, None, None)?;
+                        guard.log_event(
+                            Some(&msg.sender),
+                            "ticket_completed",
+                            &format!(
+                                "ticket {} completed by {} via {} (tests passed)",
+                                ticket_id, msg.sender, via
+                            ),
+                            None,
+                        )?;
+                    }
+
+                    eprintln!(
+                        "[manager] ticket {} completed by {} via {} (tests passed)",
+                        ticket_id, msg.sender, via
+                    );
+                    completions += 1;
+
+                    // Attempt to merge the worker branch into main
+                    match spawner.find_branch_for_ticket(&ticket_id) {
+                        Ok(Some(branch)) => {
+                            match spawner.merge_branch(&branch) {
+                                Ok(true) => {
+                                    // Merge succeeded — clean up the branch
+                                    spawner.delete_branch(&branch);
+                                    {
+                                        let guard = db.lock().unwrap();
+                                        guard.log_event(
+                                            Some("mgr"),
+                                            "branch_merged",
+                                            &format!("merged {} into main for ticket {}", branch, ticket_id),
+                                            None,
+                                        )?;
+                                    }
+                                    eprintln!(
+                                        "[manager] merged branch {} for ticket {}",
+                                        branch, ticket_id
+                                    );
+                                    merged += 1;
+                                }
+                                Ok(false) => {
+                                    // Merge conflict — re-queue the ticket
+                                    spawner.delete_branch(&branch);
+                                    {
+                                        let guard = db.lock().unwrap();
+                                        guard.update_ticket(
+                                            &ticket_id,
+                                            "pending",
+                                            Some(&format!("Merge conflict on branch {}", branch)),
+                                            None,
+                                            Some(None),
+                                        )?;
+                                        guard.log_event(
+                                            Some("mgr"),
+                                            "merge_conflict_requeued",
+                                            &format!(
+                                                "merge conflict for ticket {} on branch {} (re-queued)",
+                                                ticket_id, branch
+                                            ),
+                                            None,
+                                        )?;
+                                    }
+                                    eprintln!(
+                                        "[manager] merge conflict for ticket {} on branch {}",
+                                        ticket_id, branch
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("[manager] merge error for ticket {}: {}", ticket_id, e);
                                     let guard = db.lock().unwrap();
                                     guard.log_event(
                                         Some("mgr"),
-                                        "branch_merged",
-                                        &format!("merged {} into main for ticket {}", branch, ticket_id),
+                                        "merge_error",
+                                        &format!("merge error for ticket {}: {}", ticket_id, e),
                                         None,
                                     )?;
                                 }
-                                eprintln!("[manager] merged branch {} for ticket {}", branch, ticket_id);
-                                merged += 1;
-                            }
-                            Ok(false) => {
-                                // Merge conflict — block the ticket and re-assign
-                                {
-                                    let guard = db.lock().unwrap();
-                                    guard.update_ticket(
-                                        &ticket_id,
-                                        "blocked",
-                                        Some(&format!("Merge conflict on branch {}", branch)),
-                                        None,
-                                        None,
-                                    )?;
-                                    guard.log_event(
-                                        Some("mgr"),
-                                        "merge_conflict",
-                                        &format!("merge conflict for ticket {} on branch {}", ticket_id, branch),
-                                        None,
-                                    )?;
-                                }
-                                eprintln!(
-                                    "[manager] merge conflict for ticket {} on branch {}",
-                                    ticket_id, branch
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("[manager] merge error for ticket {}: {}", ticket_id, e);
-                                let guard = db.lock().unwrap();
-                                guard.log_event(
-                                    Some("mgr"),
-                                    "merge_error",
-                                    &format!("merge error for ticket {}: {}", ticket_id, e),
-                                    None,
-                                )?;
                             }
                         }
+                        Ok(None) => {
+                            // No branch found — nothing to merge (may have been manually merged)
+                            eprintln!(
+                                "[manager] no branch found for ticket {}, skipping merge",
+                                ticket_id
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[manager] error finding branch for ticket {}: {}",
+                                ticket_id, e
+                            );
+                        }
                     }
-                    Ok(None) => {
-                        // No branch found — nothing to merge (may have been manually merged)
-                        eprintln!("[manager] no branch found for ticket {}, skipping merge", ticket_id);
+                } else {
+                    // Tests failed — do not merge; re-queue.
+                    {
+                        let guard = db.lock().unwrap();
+                        guard.update_ticket(
+                            &ticket_id,
+                            "pending",
+                            Some("cargo test failed in worker worktree"),
+                            None,
+                            Some(None),
+                        )?;
+                        guard.log_event(
+                            Some(&msg.sender),
+                            "ticket_tests_failed",
+                            &format!(
+                                "ticket {} tests failed via {}; re-queued",
+                                ticket_id, via
+                            ),
+                            None,
+                        )?;
                     }
-                    Err(e) => {
-                        eprintln!("[manager] error finding branch for ticket {}: {}", ticket_id, e);
+
+                    eprintln!(
+                        "[manager] ticket {} completed by {} via {} but tests failed; re-queued",
+                        ticket_id, msg.sender, via
+                    );
+                    completions += 1;
+
+                    // Best-effort cleanup: delete the local branch so the next worker has a clean slate.
+                    if let Ok(Some(branch)) = spawner.find_branch_for_ticket(&ticket_id) {
+                        spawner.delete_branch(&branch);
                     }
                 }
             }
@@ -406,6 +564,30 @@ mod tests {
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
         assert_eq!(ticket.status, "completed");
+    }
+
+    #[test]
+    fn process_completions_requeues_ticket_when_tests_fail() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            let tid = g.create_ticket("Task A", "Do A", "general", 1).unwrap();
+            g.update_ticket(&tid, "in_progress", None, None, None).unwrap();
+
+            g.push_inbox(
+                "mgr",
+                "ticket_completed",
+                r#"{"ticket_id":"t-001","tests_passed":false}"#,
+                "w-1",
+            )
+            .unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let ticket = g.get_ticket("t-001").unwrap().unwrap();
+        assert_eq!(ticket.status, "pending");
     }
 
     #[test]

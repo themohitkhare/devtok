@@ -5,21 +5,43 @@ use std::process::{Child, Command, Stdio};
 use anyhow::{bail, Context, Result};
 use rand::Rng;
 
+use crate::config::AgentConfig;
+
 pub struct Spawner {
     project_dir: PathBuf,
     acs_dir: PathBuf,
     claude_path: String,
+    codex_path: Option<String>,
+    agent_path: Option<String>,
     tool_path: String,
 }
 
 impl Spawner {
+    /// Backwards-compatible constructor: only `claude` is enabled.
     pub fn new(project_dir: &Path, claude_path: &str, tool_path: &str) -> Self {
         let acs_dir = project_dir.join(".acs");
         Spawner {
             project_dir: project_dir.to_path_buf(),
             acs_dir,
             claude_path: claude_path.to_string(),
+            codex_path: None,
+            agent_path: None,
             tool_path: tool_path.to_string(),
+        }
+    }
+
+    pub fn new_with_agent_config(project_dir: &Path, agents: &AgentConfig) -> Self {
+        let acs_dir = project_dir.join(".acs");
+        let codex_path = (!agents.codex_path.trim().is_empty()).then(|| agents.codex_path.clone());
+        let agent_path = (!agents.agent_path.trim().is_empty()).then(|| agents.agent_path.clone());
+
+        Spawner {
+            project_dir: project_dir.to_path_buf(),
+            acs_dir,
+            claude_path: agents.claude_path.clone(),
+            codex_path,
+            agent_path,
+            tool_path: agents.tool_path.clone(),
         }
     }
 
@@ -85,10 +107,18 @@ impl Spawner {
         Ok(())
     }
 
-    /// Spawns a `claude` subprocess inside `worktree`, redirecting stdout and
-    /// stderr to `.acs/logs/{worker_id}.log`. Returns the `Child` handle.
-    pub fn spawn_claude(
+    /// Spawns a provider subprocess inside `worktree`.
+    ///
+    /// The provider is selected via `provider`:
+    /// - `claude`
+    /// - `codex`
+    /// - `agent`
+    ///
+    /// stdout/stderr are redirected to `.acs/logs/{worker_id}.log`. Returns the `Child` handle.
+    pub fn spawn_provider(
         &self,
+        provider: &str,
+        model: Option<&str>,
         worker_id: &str,
         worktree: &Path,
         prompt: &str,
@@ -110,27 +140,91 @@ impl Spawner {
             .try_clone()
             .with_context(|| "Failed to clone log file handle for stderr")?;
 
-        let child = Command::new(&self.claude_path)
-            .arg("-p")
-            .arg(prompt)
-            .arg("--append-system-prompt")
-            .arg(system_prompt)
-            .arg("--dangerously-skip-permissions")
-            .arg("--output-format")
-            .arg("json")
-            .current_dir(worktree)
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_file_stderr))
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "Failed to spawn claude process '{}' in '{}'",
-                    self.claude_path,
-                    worktree.display()
-                )
-            })?;
+        // Combine "system prompt" + ticket instructions because codex/agent do not
+        // necessarily support Claude-style `--append-system-prompt`.
+        let combined_prompt = format!("{}\n\n{}", system_prompt, prompt);
+
+        let child = match provider {
+            "claude" => {
+                // Claude Code uses `-p` for non-interactive prompt printing.
+                let mut cmd = Command::new(&self.claude_path);
+                cmd.arg("-p")
+                    .arg(prompt)
+                    .arg("--append-system-prompt")
+                    .arg(system_prompt)
+                    .arg("--dangerously-skip-permissions")
+                    .arg("--output-format")
+                    .arg("json");
+                if let Some(m) = model {
+                    cmd.arg("--model").arg(m);
+                }
+                cmd.current_dir(worktree)
+                    .stdout(Stdio::from(log_file))
+                    .stderr(Stdio::from(log_file_stderr))
+                    .spawn()
+            }
+            "codex" => {
+                let codex_path = self.codex_path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("codex provider is not configured (codex_path is empty)")
+                })?;
+
+                // Codex exec:
+                // - use `--json` so logs are JSONL-ish
+                // - set sandbox to allow editing
+                // - pass model via `-m/--model`
+                let mut cmd = Command::new(codex_path);
+                cmd.arg("exec")
+                    .arg("--json")
+                    .arg("--sandbox")
+                    .arg("workspace-write")
+                    .arg("--dangerously-bypass-approvals-and-sandbox")
+                    .arg("-C")
+                    .arg(worktree)
+                    .stdout(Stdio::from(log_file))
+                    .stderr(Stdio::from(log_file_stderr));
+                if let Some(m) = model {
+                    cmd.arg("-m").arg(m);
+                }
+                cmd.arg(combined_prompt).spawn()
+            }
+            "agent" => {
+                let agent_path = self.agent_path.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("agent provider is not configured (agent_path is empty)")
+                })?;
+
+                // Cursor agent:
+                // - `--print` + `--output-format json` for non-interactive output
+                // - `--workspace` to ensure it edits within the worktree
+                let mut cmd = Command::new(agent_path);
+                cmd.arg("--print")
+                    .arg("--output-format")
+                    .arg("json")
+                    .arg("--force")
+                    .arg("--workspace")
+                    .arg(worktree)
+                    .current_dir(worktree)
+                    .stdout(Stdio::from(log_file))
+                    .stderr(Stdio::from(log_file_stderr));
+                if let Some(m) = model {
+                    cmd.arg("--model").arg(m);
+                }
+                cmd.arg(combined_prompt).spawn()
+            }
+            other => bail!("unknown provider '{}'", other),
+        }
+        .with_context(|| format!("Failed to spawn provider '{}' in '{}'", provider, worktree.display()))?;
 
         Ok(child)
+    }
+
+    pub fn spawn_claude(
+        &self,
+        worker_id: &str,
+        worktree: &Path,
+        prompt: &str,
+        system_prompt: &str,
+    ) -> Result<Child> {
+        self.spawn_provider("claude", None, worker_id, worktree, prompt, system_prompt)
     }
 
     /// Sends SIGTERM to the given PID, waits up to 5 seconds, then sends

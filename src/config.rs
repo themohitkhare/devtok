@@ -44,6 +44,26 @@ pub struct AgentConfig {
     pub tool_path: String,
     #[serde(default = "default_claude_path")]
     pub claude_path: String,
+    /// Optional CodeX provider binary path (if empty, CodeX is disabled).
+    #[serde(default = "default_empty_provider_path")]
+    pub codex_path: String,
+    /// Optional "agent" provider binary path (if empty, agent provider is disabled).
+    #[serde(default = "default_empty_provider_path")]
+    pub agent_path: String,
+    /// Provider selection order (e.g. ["claude","codex","agent"]).
+    /// If empty, workers infer providers from configured paths.
+    #[serde(default)]
+    pub providers: Vec<String>,
+
+    /// Claude model offers (best -> cheaper), used for manager tiering.
+    #[serde(default)]
+    pub claude_models: Vec<String>,
+    /// Codex model offers (best -> cheaper), used for manager tiering.
+    #[serde(default)]
+    pub codex_models: Vec<String>,
+    /// Cursor Agent model offers (best -> cheaper), used for manager tiering.
+    #[serde(default)]
+    pub agent_models: Vec<String>,
 }
 
 fn default_workers() -> usize { 2 }
@@ -52,6 +72,7 @@ fn default_timeout() -> u64 { 300 }
 fn default_poll() -> u64 { 3 }
 fn default_tool_path() -> String { "acs".into() }
 fn default_claude_path() -> String { "claude".into() }
+fn default_empty_provider_path() -> String { "".into() }
 
 fn default_persona_mapping() -> HashMap<String, String> {
     let mut m = HashMap::new();
@@ -79,7 +100,16 @@ impl Default for PersonaConfig {
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { tool_path: default_tool_path(), claude_path: default_claude_path() }
+        Self {
+            tool_path: default_tool_path(),
+            claude_path: default_claude_path(),
+            codex_path: default_empty_provider_path(),
+            agent_path: default_empty_provider_path(),
+            providers: vec![],
+            claude_models: vec![],
+            codex_models: vec![],
+            agent_models: vec![],
+        }
     }
 }
 
@@ -103,7 +133,7 @@ impl Config {
     }
 
     pub fn to_toml(&self) -> String {
-        format!(
+        let mut out = format!(
             r#"[project]
 name = "{}"
 default_workers = {}
@@ -117,10 +147,64 @@ worker_poll_seconds = {}
 tool_path = "{}"
 claude_path = "{}"
 "#,
-            self.project.name, self.project.default_workers,
-            self.manager.cycle_seconds, self.manager.worker_timeout_seconds, self.manager.worker_poll_seconds,
-            self.agents.tool_path, self.agents.claude_path,
-        )
+            self.project.name,
+            self.project.default_workers,
+            self.manager.cycle_seconds,
+            self.manager.worker_timeout_seconds,
+            self.manager.worker_poll_seconds,
+            self.agents.tool_path,
+            self.agents.claude_path,
+        );
+
+        if !self.agents.codex_path.is_empty() {
+            out.push_str(&format!("\ncodex_path = \"{}\"", self.agents.codex_path));
+        }
+        if !self.agents.agent_path.is_empty() {
+            out.push_str(&format!("\nagent_path = \"{}\"", self.agents.agent_path));
+        }
+        if !self.agents.providers.is_empty() {
+            let providers = self
+                .agents
+                .providers
+                .iter()
+                .map(|p| format!("\"{}\"", p))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("\nproviders = [{}]", providers));
+        }
+
+        if !self.agents.claude_models.is_empty() {
+            let models = self
+                .agents
+                .claude_models
+                .iter()
+                .map(|m| format!("\"{}\"", m))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("\nclaude_models = [{}]", models));
+        }
+        if !self.agents.codex_models.is_empty() {
+            let models = self
+                .agents
+                .codex_models
+                .iter()
+                .map(|m| format!("\"{}\"", m))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("\ncodex_models = [{}]", models));
+        }
+        if !self.agents.agent_models.is_empty() {
+            let models = self
+                .agents
+                .agent_models
+                .iter()
+                .map(|m| format!("\"{}\"", m))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("\nagent_models = [{}]", models));
+        }
+
+        out
     }
 }
 
@@ -174,6 +258,9 @@ mod tests {
         assert_eq!(parsed.manager.worker_poll_seconds, original.manager.worker_poll_seconds);
         assert_eq!(parsed.agents.tool_path, original.agents.tool_path);
         assert_eq!(parsed.agents.claude_path, original.agents.claude_path);
+        assert_eq!(parsed.agents.claude_models, original.agents.claude_models);
+        assert_eq!(parsed.agents.codex_models, original.agents.codex_models);
+        assert_eq!(parsed.agents.agent_models, original.agents.agent_models);
     }
 
     #[test]

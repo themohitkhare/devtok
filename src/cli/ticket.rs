@@ -1,7 +1,6 @@
 use clap::Subcommand;
 use anyhow::{anyhow, Result};
 use crate::db::Db;
-use std::path::Path;
 use std::io::{self, Write};
 
 #[derive(Subcommand)]
@@ -53,7 +52,9 @@ const SIMILARITY_WARN_THRESHOLD: f64 = 0.70;
 const SIMILARITY_BLOCK_THRESHOLD: f64 = 0.80;
 
 pub fn execute(cmd: TicketCommands) -> Result<()> {
-    let db = Db::open(Path::new(".acs/project.db"))?;
+    let cwd = std::env::current_dir()?;
+    let acs_dir = crate::cli::acs_dir::resolve_acs_dir(&cwd)?;
+    let db = Db::open(&acs_dir.join("project.db"))?;
 
     match cmd {
         TicketCommands::Create { title, description, domain, priority, blocked_by, force, non_interactive } => {

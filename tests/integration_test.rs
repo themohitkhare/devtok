@@ -153,6 +153,22 @@ fn test_status_on_empty_project() {
 }
 
 #[test]
+fn test_evolve_dry_run() {
+    let bin = acs_bin();
+    let dir = setup_test_dir();
+
+    let output = Command::new(&bin)
+        .args(["evolve", "--dry-run", "--max-iterations", "1", "--workers", "1"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "evolve dry-run failed: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"status\": \"dry_run\"") || stdout.contains("dry_run"));
+}
+
+#[test]
 fn test_errors_are_json() {
     let bin = acs_bin();
     // Run in a temp dir without .acs/ — should produce a JSON error

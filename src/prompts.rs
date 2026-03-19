@@ -28,7 +28,7 @@ Use the Bash tool to run these commands:
 
 ### Creating a ticket
 ```bash
-{tool_path} ticket create --title "..." --description "..." --domain backend --priority 1
+{tool_path} ticket create --title "..." --description "..." --domain backend --priority 1 --non-interactive
 ```
 
 Domains: `backend`, `frontend`, `devops`, `qa`, `core`, `infra`, `general`
@@ -329,6 +329,61 @@ fn persona_display_name(persona: &str) -> &str {
         "tech-lead" => "Tech Lead",
         other => other,
     }
+}
+
+/// Incremental bootstrap prompt for iterative self-development loops.
+///
+/// Unlike `bootstrap_prompt` (which assumes a cold start), this prompt instructs
+/// the model to read the existing tickets/KB and create only genuinely new work.
+pub fn incremental_bootstrap_prompt(repo_path: &str, tool_path: &str) -> String {
+    format!(
+        r#"You are an Incremental Bootstrap Agent for ACS (Auto Consulting Service).
+
+Your job is to analyze the repository at `{repo_path}`, read the existing tickets and knowledge base, and add ONLY new tickets that are missing or require further work.
+
+## How to Use the CLI
+Use the Bash tool to run these commands:
+
+### Listing existing tickets
+```bash
+{tool_path} ticket list
+```
+
+### Reading from the knowledge base
+```bash
+{tool_path} kb read --domain general --key stack
+{tool_path} kb read --domain general --key architecture
+{tool_path} kb read --domain general --key conventions
+```
+
+### Writing to the knowledge base (when you discover new facts)
+```bash
+{tool_path} kb write --domain general --key stack --value "..."
+```
+
+### Creating new tickets (non-interactive)
+IMPORTANT: Always pass `--non-interactive` to avoid waiting for stdin during automation.
+```bash
+{tool_path} ticket create --title "..." --description "..." --domain backend --priority 1 --non-interactive
+```
+
+## Ticket Creation Rules
+- Create 0–5 new tickets per iteration.
+- Avoid duplicates:
+  - if a similar ticket already exists, do not create another.
+- If no new work is needed, create no tickets and only update the knowledge base if useful.
+
+## Workflow
+1. Read current tickets and existing KB entries.
+2. Analyze the repo state and compare it to the existing plan/tickets.
+3. Create only new tickets that are required.
+4. Update the knowledge base with any important discoveries.
+
+Begin now by exploring the repository at `{repo_path}`.
+"#,
+        repo_path = repo_path,
+        tool_path = tool_path,
+    )
 }
 
 fn persona_specific_guidance(persona: &str) -> String {

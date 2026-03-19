@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -58,6 +59,7 @@ pub async fn worker_loop(
                     &db,
                     &config,
                     &project_dir,
+                    &mut shutdown,
                 )
                 .await
                 {
@@ -93,6 +95,7 @@ async fn handle_ticket_assignment(
     db: &Arc<Mutex<Db>>,
     config: &Config,
     project_dir: &PathBuf,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     // --- (a) Parse payload ---
     let val: serde_json::Value = serde_json::from_str(payload)?;
@@ -104,6 +107,18 @@ async fn handle_ticket_assignment(
         .as_str()
         .unwrap_or_else(|| config.persona_for_domain(&domain))
         .to_string();
+
+    let provider = val
+        .get("work_type")
+        .or_else(|| val.get("provider"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| select_provider_for_ticket(&config.agents, worker_id, &ticket_id));
+
+    let model = val
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     tracing_log(worker_id, &format!("received ticket_assignment for {}", ticket_id));
 
@@ -120,7 +135,8 @@ async fn handle_ticket_assignment(
     }
 
     // --- (c) Create spawner ---
-    let spawner = Spawner::new(project_dir, &config.agents.claude_path, &config.agents.tool_path);
+    // Workers may use multiple providers (claude/codex/agent) to execute tickets.
+    let spawner = Spawner::new_with_agent_config(project_dir, &config.agents);
 
     // --- (d) Create worktree ---
     let worktree = spawner.create_worktree(worker_id, &ticket_id)?;
@@ -143,8 +159,22 @@ async fn handle_ticket_assignment(
         description = description,
     );
 
-    // --- (g) Spawn Claude ---
-    let mut child = spawner.spawn_claude(worker_id, &worktree, &task_prompt, &system_prompt)?;
+    // --- (g) Spawn provider ---
+    tracing_log(
+        worker_id,
+        &format!(
+            "spawning provider '{}' (model={:?}) for ticket {}",
+            provider, model, ticket_id
+        ),
+    );
+    let mut child = spawner.spawn_provider(
+        &provider,
+        model.as_deref(),
+        worker_id,
+        &worktree,
+        &task_prompt,
+        &system_prompt,
+    )?;
     let pid: u32 = child.id();
 
     // Update agent record with the PID
@@ -156,11 +186,31 @@ async fn handle_ticket_assignment(
     // --- (h) Wait for completion with timeout ---
     let timeout = Duration::from_secs(config.manager.worker_timeout_seconds);
 
-    let result = tokio::time::timeout(
-        timeout,
-        tokio::task::spawn_blocking(move || child.wait()),
-    )
-    .await;
+    let wait_handle = tokio::task::spawn_blocking(move || child.wait());
+
+    let result = tokio::select! {
+        _ = shutdown.changed() => {
+            // Manager shutdown requested: stop promptly.
+            let _ = Spawner::kill_process(pid);
+
+            {
+                let db = db.lock().unwrap();
+                // Re-queue so the ticket can be picked up in the next evolution run.
+                db.update_ticket(&ticket_id, "pending", None, None, Some(None))?;
+                db.update_agent(worker_id, "idle", None, None)?;
+                db.log_event(
+                    Some(worker_id),
+                    "ticket_shutdown",
+                    &format!("ticket {} interrupted by shutdown request", ticket_id),
+                    None,
+                )?;
+            }
+
+            let _ = spawner.remove_worktree(worker_id);
+            return Ok(());
+        }
+        res = tokio::time::timeout(timeout, wait_handle) => res,
+    };
 
     match result {
         // Timed out
@@ -214,6 +264,10 @@ async fn handle_ticket_assignment(
                     // --- (3a) Parse log file for token usage (best effort) ---
                     let tokens = parse_token_usage_from_log(&spawner.log_path(worker_id));
 
+                    // --- (3b) Gate merge via `cargo test` (if Rust project) ---
+                    // We run tests inside the worker's worktree before the manager merges.
+                    let tests_passed = run_cargo_tests_if_rust_project(&worktree).unwrap_or(false);
+
                     // --- (3b) Update DB ---
                     {
                         let db = db.lock().unwrap();
@@ -224,6 +278,9 @@ async fn handle_ticket_assignment(
                                 "ticket_id": ticket_id,
                                 "worker_id": worker_id,
                                 "status": "review_pending",
+                                "tests_passed": tests_passed,
+                                "work_type": provider,
+                                "model": model,
                             })
                             .to_string(),
                             worker_id,
@@ -327,4 +384,44 @@ fn parse_token_usage_from_log(log_path: &std::path::Path) -> Option<i64> {
 /// Lightweight structured logging to stderr.
 fn tracing_log(worker_id: &str, msg: &str) {
     eprintln!("[worker:{}] {}", worker_id, msg);
+}
+
+fn run_cargo_tests_if_rust_project(worktree: &PathBuf) -> Option<bool> {
+    // If this doesn't look like a Rust project, we don't enforce tests.
+    if !worktree.join("Cargo.toml").is_file() {
+        return Some(true);
+    }
+
+    // Best-effort: if cargo or tests fail, we return false to prevent merging.
+    let output = Command::new("cargo")
+        .args(["test", "--quiet"])
+        .current_dir(worktree)
+        .output()
+        .ok()?;
+
+    Some(output.status.success())
+}
+
+fn select_provider_for_ticket(agents: &crate::config::AgentConfig, worker_id: &str, ticket_id: &str) -> String {
+    let mut order = agents.providers.clone();
+    if order.is_empty() {
+        order.push("claude".to_string());
+        if !agents.codex_path.trim().is_empty() {
+            order.push("codex".to_string());
+        }
+        if !agents.agent_path.trim().is_empty() {
+            order.push("agent".to_string());
+        }
+    }
+
+    if order.is_empty() {
+        order.push("claude".to_string());
+    }
+
+    let seed = (simple_hash(worker_id) + simple_hash(ticket_id)) as usize;
+    order[seed % order.len()].clone()
+}
+
+fn simple_hash(s: &str) -> u64 {
+    s.as_bytes().iter().map(|b| *b as u64).sum()
 }

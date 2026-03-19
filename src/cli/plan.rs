@@ -8,11 +8,7 @@ use crate::spawner::Spawner;
 
 pub fn execute() -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let acs_dir = cwd.join(".acs");
-
-    if !acs_dir.exists() {
-        bail!(".acs/ not found. Run `acs init` first.");
-    }
+    let acs_dir = crate::cli::acs_dir::resolve_acs_dir(&cwd)?;
 
     let config = Config::load(&acs_dir.join("config.toml"))?;
     let db = Db::open(&acs_dir.join("project.db"))?;

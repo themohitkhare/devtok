@@ -1,7 +1,6 @@
 use clap::Subcommand;
 use anyhow::{anyhow, Result};
 use crate::db::Db;
-use std::path::Path;
 
 #[derive(Subcommand)]
 pub enum KbCommands {
@@ -24,7 +23,9 @@ pub enum KbCommands {
 }
 
 pub fn execute(cmd: KbCommands) -> Result<()> {
-    let db = Db::open(Path::new(".acs/project.db"))?;
+    let cwd = std::env::current_dir()?;
+    let acs_dir = crate::cli::acs_dir::resolve_acs_dir(&cwd)?;
+    let db = Db::open(&acs_dir.join("project.db"))?;
 
     match cmd {
         KbCommands::Read { domain, key } => {

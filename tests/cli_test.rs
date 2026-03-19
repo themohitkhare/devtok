@@ -2,14 +2,9 @@ use std::process::Command;
 use std::fs;
 
 fn acs_bin() -> String {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let output = Command::new("cargo")
-        .args(["build"])
-        .current_dir(manifest_dir)
-        .output()
-        .expect("cargo build failed");
-    assert!(output.status.success(), "cargo build failed: {}", String::from_utf8_lossy(&output.stderr));
-    format!("{}/target/debug/acs", manifest_dir)
+    // Cargo sets `CARGO_BIN_EXE_<name>` for integration tests, so we can reuse
+    // the already-built binary without running `cargo build` inside each test.
+    format!("{}", env!("CARGO_BIN_EXE_acs"))
 }
 
 fn setup_test_dir() -> tempfile::TempDir {

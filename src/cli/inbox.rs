@@ -1,7 +1,6 @@
 use clap::Subcommand;
 use anyhow::Result;
 use crate::db::Db;
-use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
@@ -32,7 +31,9 @@ pub enum InboxCommands {
 }
 
 pub fn execute(cmd: InboxCommands) -> Result<()> {
-    let db = Db::open(Path::new(".acs/project.db"))?;
+    let cwd = std::env::current_dir()?;
+    let acs_dir = crate::cli::acs_dir::resolve_acs_dir(&cwd)?;
+    let db = Db::open(&acs_dir.join("project.db"))?;
 
     match cmd {
         InboxCommands::Push { to, msg_type, payload, sender } => {

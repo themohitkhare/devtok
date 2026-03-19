@@ -2,11 +2,8 @@ use anyhow::Result;
 use crate::db::Db;
 
 pub fn execute(follow: bool, limit: usize) -> Result<()> {
-    let acs_dir = std::env::current_dir()?.join(".acs");
-    if !acs_dir.exists() {
-        anyhow::bail!(".acs/ not found. Run `acs init` first.");
-    }
-
+    let cwd = std::env::current_dir()?;
+    let acs_dir = crate::cli::acs_dir::resolve_acs_dir(&cwd)?;
     let db = Db::open(&acs_dir.join("project.db"))?;
 
     let events = db.recent_events(limit)?;
