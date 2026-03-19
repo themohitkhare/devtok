@@ -1,19 +1,11 @@
-# Rust build artifacts
-backend/synapse-backend/spacetimedb/target/
+# Rust
+/target/
+*.swp
 
-# Node
-frontend/node_modules/
-frontend/dist/
-
-# Python
-worker/__pycache__/
-worker/src/__pycache__/
-worker/*.pyc
-**/*.pyc
-**/__pycache__/
+# ACS data directory (per-project, never committed)
+.acs/
 
 # Logs
-/tmp/synapse-*.log
 *.log
 
 # OS
@@ -21,3 +13,9 @@ worker/*.pyc
 
 # Editor
 .cursor/
+.vscode/
+
+
+# Added by cargo
+
+/target
