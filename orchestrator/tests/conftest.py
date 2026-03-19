@@ -1,8 +1,8 @@
-import pytest
+import pytest_asyncio
 import fakeredis.aioredis
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def redis():
     """Provide a fresh fakeredis async client per test."""
     client = fakeredis.aioredis.FakeRedis(decode_responses=True)
