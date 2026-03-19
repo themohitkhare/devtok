@@ -123,3 +123,117 @@ claude_path = "{}"
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn default_for_creates_valid_config() {
+        let cfg = Config::default_for("my-project");
+        assert_eq!(cfg.project.name, "my-project");
+        assert_eq!(cfg.project.default_workers, 2);
+        assert_eq!(cfg.manager.cycle_seconds, 15);
+        assert_eq!(cfg.manager.worker_timeout_seconds, 300);
+        assert_eq!(cfg.manager.worker_poll_seconds, 3);
+        assert_eq!(cfg.agents.tool_path, "acs");
+        assert_eq!(cfg.agents.claude_path, "claude");
+        assert!(!cfg.personas.mapping.is_empty());
+    }
+
+    #[test]
+    fn persona_for_domain_returns_correct_mappings() {
+        let cfg = Config::default_for("test");
+        assert_eq!(cfg.persona_for_domain("frontend"), "frontend-dev");
+        assert_eq!(cfg.persona_for_domain("backend"), "backend-dev");
+        assert_eq!(cfg.persona_for_domain("devops"), "devops");
+        assert_eq!(cfg.persona_for_domain("qa"), "qa");
+        assert_eq!(cfg.persona_for_domain("infra"), "devops");
+        assert_eq!(cfg.persona_for_domain("core"), "tech-lead");
+        assert_eq!(cfg.persona_for_domain("general"), "backend-dev");
+    }
+
+    #[test]
+    fn persona_for_domain_unknown_falls_back_to_backend_dev() {
+        let cfg = Config::default_for("test");
+        assert_eq!(cfg.persona_for_domain("nonexistent"), "backend-dev");
+        assert_eq!(cfg.persona_for_domain(""), "backend-dev");
+    }
+
+    #[test]
+    fn to_toml_roundtrips() {
+        let original = Config::default_for("roundtrip-proj");
+        let toml_str = original.to_toml();
+        let parsed: Config = toml::from_str(&toml_str).expect("should parse generated TOML");
+        assert_eq!(parsed.project.name, original.project.name);
+        assert_eq!(parsed.project.default_workers, original.project.default_workers);
+        assert_eq!(parsed.manager.cycle_seconds, original.manager.cycle_seconds);
+        assert_eq!(parsed.manager.worker_timeout_seconds, original.manager.worker_timeout_seconds);
+        assert_eq!(parsed.manager.worker_poll_seconds, original.manager.worker_poll_seconds);
+        assert_eq!(parsed.agents.tool_path, original.agents.tool_path);
+        assert_eq!(parsed.agents.claude_path, original.agents.claude_path);
+    }
+
+    #[test]
+    fn config_load_parses_toml_file() {
+        let toml_content = r#"
+[project]
+name = "file-test"
+default_workers = 4
+
+[manager]
+cycle_seconds = 30
+worker_timeout_seconds = 600
+worker_poll_seconds = 5
+
+[agents]
+tool_path = "/usr/bin/acs"
+claude_path = "/usr/bin/claude"
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "{}", toml_content).unwrap();
+
+        let cfg = Config::load(tmp.path()).expect("should load config from file");
+        assert_eq!(cfg.project.name, "file-test");
+        assert_eq!(cfg.project.default_workers, 4);
+        assert_eq!(cfg.manager.cycle_seconds, 30);
+        assert_eq!(cfg.manager.worker_timeout_seconds, 600);
+        assert_eq!(cfg.manager.worker_poll_seconds, 5);
+        assert_eq!(cfg.agents.tool_path, "/usr/bin/acs");
+        assert_eq!(cfg.agents.claude_path, "/usr/bin/claude");
+    }
+
+    #[test]
+    fn config_load_with_minimal_toml_uses_defaults() {
+        let toml_content = r#"
+[project]
+name = "minimal"
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "{}", toml_content).unwrap();
+
+        let cfg = Config::load(tmp.path()).expect("should load minimal config");
+        assert_eq!(cfg.project.name, "minimal");
+        assert_eq!(cfg.project.default_workers, 2);
+        assert_eq!(cfg.manager.cycle_seconds, 15);
+        assert_eq!(cfg.agents.tool_path, "acs");
+        assert_eq!(cfg.persona_for_domain("frontend"), "frontend-dev");
+    }
+
+    #[test]
+    fn config_load_fails_on_missing_file() {
+        let result = Config::load(Path::new("/nonexistent/path/config.toml"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_load_fails_on_invalid_toml() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "this is not valid toml {{{{").unwrap();
+
+        let result = Config::load(tmp.path());
+        assert!(result.is_err());
+    }
+}
