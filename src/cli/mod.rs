@@ -1,6 +1,7 @@
 pub mod ticket;
 pub mod kb;
 pub mod inbox;
+pub mod init;
 
 use clap::{Parser, Subcommand};
 

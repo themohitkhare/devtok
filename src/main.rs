@@ -9,7 +9,7 @@ fn main() -> anyhow::Result<()> {
         cli::Commands::Inbox(cmd) => cli::inbox::execute(cmd),
         cli::Commands::Status => { println!("TODO: status"); Ok(()) },
         cli::Commands::Log { .. } => { println!("TODO: log"); Ok(()) },
-        cli::Commands::Init { .. } => { println!("TODO: init"); Ok(()) },
+        cli::Commands::Init { spec, auto } => cli::init::execute(spec, auto),
         cli::Commands::Run { .. } => { println!("TODO: run"); Ok(()) },
     }
 }
