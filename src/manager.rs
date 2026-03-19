@@ -7,28 +7,47 @@ use tokio::time::{sleep, Duration};
 use crate::config::Config;
 use crate::db::Db;
 use crate::models::*;
+use crate::prompts;
+use crate::quality::score_ticket_from_branch;
 use crate::spawner::Spawner;
 
-/// Builds a pre-loaded KB context string for a worker's ticket assignment.
+/// Builds a structured pre-loaded list of KB entries for a worker's ticket assignment.
 ///
-/// Reads the most relevant KB entries for the ticket's domain and returns them
-/// as a formatted markdown string so the worker has immediate context without
-/// needing a round-trip to the DB at startup.
-fn build_kb_context(db: &Db, domain: &str) -> String {
+/// This is used to enrich the `ticket_assignment` payload with immediate context.
+fn build_kb_context_entries(db: &Db, domain: &str) -> Vec<crate::models::KnowledgeEntry> {
     let keys_to_fetch: &[(&str, &str)] = &[
+        // Domain-owned tech stack.
         (domain, "stack"),
+        // Domain-owned API contracts (if present).
+        (domain, "api-contracts"),
+        // Cross-domain architecture/conventions for consistent implementation style.
         ("general", "architecture"),
         ("general", "conventions"),
+        // Cross-domain API contracts (if present).
         ("architecture", "api-contracts"),
     ];
 
-    let mut parts = Vec::new();
+    let mut out = Vec::new();
     for &(d, k) in keys_to_fetch {
         if let Ok(Some(entry)) = db.read_knowledge(d, k) {
-            parts.push(format!("**{}/{}:** {}", entry.domain, entry.key, entry.value));
+            out.push(entry);
         }
     }
-    parts.join("\n\n")
+    out
+}
+
+fn format_kb_context(entries: &[crate::models::KnowledgeEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| format!("**{}/{}:** {}", entry.domain, entry.key, entry.value))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Builds a pre-loaded KB context string for a worker's ticket assignment.
+fn build_kb_context(db: &Db, domain: &str) -> String {
+    let entries = build_kb_context_entries(db, domain);
+    format_kb_context(&entries)
 }
 
 pub async fn run_loop(
@@ -131,6 +150,17 @@ fn select_model_for_provider(
     }
 }
 
+fn get_diff_for_branch(branch: &str, project_dir: &std::path::Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["diff", "main...", branch])
+        .current_dir(project_dir)
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => String::new(),
+    }
+}
+
 fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path) -> Result<()> {
     let mut assignments = 0usize;
     let mut completions = 0usize;
@@ -139,7 +169,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
     let mut merged = 0usize;
 
     // -----------------------------------------------------------------------
-    // 0. Auto-review: promote review_pending → completed (v1 — no code review)
+    // 0. Review: promote review_pending tickets — Tech Lead or auto-approve
     // -----------------------------------------------------------------------
     {
         let review_tickets = {
@@ -147,8 +177,100 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
             guard.list_tickets(Some("review_pending"))?
         };
 
+        let spawner = Spawner::new(project_dir, &config.agents.claude_path, &config.agents.tool_path);
+
         for ticket in review_tickets {
-            {
+            if config.quality.code_review {
+                // Tech Lead path: find the worker branch, create a review worktree,
+                // then spawn a Claude reviewer agent.
+                match spawner.find_branch_for_ticket(&ticket.id) {
+                    Ok(Some(branch)) => {
+                        let diff = get_diff_for_branch(&branch, project_dir);
+                        let prompt = prompts::tech_lead_review_prompt(
+                            &ticket.id,
+                            &branch,
+                            &config.agents.tool_path,
+                        );
+                        match spawner.create_review_worktree("tech-lead", &branch) {
+                            Ok(review_dir) => {
+                                let payload = serde_json::json!({
+                                    "ticket_id": ticket.id,
+                                    "branch": branch,
+                                    "diff_summary": &diff[..diff.len().min(500)],
+                                });
+                                match spawner.spawn_provider(
+                                    "claude",
+                                    None,
+                                    "tech-lead",
+                                    &review_dir,
+                                    &prompt,
+                                    "",
+                                ) {
+                                    Ok(_) => {
+                                        let guard = db.lock().unwrap();
+                                        guard.log_event(
+                                            Some("mgr"),
+                                            "tech_lead_review_started",
+                                            &format!(
+                                                "spawned tech-lead review for ticket {} on branch {} payload {}",
+                                                ticket.id,
+                                                branch,
+                                                payload.to_string()
+                                            ),
+                                            None,
+                                        )?;
+                                        eprintln!(
+                                            "[manager] spawned tech-lead review for ticket {} on branch {}",
+                                            ticket.id, branch
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[manager] failed to spawn tech-lead for ticket {}: {}",
+                                            ticket.id, e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[manager] failed to create review worktree for ticket {}: {}",
+                                    ticket.id, e
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // No branch found — auto-approve since there's nothing to review
+                        let guard = db.lock().unwrap();
+                        guard.update_ticket(
+                            &ticket.id,
+                            "completed",
+                            Some("Auto-reviewed by manager (no branch found)"),
+                            None,
+                            None,
+                        )?;
+                        guard.log_event(
+                            Some("mgr"),
+                            "ticket_reviewed",
+                            &format!("ticket {} auto-reviewed (no branch found)", ticket.id),
+                            None,
+                        )?;
+                        eprintln!(
+                            "[manager] auto-reviewed ticket {} (no branch found) → completed",
+                            ticket.id
+                        );
+                        reviewed += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[manager] error finding branch for ticket {} during review: {}",
+                            ticket.id, e
+                        );
+                    }
+                }
+            } else {
+                // Auto-review path (code_review disabled)
                 let guard = db.lock().unwrap();
                 guard.update_ticket(&ticket.id, "completed", Some("Auto-reviewed by manager"), None, None)?;
                 guard.log_event(
@@ -157,9 +279,9 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                     &format!("ticket {} auto-reviewed and completed", ticket.id),
                     None,
                 )?;
+                eprintln!("[manager] auto-reviewed ticket {} → completed", ticket.id);
+                reviewed += 1;
             }
-            eprintln!("[manager] auto-reviewed ticket {} → completed", ticket.id);
-            reviewed += 1;
         }
     }
 
@@ -245,9 +367,15 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 let model = select_model_for_provider(&work_type, &config.agents, ticket.priority);
 
                 // Pre-load KB entries so the worker has immediate context.
-                let kb_context = {
+                let (kb_entries, kb_context) = {
                     let guard = db.lock().unwrap();
-                    build_kb_context(&guard, &ticket.domain)
+                    let entries = build_kb_context_entries(&guard, &ticket.domain);
+                    let context = format_kb_context(&entries);
+                    let entries_payload = entries
+                        .iter()
+                        .map(|e| json!({ "domain": e.domain, "key": e.key, "value": e.value }))
+                        .collect::<Vec<_>>();
+                    (entries_payload, context)
                 };
 
                 let mut payload = json!({
@@ -258,6 +386,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                     "persona":     persona,
                     "work_type":   work_type,
                     "kb_context":  kb_context,
+                    "kb_entries":  kb_entries,
                 });
                 if let Some(m) = model {
                     payload["model"] = json!(m);
@@ -332,8 +461,12 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 let spawner = Spawner::new(project_dir, &config.agents.claude_path, &config.agents.tool_path);
 
                 if tests_passed {
-                    {
+                    let ticket_notes = {
                         let guard = db.lock().unwrap();
+                        let notes = guard
+                            .get_ticket(&ticket_id)?
+                            .map(|t| t.notes)
+                            .unwrap_or_default();
                         guard.update_ticket(&ticket_id, "completed", None, None, None)?;
                         guard.log_event(
                             Some(&msg.sender),
@@ -344,7 +477,8 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                             ),
                             None,
                         )?;
-                    }
+                        notes
+                    };
 
                     eprintln!(
                         "[manager] ticket {} completed by {} via {} (tests passed)",
@@ -355,6 +489,24 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                     // Attempt to merge the worker branch into main
                     match spawner.find_branch_for_ticket(&ticket_id) {
                         Ok(Some(branch)) => {
+                            // Auto-score while the branch still exists and before merging
+                            // it into `main` (quality detection runs `git diff main...<branch>`).
+                            if let Err(e) = {
+                                let guard = db.lock().unwrap();
+                                score_ticket_from_branch(
+                                    &*guard,
+                                    project_dir,
+                                    &ticket_id,
+                                    Some(&branch),
+                                    &ticket_notes,
+                                )
+                            } {
+                                eprintln!(
+                                    "[manager] quality scoring failed for ticket {} on branch {}: {}",
+                                    ticket_id, branch, e
+                                );
+                            }
+
                             match spawner.merge_branch(&branch) {
                                 Ok(true) => {
                                     // Merge succeeded — clean up the branch
@@ -730,6 +882,126 @@ mod tests {
         assert_eq!(g.get_ticket("t-002").unwrap().unwrap().status, "completed");
     }
 
+    #[test]
+    fn process_completions_computes_quality_score_from_branch_diff() {
+        use std::fs;
+        use std::process::Command;
+
+        let (db, config) = setup();
+
+        // Create an actual git repo so `git diff main...<branch>` works.
+        let repo = tempfile::tempdir().unwrap();
+        let repo_path = repo.path();
+
+        Command::new("git")
+            .args(["init"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        // Rename default branch to `main`.
+        Command::new("git")
+            .args(["branch", "-M", "main"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        fs::write(repo_path.join("README.md"), "base readme").unwrap();
+        fs::create_dir_all(repo_path.join("src")).unwrap();
+        fs::write(repo_path.join("src/lib.rs"), "pub fn base() {}").unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init", "--no-gpg-sign"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // Create an ACS branch for ticket t-001.
+        Command::new("git")
+            .args(["checkout", "-b", "acs/t-001-abc123"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // Add doc and test changes so the quality module can detect them.
+        fs::write(
+            repo_path.join("README.md"),
+            "changed readme with enough content to count as docs update",
+        )
+        .unwrap();
+        fs::create_dir_all(repo_path.join("tests")).unwrap();
+        fs::write(
+            repo_path.join("tests/quality_test.rs"),
+            "#[test]\nfn it_works() { assert!(true); }\n",
+        )
+        .unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "acs changes", "--no-gpg-sign"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // Ensure `main` is checked out so manager's merge targets it.
+        Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        {
+            let g = db.lock().unwrap();
+            g.create_ticket("Task A", "Do A", "general", 1).unwrap();
+            g.update_ticket(
+                "t-001",
+                "in_progress",
+                Some("AC verified - all tests pass"),
+                None,
+                None,
+            )
+            .unwrap();
+
+            g.push_inbox(
+                "mgr",
+                "ticket_completed",
+                r#"{"ticket_id":"t-001","tests_passed":true,"work_type":"backend","model":"claude"}"#,
+                "w-1",
+            )
+            .unwrap();
+        }
+
+        run_cycle(&db, &config, repo_path).unwrap();
+
+        let g = db.lock().unwrap();
+        let score = g
+            .get_quality_score("t-001")
+            .unwrap()
+            .expect("quality score should be computed");
+        assert!(score.tests_added);
+        assert!(score.docs_updated);
+        assert!(score.acceptance_criteria_met);
+        assert_eq!(score.score, 100);
+    }
+
     // -----------------------------------------------------------------------
     // unblock_tickets: resets blocked tickets when blocker completes
     // -----------------------------------------------------------------------
@@ -1001,10 +1273,15 @@ mod tests {
 
         let payload: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
         let kb_context = payload["kb_context"].as_str().unwrap_or("");
+        let kb_entries = payload["kb_entries"].as_array().unwrap();
         assert!(!kb_context.is_empty(), "kb_context should be non-empty when KB has entries");
         assert!(kb_context.contains("backend/stack"), "kb_context should contain domain stack");
         assert!(kb_context.contains("Rust, Axum"), "kb_context should contain stack value");
         assert!(kb_context.contains("general/architecture"), "kb_context should contain architecture");
+        assert!(
+            kb_entries.iter().any(|e| e["domain"] == "backend" && e["key"] == "stack"),
+            "kb_entries should include backend/stack"
+        );
     }
 
     #[test]
@@ -1023,7 +1300,9 @@ mod tests {
         let msg = g.pop_inbox("w-1").unwrap().expect("worker should have received an assignment");
         let payload: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
         let kb_context = payload["kb_context"].as_str().unwrap_or("missing");
+        let kb_entries = payload["kb_entries"].as_array().unwrap();
         // Should be present in payload but empty string
         assert_eq!(kb_context, "", "kb_context should be empty string when KB has no entries");
+        assert!(kb_entries.is_empty(), "kb_entries should be empty when KB has no entries");
     }
 }
