@@ -2,6 +2,7 @@ pub mod ticket;
 pub mod kb;
 pub mod inbox;
 pub mod init;
+pub mod plan;
 pub mod run;
 pub mod status;
 pub mod log;
@@ -26,6 +27,8 @@ pub enum Commands {
         #[arg(long)]
         auto: bool,
     },
+    /// Run the Solution Architect agent to plan milestones and write ADRs
+    Plan,
     /// Start manager + workers to execute tickets
     Run {
         /// Number of worker agents
