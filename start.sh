@@ -3,21 +3,24 @@
 # Starts SpacetimeDB, publishes module, seeds data, starts worker + frontend
 set -euo pipefail
 
-export PATH="/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+# Prefer rustup's cargo (has wasm32 target); Homebrew's standalone rust has no wasm32
+export PATH="$HOME/.cargo/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:$HOME/.local/bin:$PATH"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 DB_NAME="synapse-backend-g9cee"
 DB_URL="http://localhost:3000"
 
 STDB_PID=""
 WORKER_PID=""
+ORCHESTRATOR_PID=""
 FRONTEND_PID=""
 
 cleanup() {
   echo ""
   echo "Stopping Synapse..."
-  [ -n "$FRONTEND_PID" ] && kill "$FRONTEND_PID" 2>/dev/null || true
-  [ -n "$WORKER_PID" ]   && kill "$WORKER_PID"   2>/dev/null || true
-  [ -n "$STDB_PID" ]     && kill "$STDB_PID"     2>/dev/null || true
+  [ -n "$FRONTEND_PID" ]     && kill "$FRONTEND_PID"     2>/dev/null || true
+  [ -n "$ORCHESTRATOR_PID" ] && kill "$ORCHESTRATOR_PID" 2>/dev/null || true
+  [ -n "$WORKER_PID" ]       && kill "$WORKER_PID"       2>/dev/null || true
+  [ -n "$STDB_PID" ]         && kill "$STDB_PID"         2>/dev/null || true
   echo "Done."
 }
 trap cleanup EXIT INT TERM
@@ -42,6 +45,14 @@ else
     fi
   done
 fi
+
+# ── 1b. Redis ─────────────────────────────────────────────────────────────────
+# Check Redis is running
+if ! redis-cli ping > /dev/null 2>&1; then
+    echo "⚠ Redis not running. Starting Redis..."
+    redis-server --daemonize yes
+fi
+echo "✓ Redis connected"
 
 # ── 2. Publish module ─────────────────────────────────────────────────────────
 echo "▶ Publishing SpacetimeDB module..."
@@ -70,7 +81,17 @@ WORKER_PID=$!
 cd "$ROOT"
 echo "✅ Worker started (PID $WORKER_PID) — logs: /tmp/synapse-worker.log"
 
-# ── 5. Frontend dev server ────────────────────────────────────────────────────
+# ── 5. Synapse OS orchestrator ────────────────────────────────────────────────
+# Start Synapse OS orchestrator
+echo "Starting Synapse OS orchestrator..."
+cd "$ROOT/orchestrator"
+pip3 install -e . --quiet --break-system-packages 2>/dev/null
+synapse-os > /tmp/synapse-os.log 2>&1 &
+ORCHESTRATOR_PID=$!
+echo "✓ Orchestrator running (PID: $ORCHESTRATOR_PID)"
+cd "$ROOT"
+
+# ── 6. Frontend dev server ────────────────────────────────────────────────────
 echo "▶ Starting frontend..."
 cd "$ROOT/frontend"
 npm install --silent 2>/dev/null || true
