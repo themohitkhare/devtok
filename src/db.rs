@@ -109,7 +109,15 @@ impl Db {
                 FOREIGN KEY (milestone_id) REFERENCES milestones(id) ON DELETE CASCADE,
                 FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
             );
-            CREATE INDEX IF NOT EXISTS idx_milestone_tickets_milestone ON milestone_tickets(milestone_id);"
+            CREATE INDEX IF NOT EXISTS idx_milestone_tickets_milestone ON milestone_tickets(milestone_id);
+            CREATE TABLE IF NOT EXISTS quality_scores (
+                ticket_id TEXT PRIMARY KEY,
+                tests_added INTEGER NOT NULL,
+                docs_updated INTEGER NOT NULL,
+                acceptance_criteria_met INTEGER NOT NULL,
+                score INTEGER NOT NULL,
+                computed_at TEXT NOT NULL
+            );"
         )?;
 
         // Additive migrations: add new columns to existing events tables.
@@ -728,5 +736,63 @@ impl Db {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).map_err(Into::into)
+    }
+
+    // --- Quality Scores ---
+
+    pub fn upsert_quality_score(&self, score: &QualityScore) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO quality_scores (ticket_id, tests_added, docs_updated, acceptance_criteria_met, score, computed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(ticket_id) DO UPDATE SET
+                 tests_added = excluded.tests_added,
+                 docs_updated = excluded.docs_updated,
+                 acceptance_criteria_met = excluded.acceptance_criteria_met,
+                 score = excluded.score,
+                 computed_at = excluded.computed_at",
+            params![
+                score.ticket_id,
+                score.tests_added as i32,
+                score.docs_updated as i32,
+                score.acceptance_criteria_met as i32,
+                score.score,
+                score.computed_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_quality_score(&self, ticket_id: &str) -> Result<Option<QualityScore>> {
+        self.conn
+            .query_row(
+                "SELECT ticket_id, tests_added, docs_updated, acceptance_criteria_met, score, computed_at
+                 FROM quality_scores
+                 WHERE ticket_id = ?1",
+                params![ticket_id],
+                |row| Self::row_to_quality_score(row),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_quality_scores(&self) -> Result<Vec<QualityScore>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ticket_id, tests_added, docs_updated, acceptance_criteria_met, score, computed_at
+             FROM quality_scores
+             ORDER BY computed_at DESC, ticket_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| Self::row_to_quality_score(row))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    fn row_to_quality_score(row: &rusqlite::Row) -> rusqlite::Result<QualityScore> {
+        Ok(QualityScore {
+            ticket_id: row.get(0)?,
+            tests_added: row.get::<_, i32>(1)? != 0,
+            docs_updated: row.get::<_, i32>(2)? != 0,
+            acceptance_criteria_met: row.get::<_, i32>(3)? != 0,
+            score: row.get(4)?,
+            computed_at: row.get(5)?,
+        })
     }
 }
