@@ -8,7 +8,7 @@ use crate::db::Db;
 use crate::manager;
 use crate::worker;
 
-pub fn execute(workers: usize) -> Result<()> {
+pub fn execute(workers: usize, backend: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let acs_dir = crate::cli::acs_dir::resolve_acs_dir(&cwd)?;
     let project_dir = acs_dir
@@ -41,7 +41,7 @@ pub fn execute(workers: usize) -> Result<()> {
             manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown).await
         });
 
-        // Spawn worker tasks
+        // Spawn worker tasks — each gets a per-worker provider resolved from --backend
         let mut worker_handles = vec![];
         for i in 0..workers {
             let worker_id = format!("w-{}", i);
@@ -49,13 +49,18 @@ pub fn execute(workers: usize) -> Result<()> {
             let w_config = config.clone();
             let w_dir = project_dir.clone();
             let w_shutdown = shutdown_rx.clone();
+            let forced_provider = resolve_worker_provider(i, workers, backend.as_deref());
             let handle = tokio::spawn(async move {
-                worker::worker_loop(worker_id, w_db, w_config, w_dir, w_shutdown).await
+                worker::worker_loop(worker_id, w_db, w_config, w_dir, w_shutdown, forced_provider).await
             });
             worker_handles.push(handle);
         }
 
-        println!("ACS running with {} workers. Press Ctrl+C to stop.", workers);
+        if let Some(ref b) = backend {
+            println!("ACS running with {} workers (backend: {}). Press Ctrl+C to stop.", workers, b);
+        } else {
+            println!("ACS running with {} workers. Press Ctrl+C to stop.", workers);
+        }
 
         // Wait for Ctrl+C
         tokio::signal::ctrl_c().await.ok();
@@ -108,4 +113,94 @@ pub fn execute(workers: usize) -> Result<()> {
     })?;
 
     Ok(())
+}
+
+/// Resolves the provider for a specific worker index given the --backend flag.
+///
+/// - `None` → no forced provider; worker uses config-based selection
+/// - `"claude"` → all workers use claude
+/// - `"cursor"` → all workers use the cursor agent (mapped to "agent" internally)
+/// - `"codex"` → all workers use codex
+/// - `"mixed"` → first half of workers use claude, second half use cursor/agent
+/// - anything else → treated as a literal provider name
+pub fn resolve_worker_provider(index: usize, total: usize, backend: Option<&str>) -> Option<String> {
+    match backend {
+        None => None,
+        Some("mixed") => {
+            // First half (floor division) → claude; second half → cursor agent
+            let split = total / 2;
+            if total <= 1 || index < split {
+                Some("claude".to_string())
+            } else {
+                Some("agent".to_string())
+            }
+        }
+        Some("cursor") => Some("agent".to_string()),
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_backend_returns_none() {
+        assert_eq!(resolve_worker_provider(0, 4, None), None);
+        assert_eq!(resolve_worker_provider(3, 4, None), None);
+    }
+
+    #[test]
+    fn cursor_backend_maps_to_agent_for_all_workers() {
+        for i in 0..4 {
+            assert_eq!(
+                resolve_worker_provider(i, 4, Some("cursor")),
+                Some("agent".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn claude_backend_maps_to_claude_for_all_workers() {
+        for i in 0..4 {
+            assert_eq!(
+                resolve_worker_provider(i, 4, Some("claude")),
+                Some("claude".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn codex_backend_maps_to_codex_for_all_workers() {
+        for i in 0..4 {
+            assert_eq!(
+                resolve_worker_provider(i, 4, Some("codex")),
+                Some("codex".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_backend_splits_at_midpoint() {
+        // total=4: workers 0,1 → claude; workers 2,3 → agent
+        assert_eq!(resolve_worker_provider(0, 4, Some("mixed")), Some("claude".to_string()));
+        assert_eq!(resolve_worker_provider(1, 4, Some("mixed")), Some("claude".to_string()));
+        assert_eq!(resolve_worker_provider(2, 4, Some("mixed")), Some("agent".to_string()));
+        assert_eq!(resolve_worker_provider(3, 4, Some("mixed")), Some("agent".to_string()));
+    }
+
+    #[test]
+    fn mixed_backend_with_odd_total() {
+        // total=5: workers 0,1 → claude (floor(5/2)=2); workers 2,3,4 → agent
+        assert_eq!(resolve_worker_provider(0, 5, Some("mixed")), Some("claude".to_string()));
+        assert_eq!(resolve_worker_provider(1, 5, Some("mixed")), Some("claude".to_string()));
+        assert_eq!(resolve_worker_provider(2, 5, Some("mixed")), Some("agent".to_string()));
+        assert_eq!(resolve_worker_provider(3, 5, Some("mixed")), Some("agent".to_string()));
+        assert_eq!(resolve_worker_provider(4, 5, Some("mixed")), Some("agent".to_string()));
+    }
+
+    #[test]
+    fn mixed_backend_single_worker_uses_claude() {
+        assert_eq!(resolve_worker_provider(0, 1, Some("mixed")), Some("claude".to_string()));
+    }
 }

@@ -37,6 +37,9 @@ pub enum Commands {
         /// Number of worker agents
         #[arg(long, default_value = "2")]
         workers: usize,
+        /// Backend provider: claude, cursor, codex, or mixed (first half claude, second half cursor)
+        #[arg(long)]
+        backend: Option<String>,
     },
     /// Iteratively run manager/workers + incremental bootstrap (self-development loop)
     Evolve {
@@ -58,9 +61,16 @@ pub enum Commands {
         /// Max seconds for a single bounded manager/worker run (optional)
         #[arg(long)]
         max_run_seconds: Option<u64>,
+        /// Do not overwrite existing agents in the DB (useful to resume after
+        /// an interrupted run). This helps avoid clobbering in-flight work.
+        #[arg(long, default_value = "false")]
+        preserve_agents: bool,
         /// Dry-run: don't spawn Claude/agents; just print current ticket count
         #[arg(long, default_value = "false")]
         dry_run: bool,
+        /// Backend provider: claude, cursor, codex, or mixed (first half claude, second half cursor)
+        #[arg(long)]
+        backend: Option<String>,
     },
     /// Show project status
     Status,

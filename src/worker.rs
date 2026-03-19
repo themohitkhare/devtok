@@ -22,6 +22,7 @@ pub async fn worker_loop(
     config: Config,
     project_dir: PathBuf,
     mut shutdown: watch::Receiver<bool>,
+    forced_provider: Option<String>,
 ) {
     let poll_interval = Duration::from_secs(config.manager.worker_poll_seconds);
 
@@ -60,6 +61,7 @@ pub async fn worker_loop(
                     &config,
                     &project_dir,
                     &mut shutdown,
+                    forced_provider.clone(),
                 )
                 .await
                 {
@@ -96,6 +98,7 @@ async fn handle_ticket_assignment(
     config: &Config,
     project_dir: &PathBuf,
     shutdown: &mut watch::Receiver<bool>,
+    forced_provider: Option<String>,
 ) -> Result<()> {
     // --- (a) Parse payload ---
     let val: serde_json::Value = serde_json::from_str(payload)?;
@@ -108,12 +111,14 @@ async fn handle_ticket_assignment(
         .unwrap_or_else(|| config.persona_for_domain(&domain))
         .to_string();
 
-    let provider = val
-        .get("work_type")
-        .or_else(|| val.get("provider"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| select_provider_for_ticket(&config.agents, worker_id, &ticket_id));
+    // Provider selection: forced_provider (from --backend flag) > payload override > config-based selection
+    let provider = forced_provider.unwrap_or_else(|| {
+        val.get("work_type")
+            .or_else(|| val.get("provider"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| select_provider_for_ticket(&config.agents, worker_id, &ticket_id))
+    });
 
     let model = val
         .get("model")

@@ -20,7 +20,9 @@ pub fn execute(
     bootstrap_after_run: bool,
     stop_when_no_new_tickets: bool,
     max_run_seconds: Option<u64>,
+    preserve_agents: bool,
     dry_run: bool,
+    backend: Option<String>,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let acs_dir = acs_dir::resolve_acs_dir(&cwd)?;
@@ -84,7 +86,16 @@ pub fn execute(
             }
 
             // Run bounded manager+workers until the queue drains or timeout.
-            run_bounded_workers(&db, &config, &project_dir, workers, max_run_seconds).await?;
+            run_bounded_workers(
+                &db,
+                &config,
+                &project_dir,
+                workers,
+                max_run_seconds,
+                preserve_agents,
+                backend.clone(),
+            )
+            .await?;
 
             if !bootstrap_after_run {
                 // If caller doesn't want additional tickets, exit after first run.
@@ -158,15 +169,35 @@ async fn run_bounded_workers(
     project_dir: &PathBuf,
     workers: usize,
     max_run_seconds: Option<u64>,
+    preserve_agents: bool,
+    backend: Option<String>,
 ) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Register workers.
+    // Register workers (optionally preserve existing agent state).
+    let mut newly_registered: Vec<String> = vec![];
     {
-        let db = db.lock().unwrap();
+        let db_guard = db.lock().unwrap();
+        let existing_agents = db_guard.list_agents()?;
+        let existing_ids: std::collections::HashSet<String> =
+            existing_agents.into_iter().map(|a| a.id).collect();
+
+        let mut ids_to_register = vec![];
         for i in 0..workers {
             let worker_id = format!("w-{}", i);
-            db.register_agent(&worker_id, "worker", "general")?;
+            if !preserve_agents || !existing_ids.contains(&worker_id) {
+                ids_to_register.push(worker_id.clone());
+            }
+        }
+
+        // Apply registration.
+        // Note: we reuse the same lock scope (db_guard is immutable borrow after list_agents),
+        // so we re-lock below for the updates.
+        drop(db_guard);
+        let db_guard = db.lock().unwrap();
+        for worker_id in ids_to_register {
+            db_guard.register_agent(&worker_id, "worker", "general")?;
+            newly_registered.push(worker_id);
         }
     }
 
@@ -187,8 +218,9 @@ async fn run_bounded_workers(
         let w_config = config.clone();
         let w_dir = project_dir.clone();
         let w_shutdown = shutdown_rx.clone();
+        let forced_provider = crate::cli::run::resolve_worker_provider(i, workers, backend.as_deref());
         let handle = tokio::spawn(async move {
-            worker::worker_loop(worker_id, w_db, w_config, w_dir, w_shutdown).await
+            worker::worker_loop(worker_id, w_db, w_config, w_dir, w_shutdown, forced_provider).await
         });
         worker_handles.push(handle);
     }
@@ -236,8 +268,14 @@ async fn run_bounded_workers(
     // Deregister agents.
     {
         let db = db.lock().unwrap();
-        for i in 0..workers {
-            db.deregister_agent(&format!("w-{}", i)).ok();
+        if preserve_agents {
+            for id in newly_registered {
+                db.deregister_agent(&id).ok();
+            }
+        } else {
+            for i in 0..workers {
+                db.deregister_agent(&format!("w-{}", i)).ok();
+            }
         }
     }
 

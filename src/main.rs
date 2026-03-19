@@ -25,7 +25,7 @@ fn main() -> ExitCode {
         cli::Commands::Inbox(cmd) => cli::inbox::execute(cmd),
         cli::Commands::Init { spec, auto } => cli::init::execute(spec, auto),
         cli::Commands::Plan => cli::plan::execute(),
-        cli::Commands::Run { workers } => cli::run::execute(workers),
+        cli::Commands::Run { workers, backend } => cli::run::execute(workers, backend),
         cli::Commands::Evolve {
             workers,
             max_iterations,
@@ -33,7 +33,9 @@ fn main() -> ExitCode {
             bootstrap_after_run,
             stop_when_no_new_tickets,
             max_run_seconds,
+            preserve_agents,
             dry_run,
+            backend,
         } => cli::evolve::execute(
             workers,
             max_iterations,
@@ -41,7 +43,9 @@ fn main() -> ExitCode {
             bootstrap_after_run,
             stop_when_no_new_tickets,
             max_run_seconds,
+            preserve_agents,
             dry_run,
+            backend,
         ),
         cli::Commands::Cleanup => cli::cleanup::execute(),
         cli::Commands::Status => cli::status::execute(),
