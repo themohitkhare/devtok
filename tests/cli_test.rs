@@ -192,6 +192,82 @@ fn test_inbox_pop_empty_returns_json() {
     assert_eq!(json["status"], "empty");
 }
 
+// --- Ticket deduplication CLI tests ---
+
+#[test]
+fn test_ticket_create_dedup_noninteractive_blocks_duplicate() {
+    let bin = acs_bin();
+    let dir = setup_test_dir();
+
+    // Create first ticket
+    let output = Command::new(&bin)
+        .args(["ticket", "create", "--title", "Add user authentication system", "--description", "Implement login and signup flow", "--domain", "backend", "--priority", "1"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Create near-identical ticket in non-interactive mode — should be skipped
+    let output2 = Command::new(&bin)
+        .args(["ticket", "create", "--title", "Add user authentication system", "--description", "Implement login and signup flow", "--domain", "backend", "--priority", "1", "--non-interactive"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output2.status.success());
+    let stdout = String::from_utf8_lossy(&output2.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(json["status"], "skipped");
+    assert_eq!(json["reason"], "duplicate");
+}
+
+#[test]
+fn test_ticket_create_dedup_force_allows_duplicate() {
+    let bin = acs_bin();
+    let dir = setup_test_dir();
+
+    // Create first ticket
+    Command::new(&bin)
+        .args(["ticket", "create", "--title", "Add user authentication system", "--description", "Implement login and signup flow", "--domain", "backend", "--priority", "1"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // Create identical ticket with --force — should succeed
+    let output2 = Command::new(&bin)
+        .args(["ticket", "create", "--title", "Add user authentication system", "--description", "Implement login and signup flow", "--domain", "backend", "--priority", "1", "--force"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output2.status.success());
+    let stdout = String::from_utf8_lossy(&output2.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(json["status"], "created");
+}
+
+#[test]
+fn test_ticket_create_dedup_different_ticket_passes() {
+    let bin = acs_bin();
+    let dir = setup_test_dir();
+
+    // Create first ticket
+    Command::new(&bin)
+        .args(["ticket", "create", "--title", "Add user authentication", "--description", "Login flow", "--domain", "backend", "--priority", "1"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // Create completely different ticket — should succeed even in non-interactive
+    let output2 = Command::new(&bin)
+        .args(["ticket", "create", "--title", "Deploy monitoring dashboard", "--description", "Set up Grafana", "--domain", "devops", "--priority", "2", "--non-interactive"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output2.status.success());
+    let stdout = String::from_utf8_lossy(&output2.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(json["status"], "created");
+}
+
 // --- Missing .acs directory tests ---
 
 #[test]

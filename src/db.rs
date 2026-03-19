@@ -82,7 +82,14 @@ impl Db {
                 name TEXT PRIMARY KEY,
                 value INTEGER NOT NULL DEFAULT 0
             );
-            INSERT OR IGNORE INTO counters (name, value) VALUES ('ticket_id', 0);"
+            INSERT OR IGNORE INTO counters (name, value) VALUES ('ticket_id', 0);
+            CREATE TABLE IF NOT EXISTS ticket_keywords (
+                ticket_id TEXT NOT NULL,
+                keyword TEXT NOT NULL,
+                PRIMARY KEY (ticket_id, keyword),
+                FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_ticket_keywords_keyword ON ticket_keywords(keyword);"
         )?;
         Ok(())
     }
@@ -196,6 +203,96 @@ impl Db {
             assignee: row.get(6)?, blocked_by: row.get(7)?, notes: row.get(8)?,
             created_at: row.get(9)?, updated_at: row.get(10)?,
         })
+    }
+
+    // --- Ticket Keywords / Deduplication ---
+
+    /// Extract meaningful keywords from text: lowercase, split on non-alphanumeric,
+    /// filter stop words and short tokens.
+    pub fn extract_keywords(text: &str) -> std::collections::HashSet<String> {
+        const STOP_WORDS: &[&str] = &[
+            "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+            "of", "with", "by", "from", "is", "it", "as", "be", "was", "are",
+            "that", "this", "not", "can", "will", "has", "have", "had", "do",
+            "does", "did", "should", "would", "could", "may", "might", "shall",
+            "its", "into", "than", "then", "also", "just", "so", "if", "when",
+            "use", "using", "via", "e.g", "etc", "new", "all", "each", "any",
+            "about", "over", "after", "before", "between", "through", "during",
+        ];
+        text.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 3 && !STOP_WORDS.contains(w))
+            .map(String::from)
+            .collect()
+    }
+
+    /// Store keywords for a ticket.
+    pub fn store_ticket_keywords(&self, ticket_id: &str, title: &str, description: &str) -> Result<()> {
+        let mut keywords = Self::extract_keywords(title);
+        keywords.extend(Self::extract_keywords(description));
+        let mut stmt = self.conn.prepare(
+            "INSERT OR IGNORE INTO ticket_keywords (ticket_id, keyword) VALUES (?1, ?2)"
+        )?;
+        for kw in &keywords {
+            stmt.execute(params![ticket_id, kw])?;
+        }
+        Ok(())
+    }
+
+    /// Find tickets that share keywords with the given text and compute Jaccard similarity.
+    /// Returns vec of (ticket_id, title, similarity_score) sorted by score descending.
+    pub fn find_similar_tickets(&self, title: &str, description: &str) -> Result<Vec<(String, String, f64)>> {
+        let input_keywords = Self::extract_keywords(title);
+        let input_desc_keywords = Self::extract_keywords(description);
+        let all_input: std::collections::HashSet<String> =
+            input_keywords.union(&input_desc_keywords).cloned().collect();
+
+        if all_input.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Find candidate ticket IDs that share at least one keyword
+        let placeholders: Vec<String> = (0..all_input.len()).map(|i| format!("?{}", i + 1)).collect();
+        let sql = format!(
+            "SELECT DISTINCT ticket_id FROM ticket_keywords WHERE keyword IN ({})",
+            placeholders.join(", ")
+        );
+        let keyword_vec: Vec<&str> = all_input.iter().map(|s| s.as_str()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let candidate_ids: Vec<String> = stmt
+            .query_map(rusqlite::params_from_iter(&keyword_vec), |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut results = Vec::new();
+        for cid in candidate_ids {
+            // Get this candidate's keywords
+            let mut kw_stmt = self.conn.prepare(
+                "SELECT keyword FROM ticket_keywords WHERE ticket_id = ?1"
+            )?;
+            let candidate_keywords: std::collections::HashSet<String> = kw_stmt
+                .query_map(params![cid], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            // Jaccard similarity
+            let intersection = all_input.intersection(&candidate_keywords).count() as f64;
+            let union = all_input.union(&candidate_keywords).count() as f64;
+            let similarity = if union > 0.0 { intersection / union } else { 0.0 };
+
+            if similarity > 0.0 {
+                // Get ticket title
+                let ticket_title: String = self.conn.query_row(
+                    "SELECT title FROM tickets WHERE id = ?1",
+                    params![cid],
+                    |row| row.get(0),
+                )?;
+                results.push((cid, ticket_title, similarity));
+            }
+        }
+
+        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(results)
     }
 
     // --- Inbox ---

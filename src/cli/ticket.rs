@@ -2,6 +2,7 @@ use clap::Subcommand;
 use anyhow::{anyhow, Result};
 use crate::db::Db;
 use std::path::Path;
+use std::io::{self, Write};
 
 #[derive(Subcommand)]
 pub enum TicketCommands {
@@ -22,6 +23,12 @@ pub enum TicketCommands {
         priority: i32,
         #[arg(long)]
         blocked_by: Option<String>,
+        /// Skip duplicate check and create anyway
+        #[arg(long, default_value = "false")]
+        force: bool,
+        /// Non-interactive mode (auto-skip if >80% match)
+        #[arg(long, default_value = "false")]
+        non_interactive: bool,
     },
     /// Update ticket status
     Update {
@@ -40,12 +47,64 @@ pub enum TicketCommands {
     },
 }
 
+/// Similarity threshold for showing a warning (70%)
+const SIMILARITY_WARN_THRESHOLD: f64 = 0.70;
+/// Similarity threshold for auto-skipping in non-interactive mode (80%)
+const SIMILARITY_BLOCK_THRESHOLD: f64 = 0.80;
+
 pub fn execute(cmd: TicketCommands) -> Result<()> {
     let db = Db::open(Path::new(".acs/project.db"))?;
 
     match cmd {
-        TicketCommands::Create { title, description, domain, priority, blocked_by } => {
+        TicketCommands::Create { title, description, domain, priority, blocked_by, force, non_interactive } => {
+            // Check for similar tickets unless --force is set
+            if !force {
+                let similar = db.find_similar_tickets(&title, &description)?;
+                let top_match = similar.first();
+
+                if let Some((match_id, match_title, score)) = top_match {
+                    let pct = (score * 100.0).round() as u32;
+
+                    if pct as f64 >= SIMILARITY_WARN_THRESHOLD * 100.0 {
+                        if non_interactive && *score >= SIMILARITY_BLOCK_THRESHOLD {
+                            let out = serde_json::json!({
+                                "status": "skipped",
+                                "reason": "duplicate",
+                                "similar_ticket": match_id,
+                                "similar_title": match_title,
+                                "similarity": pct
+                            });
+                            println!("{}", serde_json::to_string_pretty(&out)?);
+                            return Ok(());
+                        }
+
+                        if !non_interactive {
+                            eprintln!(
+                                "Similar ticket exists: {} ({}% match) - \"{}\"",
+                                match_id, pct, match_title
+                            );
+                            eprint!("Create anyway? [y/N] ");
+                            io::stderr().flush()?;
+                            let mut input = String::new();
+                            io::stdin().read_line(&mut input)?;
+                            if !input.trim().eq_ignore_ascii_case("y") {
+                                let out = serde_json::json!({
+                                    "status": "skipped",
+                                    "reason": "duplicate",
+                                    "similar_ticket": match_id,
+                                    "similar_title": match_title,
+                                    "similarity": pct
+                                });
+                                println!("{}", serde_json::to_string_pretty(&out)?);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+
             let id = db.create_ticket(&title, &description, &domain, priority)?;
+            db.store_ticket_keywords(&id, &title, &description)?;
             if let Some(blocked) = blocked_by {
                 db.update_ticket(&id, "pending", None, Some(&blocked), None)?;
             }
