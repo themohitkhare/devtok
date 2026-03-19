@@ -167,9 +167,10 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
     let mut unblocked = 0usize;
     let mut reviewed = 0usize;
     let mut merged = 0usize;
+    let mut milestones_ready = 0usize;
 
     // -----------------------------------------------------------------------
-    // 0. Review: promote review_pending tickets — Tech Lead or auto-approve
+    // 0. Review: promote review_pending tickets — auto-approve
     // -----------------------------------------------------------------------
     {
         let review_tickets = {
@@ -177,111 +178,24 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
             guard.list_tickets(Some("review_pending"))?
         };
 
-        let spawner = Spawner::new(project_dir, &config.agents.claude_path, &config.agents.tool_path);
-
         for ticket in review_tickets {
-            if config.quality.code_review {
-                // Tech Lead path: find the worker branch, create a review worktree,
-                // then spawn a Claude reviewer agent.
-                match spawner.find_branch_for_ticket(&ticket.id) {
-                    Ok(Some(branch)) => {
-                        let diff = get_diff_for_branch(&branch, project_dir);
-                        let prompt = prompts::tech_lead_review_prompt(
-                            &ticket.id,
-                            &branch,
-                            &config.agents.tool_path,
-                        );
-                        match spawner.create_review_worktree("tech-lead", &branch) {
-                            Ok(review_dir) => {
-                                let payload = serde_json::json!({
-                                    "ticket_id": ticket.id,
-                                    "branch": branch,
-                                    "diff_summary": &diff[..diff.len().min(500)],
-                                });
-                                match spawner.spawn_provider(
-                                    "claude",
-                                    None,
-                                    "tech-lead",
-                                    &review_dir,
-                                    &prompt,
-                                    "",
-                                ) {
-                                    Ok(_) => {
-                                        let guard = db.lock().unwrap();
-                                        guard.log_event(
-                                            Some("mgr"),
-                                            "tech_lead_review_started",
-                                            &format!(
-                                                "spawned tech-lead review for ticket {} on branch {} payload {}",
-                                                ticket.id,
-                                                branch,
-                                                payload.to_string()
-                                            ),
-                                            None,
-                                        )?;
-                                        eprintln!(
-                                            "[manager] spawned tech-lead review for ticket {} on branch {}",
-                                            ticket.id, branch
-                                        );
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[manager] failed to spawn tech-lead for ticket {}: {}",
-                                            ticket.id, e
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "[manager] failed to create review worktree for ticket {}: {}",
-                                    ticket.id, e
-                                );
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // No branch found — auto-approve since there's nothing to review
-                        let guard = db.lock().unwrap();
-                        guard.update_ticket(
-                            &ticket.id,
-                            "completed",
-                            Some("Auto-reviewed by manager (no branch found)"),
-                            None,
-                            None,
-                        )?;
-                        guard.log_event(
-                            Some("mgr"),
-                            "ticket_reviewed",
-                            &format!("ticket {} auto-reviewed (no branch found)", ticket.id),
-                            None,
-                        )?;
-                        eprintln!(
-                            "[manager] auto-reviewed ticket {} (no branch found) → completed",
-                            ticket.id
-                        );
-                        reviewed += 1;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[manager] error finding branch for ticket {} during review: {}",
-                            ticket.id, e
-                        );
-                    }
-                }
-            } else {
-                // Auto-review path (code_review disabled)
-                let guard = db.lock().unwrap();
-                guard.update_ticket(&ticket.id, "completed", Some("Auto-reviewed by manager"), None, None)?;
-                guard.log_event(
-                    Some("mgr"),
-                    "ticket_reviewed",
-                    &format!("ticket {} auto-reviewed and completed", ticket.id),
-                    None,
-                )?;
-                eprintln!("[manager] auto-reviewed ticket {} → completed", ticket.id);
-                reviewed += 1;
-            }
+            // Auto-review path
+            let guard = db.lock().unwrap();
+            guard.update_ticket(
+                &ticket.id,
+                "completed",
+                Some("Auto-reviewed by manager"),
+                None,
+                None,
+            )?;
+            guard.log_event(
+                Some("mgr"),
+                "ticket_reviewed",
+                &format!("ticket {} auto-reviewed and completed", ticket.id),
+                None,
+            )?;
+            eprintln!("[manager] auto-reviewed ticket {} → completed", ticket.id);
+            reviewed += 1;
         }
     }
 
@@ -661,11 +575,72 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
     }
 
     // -----------------------------------------------------------------------
-    // 4. Log summary
+    // 4. Milestone auto-transition (CEO gate)
+    // -----------------------------------------------------------------------
+    //
+    // When ALL tickets in an active milestone are terminal (completed/cancelled),
+    // automatically move the milestone to `awaiting_approval` and notify the CEO.
+    {
+        let active_milestones = {
+            let guard = db.lock().unwrap();
+            guard
+                .list_milestones()?
+                .into_iter()
+                .filter(|m| m.status == "active")
+                .collect::<Vec<_>>()
+        };
+
+        for ms in active_milestones {
+            let terminal = {
+                let guard = db.lock().unwrap();
+                guard.is_milestone_complete(ms.id)?
+            };
+
+            if !terminal {
+                continue;
+            }
+
+            let ticket_ids = ms.tickets.clone();
+            let milestone_name = ms.name.clone();
+
+            {
+                let guard = db.lock().unwrap();
+                guard.update_milestone_status(ms.id, "awaiting_approval")?;
+                guard.log_event(
+                    Some("mgr"),
+                    "milestone_ready_for_review",
+                    &format!(
+                        "milestone {} '{}' ready for review; tickets={:?}",
+                        ms.id, milestone_name, ticket_ids
+                    ),
+                    None,
+                )?;
+
+                let payload = json!({
+                    "milestone_id": ms.id,
+                    "milestone_name": milestone_name,
+                    "ticket_ids": ticket_ids,
+                    "status": "awaiting_approval"
+                })
+                .to_string();
+
+                guard.push_inbox("ceo", "milestone_ready_for_review", &payload, "mgr")?;
+            }
+
+            milestones_ready += 1;
+            eprintln!(
+                "[manager] milestone {} transitioned active → awaiting_approval",
+                ms.id
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Log summary
     // -----------------------------------------------------------------------
     eprintln!(
-        "[manager] cycle complete — assigned: {}, reviewed: {}, completions: {}, merged: {}, unblocked: {}",
-        assignments, reviewed, completions, merged, unblocked
+        "[manager] cycle complete — assigned: {}, reviewed: {}, completions: {}, merged: {}, unblocked: {}, milestones_ready: {}",
+        assignments, reviewed, completions, merged, unblocked, milestones_ready
     );
 
     Ok(())
@@ -1169,6 +1144,93 @@ mod tests {
         let review_event = events.iter().find(|e| e.event_type == "ticket_reviewed");
         assert!(review_event.is_some(), "should log a ticket_reviewed event");
         assert!(review_event.unwrap().detail.contains("t-001"));
+    }
+
+    // -----------------------------------------------------------------------
+    // milestone_auto_transition: active → awaiting_approval
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn milestone_auto_transition_to_awaiting_approval_when_all_tickets_terminal() {
+        let (db, config) = setup();
+
+        let milestone_id = {
+            let g = db.lock().unwrap();
+            let mid = g.create_milestone("Milestone 1", "Goal").unwrap();
+            g.update_milestone_status(mid, "active").unwrap();
+
+            let t1 = g.create_ticket("T1", "D1", "general", 1).unwrap();
+            g.update_ticket(&t1, "completed", None, None, None).unwrap();
+            g.assign_ticket_to_milestone(mid, &t1).unwrap();
+
+            let t2 = g.create_ticket("T2", "D2", "general", 1).unwrap();
+            g.update_ticket(&t2, "cancelled", None, None, None).unwrap();
+            g.assign_ticket_to_milestone(mid, &t2).unwrap();
+
+            mid
+        };
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let ms = g.get_milestone(milestone_id).unwrap().unwrap();
+        assert_eq!(ms.status, "awaiting_approval");
+
+        let ceo_msg = g.pop_inbox("ceo").unwrap();
+        assert!(ceo_msg.is_some(), "ceo should have a milestone message");
+        let ceo_msg = ceo_msg.unwrap();
+        assert_eq!(ceo_msg.msg_type, "milestone_ready_for_review");
+
+        let payload: serde_json::Value = serde_json::from_str(&ceo_msg.payload).unwrap();
+        assert_eq!(
+            payload["milestone_id"].as_i64().unwrap(),
+            milestone_id,
+            "payload milestone_id mismatch"
+        );
+        assert_eq!(payload["status"].as_str().unwrap(), "awaiting_approval");
+
+        let events = g.recent_events(20).unwrap();
+        let ready_event = events
+            .iter()
+            .find(|e| e.event_type == "milestone_ready_for_review");
+        assert!(ready_event.is_some(), "should log milestone_ready_for_review event");
+        assert!(
+            ready_event.unwrap().detail.contains(&milestone_id.to_string()),
+            "event detail should include milestone_id"
+        );
+    }
+
+    #[test]
+    fn milestone_auto_transition_does_not_trigger_until_all_tickets_terminal() {
+        let (db, config) = setup();
+
+        let milestone_id = {
+            let g = db.lock().unwrap();
+            let mid = g.create_milestone("Milestone 1", "Goal").unwrap();
+            g.update_milestone_status(mid, "active").unwrap();
+
+            let t1 = g.create_ticket("T1", "D1", "general", 1).unwrap();
+            g.update_ticket(&t1, "completed", None, None, None).unwrap();
+            g.assign_ticket_to_milestone(mid, &t1).unwrap();
+
+            // Non-terminal ticket blocks transition
+            let t2 = g.create_ticket("T2", "D2", "general", 1).unwrap();
+            g.assign_ticket_to_milestone(mid, &t2).unwrap(); // status remains `pending`
+
+            mid
+        };
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let ms = g.get_milestone(milestone_id).unwrap().unwrap();
+        assert_eq!(ms.status, "active");
+
+        let ceo_msg = g.pop_inbox("ceo").unwrap();
+        assert!(
+            ceo_msg.is_none(),
+            "ceo should not receive a message until milestone is complete"
+        );
     }
 
     // -----------------------------------------------------------------------

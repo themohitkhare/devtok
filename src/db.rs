@@ -679,7 +679,8 @@ impl Db {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
-    /// Returns true when ALL tickets in the milestone are 'completed'.
+    /// Returns true when ALL tickets in the milestone are terminal
+    /// (`completed`, `cancelled`, `wont_fix`).
     pub fn is_milestone_complete(&self, milestone_id: i64) -> Result<bool> {
         let total: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM milestone_tickets WHERE milestone_id = ?1",
@@ -692,7 +693,8 @@ impl Db {
         let not_done: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM milestone_tickets mt
              JOIN tickets t ON mt.ticket_id = t.id
-             WHERE mt.milestone_id = ?1 AND t.status != 'completed'",
+             WHERE mt.milestone_id = ?1
+               AND t.status NOT IN ('completed', 'cancelled', 'wont_fix')",
             params![milestone_id],
             |row| row.get(0),
         )?;
