@@ -14,7 +14,7 @@ use tokio::sync::watch;
 use crate::config::Config;
 use crate::db::Db;
 use crate::prompts;
-use crate::spawner::Spawner;
+use crate::spawner::{SpawnProvider, Spawner};
 
 pub async fn worker_loop(
     worker_id: String,

@@ -380,4 +380,97 @@ name = "minimal"
         let result = Config::load(tmp.path());
         assert!(result.is_err());
     }
+
+    // ── BackendTemplate::expand ──────────────────────────────────────
+
+    #[test]
+    fn backend_template_expand_basic() {
+        let t = BackendTemplate {
+            command: "mytool --task {prompt} --ctx {system_prompt}".to_string(),
+        };
+        let (prog, args) = t.expand("do the thing", "you are an AI").unwrap();
+        assert_eq!(prog, "mytool");
+        assert_eq!(args, vec!["--task", "do the thing", "--ctx", "you are an AI"]);
+    }
+
+    #[test]
+    fn backend_template_expand_prompt_with_spaces() {
+        let t = BackendTemplate {
+            command: "echo {prompt}".to_string(),
+        };
+        // The full prompt string (including spaces) replaces the {prompt} token as one arg.
+        let (prog, args) = t.expand("hello world foo", "sys").unwrap();
+        assert_eq!(prog, "echo");
+        assert_eq!(args, vec!["hello world foo"]);
+    }
+
+    #[test]
+    fn backend_template_expand_no_placeholders() {
+        let t = BackendTemplate {
+            command: "echo static".to_string(),
+        };
+        let (prog, args) = t.expand("unused", "unused").unwrap();
+        assert_eq!(prog, "echo");
+        assert_eq!(args, vec!["static"]);
+    }
+
+    #[test]
+    fn backend_template_expand_empty_returns_none() {
+        let t = BackendTemplate { command: "".to_string() };
+        assert!(t.expand("p", "s").is_none());
+    }
+
+    // ── [backends] config round-trip ────────────────────────────────
+
+    #[test]
+    fn backends_round_trip_via_toml() {
+        let toml_content = r#"
+[project]
+name = "backend-test"
+
+[backends.my-claude]
+command = "claude -p {prompt} --append-system-prompt {system_prompt}"
+
+[backends.custom]
+command = "/usr/local/bin/myai --task {prompt}"
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "{}", toml_content).unwrap();
+        let cfg = Config::load(tmp.path()).expect("should parse");
+
+        assert_eq!(cfg.backends.len(), 2);
+        assert!(cfg.backends.contains_key("my-claude"));
+        assert!(cfg.backends.contains_key("custom"));
+
+        let mc = &cfg.backends["my-claude"];
+        assert!(mc.command.contains("{prompt}"));
+        assert!(mc.command.contains("{system_prompt}"));
+
+        let cu = &cfg.backends["custom"];
+        assert!(cu.command.contains("{prompt}"));
+    }
+
+    #[test]
+    fn to_toml_serializes_backends() {
+        let mut cfg = Config::default_for("proj");
+        cfg.backends.insert("my-backend".to_string(), BackendTemplate {
+            command: "mytool {prompt} {system_prompt}".to_string(),
+        });
+        let toml_str = cfg.to_toml();
+        assert!(toml_str.contains("[backends.my-backend]"), "missing backends section");
+        assert!(toml_str.contains("command = \"mytool {prompt} {system_prompt}\""), "missing command");
+
+        // Should round-trip
+        let reparsed: Config = toml::from_str(&toml_str).expect("should parse generated TOML");
+        assert_eq!(reparsed.backends["my-backend"].command, "mytool {prompt} {system_prompt}");
+    }
+
+    #[test]
+    fn config_without_backends_section_defaults_to_empty_map() {
+        let toml_content = "[project]\nname = \"minimal\"\n";
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "{}", toml_content).unwrap();
+        let cfg = Config::load(tmp.path()).expect("should load");
+        assert!(cfg.backends.is_empty());
+    }
 }
