@@ -4,7 +4,7 @@ use acs::db::Db;
 fn test_update_ticket_status_and_notes() {
     let db = Db::open_memory().unwrap();
     let id = db.create_ticket("Task", "Desc", "backend", 1).unwrap();
-    db.update_ticket(&id, "in_progress", Some("Started work"), None).unwrap();
+    db.update_ticket(&id, "in_progress", Some("Started work"), None, None).unwrap();
 
     let ticket = db.get_ticket(&id).unwrap().unwrap();
     assert_eq!(ticket.status, "in_progress");
@@ -16,7 +16,7 @@ fn test_update_ticket_sets_blocked_by() {
     let db = Db::open_memory().unwrap();
     let id1 = db.create_ticket("Blocker", "Desc", "backend", 1).unwrap();
     let id2 = db.create_ticket("Blocked", "Desc", "backend", 2).unwrap();
-    db.update_ticket(&id2, "blocked", Some("Needs blocker"), Some(&id1)).unwrap();
+    db.update_ticket(&id2, "blocked", Some("Needs blocker"), Some(&id1), None).unwrap();
 
     let ticket = db.get_ticket(&id2).unwrap().unwrap();
     assert_eq!(ticket.status, "blocked");
@@ -27,8 +27,8 @@ fn test_update_ticket_sets_blocked_by() {
 fn test_update_ticket_clears_blocked_by() {
     let db = Db::open_memory().unwrap();
     let id = db.create_ticket("Task", "Desc", "backend", 1).unwrap();
-    db.update_ticket(&id, "blocked", None, Some("t-000")).unwrap();
-    db.update_ticket(&id, "pending", None, None).unwrap();
+    db.update_ticket(&id, "blocked", None, Some("t-000"), None).unwrap();
+    db.update_ticket(&id, "pending", None, None, None).unwrap();
 
     let ticket = db.get_ticket(&id).unwrap().unwrap();
     assert_eq!(ticket.status, "pending");
@@ -40,9 +40,9 @@ fn test_update_ticket_clears_blocked_by() {
 fn test_update_ticket_preserves_notes_when_none() {
     let db = Db::open_memory().unwrap();
     let id = db.create_ticket("Task", "Desc", "backend", 1).unwrap();
-    db.update_ticket(&id, "in_progress", Some("Note1"), None).unwrap();
+    db.update_ticket(&id, "in_progress", Some("Note1"), None, None).unwrap();
     // Update status but pass None for notes — should preserve existing notes
-    db.update_ticket(&id, "review_pending", None, None).unwrap();
+    db.update_ticket(&id, "review_pending", None, None, None).unwrap();
 
     let ticket = db.get_ticket(&id).unwrap().unwrap();
     assert_eq!(ticket.status, "review_pending");
@@ -70,7 +70,7 @@ fn test_count_by_status_multiple() {
     db.create_ticket("B", "d", "backend", 1).unwrap();
     db.create_ticket("C", "d", "backend", 1).unwrap();
     let id3 = "t-003".to_string();
-    db.update_ticket(&id3, "in_progress", None, None).unwrap();
+    db.update_ticket(&id3, "in_progress", None, None, None).unwrap();
 
     let counts = db.count_by_status().unwrap();
     let pending_count = counts.iter().find(|(s, _)| s == "pending").map(|(_, c)| *c).unwrap_or(0);
@@ -84,7 +84,7 @@ fn test_list_tickets_with_status_filter() {
     let db = Db::open_memory().unwrap();
     db.create_ticket("Pending1", "d", "backend", 1).unwrap();
     db.create_ticket("Pending2", "d", "backend", 2).unwrap();
-    db.update_ticket("t-002", "in_progress", None, None).unwrap();
+    db.update_ticket("t-002", "in_progress", None, None, None).unwrap();
 
     let pending = db.list_tickets(Some("pending")).unwrap();
     assert_eq!(pending.len(), 1);
@@ -121,7 +121,7 @@ fn test_claim_skips_non_pending() {
     let db = Db::open_memory().unwrap();
     let id = db.create_ticket("Task", "d", "backend", 1).unwrap();
     // Set to in_progress — should not be claimable
-    db.update_ticket(&id, "in_progress", None, None).unwrap();
+    db.update_ticket(&id, "in_progress", None, None, None).unwrap();
 
     let claimed = db.claim_next_ticket("w-1").unwrap();
     assert!(claimed.is_none());

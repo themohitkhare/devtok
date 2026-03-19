@@ -15,7 +15,7 @@ fn run_one_cycle(db: &Arc<Mutex<Db>>, config: &Config) {
         let (tx, rx) = tokio::sync::watch::channel(false);
         // Send shutdown immediately so the loop runs one cycle then exits
         tx.send(true).unwrap();
-        acs::manager::run_loop(db.clone(), config, rx).await;
+        acs::manager::run_loop(db.clone(), config, std::path::PathBuf::from("/tmp/test"), rx).await;
     });
 }
 
@@ -72,7 +72,7 @@ fn test_manager_processes_completion_message() {
     {
         let guard = db.lock().unwrap();
         guard.create_ticket("Task A", "Do A", "backend", 1).unwrap();
-        guard.update_ticket("t-001", "in_progress", None, None).unwrap();
+        guard.update_ticket("t-001", "in_progress", None, None, None).unwrap();
         // Simulate worker sending completion to manager inbox
         guard.push_inbox("mgr", "ticket_completed", r#"{"ticket_id":"t-001"}"#, "w-0").unwrap();
     }
@@ -92,7 +92,7 @@ fn test_manager_processes_legacy_completion_msg_type() {
     {
         let guard = db.lock().unwrap();
         guard.create_ticket("Task A", "Do A", "backend", 1).unwrap();
-        guard.update_ticket("t-001", "in_progress", None, None).unwrap();
+        guard.update_ticket("t-001", "in_progress", None, None, None).unwrap();
         // Use legacy "completion" msg_type
         guard.push_inbox("mgr", "completion", r#"{"ticket_id":"t-001"}"#, "w-0").unwrap();
     }
@@ -112,7 +112,7 @@ fn test_manager_auto_reviews_review_pending() {
     {
         let guard = db.lock().unwrap();
         guard.create_ticket("Task A", "Do A", "backend", 1).unwrap();
-        guard.update_ticket("t-001", "review_pending", None, None).unwrap();
+        guard.update_ticket("t-001", "review_pending", None, None, None).unwrap();
     }
 
     run_one_cycle(&db, &config);
@@ -132,8 +132,8 @@ fn test_manager_unblocks_when_blocker_completes() {
         let guard = db.lock().unwrap();
         guard.create_ticket("Blocker", "Do first", "backend", 1).unwrap();
         guard.create_ticket("Blocked", "Do second", "backend", 2).unwrap();
-        guard.update_ticket("t-001", "completed", None, None).unwrap();
-        guard.update_ticket("t-002", "blocked", None, Some("t-001")).unwrap();
+        guard.update_ticket("t-001", "completed", None, None, None).unwrap();
+        guard.update_ticket("t-002", "blocked", None, Some("t-001"), None).unwrap();
     }
 
     run_one_cycle(&db, &config);
@@ -152,8 +152,8 @@ fn test_manager_does_not_unblock_if_blocker_incomplete() {
         let guard = db.lock().unwrap();
         guard.create_ticket("Blocker", "Do first", "backend", 1).unwrap();
         guard.create_ticket("Blocked", "Do second", "backend", 2).unwrap();
-        guard.update_ticket("t-001", "in_progress", None, None).unwrap();
-        guard.update_ticket("t-002", "blocked", None, Some("t-001")).unwrap();
+        guard.update_ticket("t-001", "in_progress", None, None, None).unwrap();
+        guard.update_ticket("t-002", "blocked", None, Some("t-001"), None).unwrap();
     }
 
     run_one_cycle(&db, &config);

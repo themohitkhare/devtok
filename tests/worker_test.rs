@@ -48,11 +48,11 @@ fn test_crash_recovery_resets_to_pending() {
     db.register_agent("w-0", "worker", "general").unwrap();
 
     // Simulate assignment
-    db.update_ticket("t-001", "in_progress", None, None).unwrap();
+    db.update_ticket("t-001", "in_progress", None, None, None).unwrap();
     db.update_agent("w-0", "working", Some("t-001"), Some(12345)).unwrap();
 
     // Simulate crash recovery
-    db.update_ticket("t-001", "pending", None, None).unwrap();
+    db.update_ticket("t-001", "pending", None, None, None).unwrap();
     db.update_agent("w-0", "idle", None, None).unwrap();
 
     let ticket = db.get_ticket("t-001").unwrap().unwrap();
@@ -70,11 +70,11 @@ fn test_timeout_sets_ticket_blocked() {
     db.create_ticket("Task", "Desc", "backend", 1).unwrap();
     db.register_agent("w-0", "worker", "general").unwrap();
 
-    db.update_ticket("t-001", "in_progress", None, None).unwrap();
+    db.update_ticket("t-001", "in_progress", None, None, None).unwrap();
     db.update_agent("w-0", "working", Some("t-001"), Some(12345)).unwrap();
 
     // Simulate timeout
-    db.update_ticket("t-001", "blocked", Some("Worker timed out"), None).unwrap();
+    db.update_ticket("t-001", "blocked", Some("Worker timed out"), None, None).unwrap();
     db.update_agent("w-0", "idle", None, None).unwrap();
 
     let ticket = db.get_ticket("t-001").unwrap().unwrap();
