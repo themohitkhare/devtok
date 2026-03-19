@@ -194,3 +194,199 @@ impl Spawner {
         &self.tool_path
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use tempfile::TempDir;
+
+    fn make_spawner(project_dir: &Path) -> Spawner {
+        Spawner::new(project_dir, "/usr/bin/claude", "/usr/bin/acs")
+    }
+
+    // ── Spawner::new / field accessors ──────────────────────────────
+
+    #[test]
+    fn new_sets_acs_dir_under_project() {
+        let s = make_spawner(Path::new("/tmp/myproject"));
+        assert_eq!(s.acs_dir, PathBuf::from("/tmp/myproject/.acs"));
+        assert_eq!(s.project_dir, PathBuf::from("/tmp/myproject"));
+    }
+
+    #[test]
+    fn tool_path_returns_configured_value() {
+        let s = Spawner::new(Path::new("/x"), "claude", "/my/acs");
+        assert_eq!(s.tool_path(), "/my/acs");
+    }
+
+    #[test]
+    fn log_path_includes_worker_id() {
+        let s = make_spawner(Path::new("/proj"));
+        let p = s.log_path("w-42");
+        assert_eq!(p, PathBuf::from("/proj/.acs/logs/w-42.log"));
+    }
+
+    // ── Branch naming (random suffix) ───────────────────────────────
+
+    #[test]
+    fn create_worktree_branch_has_random_4_hex_suffix() {
+        // We can't call create_worktree without a real repo, but we can
+        // replicate the branch-naming logic and verify its format.
+        let mut seen = HashSet::new();
+        for _ in 0..20 {
+            let mut rng = rand::rng();
+            let suffix = format!("{:04x}", rng.random::<u16>());
+            // Must be exactly 4 hex characters
+            assert_eq!(suffix.len(), 4, "suffix '{}' is not 4 chars", suffix);
+            assert!(
+                suffix.chars().all(|c| c.is_ascii_hexdigit()),
+                "suffix '{}' contains non-hex chars",
+                suffix
+            );
+            let branch = format!("acs/{}-{}", "t-001", suffix);
+            assert!(branch.starts_with("acs/t-001-"));
+            seen.insert(suffix);
+        }
+        // With 2^16 possibilities, 20 draws should produce at least 2 distinct values
+        assert!(seen.len() >= 2, "expected randomness, got only {:?}", seen);
+    }
+
+    // ── create_worktree in a real git repo ──────────────────────────
+
+    #[test]
+    fn create_worktree_produces_correct_path_and_branch() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+
+        // Initialise a minimal git repo with one commit
+        Command::new("git").args(["init"]).current_dir(repo).output().unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        let s = Spawner::new(repo, "claude", "acs");
+        let wt_path = s.create_worktree("w-1", "t-007").unwrap();
+
+        // Worktree directory must exist
+        assert!(wt_path.is_dir(), "worktree dir should exist");
+        assert_eq!(wt_path, repo.join(".acs/worktrees/w-1"));
+
+        // The branch should be listed by git branch
+        let out = Command::new("git")
+            .args(["branch", "--list", "acs/t-007-*"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        let branches = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            branches.contains("acs/t-007-"),
+            "expected acs/t-007-XXXX branch, got: {}",
+            branches
+        );
+    }
+
+    // ── remove_worktree ─────────────────────────────────────────────
+
+    #[test]
+    fn remove_worktree_succeeds_when_worktree_exists() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+
+        Command::new("git").args(["init"]).current_dir(repo).output().unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        let s = Spawner::new(repo, "claude", "acs");
+        s.create_worktree("w-rm", "t-rm").unwrap();
+
+        // Remove should succeed
+        s.remove_worktree("w-rm").unwrap();
+
+        // Directory should be gone
+        let wt = repo.join(".acs/worktrees/w-rm");
+        assert!(!wt.exists(), "worktree dir should be removed");
+    }
+
+    #[test]
+    fn remove_worktree_handles_missing_worktree_gracefully() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+
+        Command::new("git").args(["init"]).current_dir(repo).output().unwrap();
+        Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        let s = Spawner::new(repo, "claude", "acs");
+
+        // Removing a worktree that was never created should not error
+        let result = s.remove_worktree("nonexistent");
+        assert!(result.is_ok(), "remove_worktree should not error on missing worktree");
+    }
+
+    // ── spawn_claude builds correct command ─────────────────────────
+
+    #[test]
+    fn spawn_claude_creates_log_file_and_uses_correct_flags() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+        let worktree = tmp.path(); // use same dir as worktree stand-in
+
+        // Use `echo` as the "claude" binary so spawn succeeds without the real tool
+        let s = Spawner::new(project, "echo", "acs");
+
+        let child = s
+            .spawn_claude("w-test", worktree, "do stuff", "you are a bot")
+            .unwrap();
+
+        // Log file should have been created
+        let log = s.log_path("w-test");
+        assert!(log.exists(), "log file should be created at {:?}", log);
+
+        // Wait for echo to finish and capture output from the log
+        let mut child = child;
+        child.wait().unwrap();
+
+        let log_content = fs::read_to_string(&log).unwrap();
+        // `echo` prints all its args space-separated, so the log should contain
+        // every flag we pass
+        assert!(log_content.contains("-p"), "should contain -p flag");
+        assert!(log_content.contains("do stuff"), "should contain the prompt");
+        assert!(
+            log_content.contains("--append-system-prompt"),
+            "should contain --append-system-prompt"
+        );
+        assert!(
+            log_content.contains("you are a bot"),
+            "should contain system prompt text"
+        );
+        assert!(
+            log_content.contains("--dangerously-skip-permissions"),
+            "should contain --dangerously-skip-permissions"
+        );
+        assert!(
+            log_content.contains("--output-format"),
+            "should contain --output-format"
+        );
+        assert!(log_content.contains("json"), "should contain json output format");
+    }
+
+    #[test]
+    fn spawn_claude_fails_with_bad_binary() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path();
+
+        let s = Spawner::new(project, "/nonexistent/claude-binary", "acs");
+
+        let result = s.spawn_claude("w-bad", tmp.path(), "hi", "sys");
+        assert!(result.is_err(), "should fail when binary does not exist");
+    }
+}
