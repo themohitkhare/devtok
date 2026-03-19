@@ -19,3 +19,4 @@ dev = [
 
 [project.scripts]
 synapse-os = "synapse_os.cli:main"
+synapse-tool = "synapse_os.tools.cli_bridge:main"

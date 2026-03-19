@@ -76,22 +76,23 @@ async def _init() -> None:
     logger.info("MCP server initialized: agent=%s role=%s", _agent_id, _agent_role)
 
 
-def main() -> None:
-    asyncio.get_event_loop().run_until_complete(_init())
+def _import_tools() -> None:
+    """Import tool modules to register their @mcp.tool() decorators."""
+    import synapse_os.tools.ticket_tools  # noqa: F401
+    import synapse_os.tools.knowledge_tools  # noqa: F401
+    import synapse_os.tools.communication_tools  # noqa: F401
+    logger.info("All tool modules imported successfully")
 
-    # Import tool modules to register their @mcp.tool() decorators
-    try:
-        import synapse_os.tools.ticket_tools  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import synapse_os.tools.knowledge_tools  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import synapse_os.tools.communication_tools  # noqa: F401
-    except ImportError:
-        pass
+
+# Import tools at module load time so they're registered before mcp.run()
+_import_tools()
+
+
+def main() -> None:
+    # Initialize Redis connection synchronously before starting the MCP server
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(_init())
+    loop.close()
 
     mcp.run(transport="stdio")
 

@@ -53,23 +53,29 @@ class AgentSpawner:
         }
         return json.dumps(config, indent=2)
 
-    def build_claude_command(self, prompt: str, system_prompt: str, allowed_tools: list[str] | None = None) -> list[str]:
-        cmd = ["claude", "-p", prompt, "--output-format", "json", "--append-system-prompt", system_prompt]
+    def build_claude_command(self, prompt: str, system_prompt: str,
+                             mcp_config_path: str | None = None,
+                             allowed_tools: list[str] | None = None) -> list[str]:
+        cmd = ["claude", "-p", prompt, "--output-format", "json",
+               "--append-system-prompt", system_prompt,
+               "--dangerously-skip-permissions"]
+        if mcp_config_path:
+            cmd.extend(["--mcp-config", mcp_config_path])
         if allowed_tools:
             cmd.extend(["--allowedTools", ",".join(allowed_tools)])
         return cmd
 
     def _write_mcp_config(self, agent_id: str, agent_role: str, manager_id: str) -> str:
         config_content = self.build_mcp_config(agent_id, agent_role, manager_id)
-        config_path = os.path.join(self._project_dir, ".mcp.json")
+        config_path = os.path.join(self._project_dir, f".mcp.{agent_id}.json")
         with open(config_path, "w") as f:
             f.write(config_content)
         return config_path
 
     async def spawn_agent(self, agent_id: str, role: str, prompt: str, system_prompt: str,
                           manager_id: str = "", allowed_tools: list[str] | None = None) -> ManagedProcess:
-        self._write_mcp_config(agent_id, role, manager_id)
-        cmd = self.build_claude_command(prompt, system_prompt, allowed_tools)
+        mcp_config_path = self._write_mcp_config(agent_id, role, manager_id)
+        cmd = self.build_claude_command(prompt, system_prompt, mcp_config_path, allowed_tools)
         return await self._pm.spawn(agent_id=agent_id, command=cmd, cwd=self._project_dir)
 
     async def kill_agent(self, agent_id: str) -> bool:

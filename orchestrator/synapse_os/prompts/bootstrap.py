@@ -2,7 +2,7 @@
 from typing import Optional
 
 
-def build_bootstrap_prompt(repo_path: str, spec_text: Optional[str] = None) -> str:
+def build_bootstrap_prompt(repo_path: str, spec_text: Optional[str] = None, tool_path: str = "synapse-tool") -> str:
     spec_section = ""
     if spec_text:
         spec_section = f"""
@@ -29,25 +29,39 @@ Analyze the repository at `{repo_path}` and create an initial set of tickets tha
 2. Understand the current state: what exists, what's working, what's missing
 3. If a spec was provided, map spec requirements to implementation tasks
 4. If no spec, identify improvements, bugs, missing tests, documentation gaps
-5. Create tickets using the `create_ticket` tool. Each ticket should be:
+5. Create tickets using the synapse-tool CLI (see below). Each ticket should be:
    - Small enough for one agent to complete in one session
    - Self-contained with clear acceptance criteria in the description
    - Tagged with the right domain (frontend, backend, devops, etc.)
    - Prioritized (1=critical, 2=high, 3=medium, 4=low, 5=nice-to-have)
-6. Write key architecture decisions to the knowledge base using `write_knowledge_base`
-7. Post a summary status card using `post_status_card`
+6. Write key architecture decisions to the knowledge base
+7. Post a summary status card
 
-## Available Tools
+## How to Use Tools
 
-- `create_ticket(title, description, domain, priority)` — create work tickets
-- `write_knowledge_base(domain, key, value)` — store architecture decisions and project context
-- `read_knowledge_base(domain, key)` — read stored knowledge
-- `post_status_card(content, priority)` — post visible status updates
+Use the Bash tool to call `{tool_path}` commands. Examples:
+
+```bash
+# Create a ticket
+{tool_path} create-ticket --title "Build auth system" --description "Implement login/signup with JWT tokens" --domain backend --priority 1
+
+# Write to knowledge base
+{tool_path} write-kb --domain backend --key stack --value "Python 3.11, FastAPI, PostgreSQL"
+
+# Read from knowledge base
+{tool_path} read-kb --domain backend --key stack
+
+# Post a status card (visible to human)
+{tool_path} status-card --content "Bootstrap complete: created 8 tickets across 3 domains"
+```
+
+Each command returns JSON. Check the "status" field to confirm success.
 
 ## Guidelines
 
 - Create 5-15 tickets for a typical project. Don't over-decompose.
 - Each ticket description should contain enough context for a developer who hasn't seen the repo
-- Write domain-level summaries to the knowledge base (e.g. "frontend:stack" → "React 19, Vite, Tailwind")
+- Write domain-level summaries to the knowledge base (e.g. domain=frontend, key=stack, value="React 19, Vite, Tailwind")
 - Prioritize tickets that unblock other work (foundations first, features second)
+- IMPORTANT: Always use the Bash tool to run synapse-tool commands. Do not try to use MCP tools directly.
 """
