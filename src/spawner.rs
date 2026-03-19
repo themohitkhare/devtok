@@ -193,4 +193,66 @@ impl Spawner {
     pub fn tool_path(&self) -> &str {
         &self.tool_path
     }
+
+    /// Finds the branch name matching `acs/{ticket_id}-*` by listing git branches.
+    /// Returns `None` if no matching branch exists.
+    pub fn find_branch_for_ticket(&self, ticket_id: &str) -> Result<Option<String>> {
+        let prefix = format!("acs/{}-", ticket_id);
+        let output = Command::new("git")
+            .arg("branch")
+            .arg("--list")
+            .arg(format!("{}*", prefix))
+            .current_dir(&self.project_dir)
+            .output()
+            .with_context(|| "Failed to run git branch --list")?;
+
+        if !output.status.success() {
+            bail!("git branch --list failed");
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // git branch output has "  branch" or "* branch" prefix per line
+        let branch = stdout
+            .lines()
+            .map(|l| l.trim().trim_start_matches("* ").trim())
+            .find(|l| l.starts_with(&prefix))
+            .map(|s| s.to_string());
+
+        Ok(branch)
+    }
+
+    /// Merges the given branch into main using `--no-ff`. Must be run from
+    /// the main project directory (not a worktree).
+    ///
+    /// Returns `Ok(true)` if merge succeeded, `Ok(false)` if there were
+    /// conflicts (merge is aborted), or `Err` on unexpected failures.
+    pub fn merge_branch(&self, branch: &str) -> Result<bool> {
+        let status = Command::new("git")
+            .args(["merge", "--no-ff", branch])
+            .current_dir(&self.project_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .status()
+            .with_context(|| format!("Failed to run git merge --no-ff {}", branch))?;
+
+        if status.success() {
+            return Ok(true);
+        }
+
+        // Merge failed — abort to restore clean state
+        let _ = Command::new("git")
+            .args(["merge", "--abort"])
+            .current_dir(&self.project_dir)
+            .status();
+
+        Ok(false)
+    }
+
+    /// Deletes a local branch. Best-effort — errors are ignored.
+    pub fn delete_branch(&self, branch: &str) {
+        let _ = Command::new("git")
+            .args(["branch", "-d", branch])
+            .current_dir(&self.project_dir)
+            .status();
+    }
 }

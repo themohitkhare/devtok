@@ -34,8 +34,9 @@ pub fn execute(workers: usize) -> Result<()> {
         let mgr_db = db.clone();
         let mgr_config = config.clone();
         let mgr_shutdown = shutdown_rx.clone();
+        let mgr_dir = cwd.clone();
         let mgr_handle = tokio::spawn(async move {
-            manager::run_loop(mgr_db, &mgr_config, mgr_shutdown).await
+            manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown).await
         });
 
         // Spawn worker tasks
