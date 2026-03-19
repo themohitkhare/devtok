@@ -3,9 +3,24 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
 from synapse_os.config import Config
 from synapse_os.process_manager import ManagedProcess, ProcessManager
+
+
+def _find_venv_python() -> str:
+    """Find the venv Python that has our dependencies installed."""
+    # Check if we're already running from a venv
+    if hasattr(sys, "real_prefix") or (hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix):
+        return sys.executable
+    # Check for .venv in the orchestrator directory
+    orchestrator_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    venv_python = os.path.join(orchestrator_dir, ".venv", "bin", "python3")
+    if os.path.exists(venv_python):
+        return venv_python
+    # Fallback to current Python
+    return sys.executable
 
 
 class AgentSpawner:
@@ -14,6 +29,7 @@ class AgentSpawner:
         self._project_dir = project_dir
         self._pm = ProcessManager()
         self._orchestrator_pkg = os.path.dirname(os.path.abspath(__file__))
+        self._venv_python = _find_venv_python()
 
     def build_mcp_config(self, agent_id: str, agent_role: str, manager_id: str = "") -> str:
         pkg_root = os.path.dirname(self._orchestrator_pkg)
@@ -21,7 +37,7 @@ class AgentSpawner:
             "mcpServers": {
                 "synapse-os-tools": {
                     "type": "stdio",
-                    "command": "python3",
+                    "command": self._venv_python,
                     "args": ["-m", "synapse_os.tools.server"],
                     "env": {
                         "SYNAPSE_REDIS_URL": self._config.redis_url,

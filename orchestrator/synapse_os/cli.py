@@ -62,8 +62,7 @@ def run(path: str, domain: str, workers: int):
         await runner.start()
         click.echo("Agents running. Press Ctrl+C to stop.")
         try:
-            while True:
-                await asyncio.sleep(1)
+            await runner.run_loop()
         except KeyboardInterrupt:
             pass
         finally:
@@ -72,6 +71,54 @@ def run(path: str, domain: str, workers: int):
             click.echo("Stopped.")
 
     asyncio.run(_run())
+
+
+@cli.command()
+def preflight():
+    """Check that all dependencies are available."""
+    import shutil
+    import subprocess
+
+    ok = True
+
+    # Check Redis
+    try:
+        result = subprocess.run(["redis-cli", "ping"], capture_output=True, text=True, timeout=5)
+        if result.stdout.strip() == "PONG":
+            click.echo("  [OK] Redis is running")
+        else:
+            click.echo("  [FAIL] Redis not responding. Run: redis-server --daemonize yes")
+            ok = False
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        click.echo("  [FAIL] redis-cli not found. Install Redis first.")
+        ok = False
+
+    # Check Claude CLI
+    if shutil.which("claude"):
+        click.echo("  [OK] Claude Code CLI found")
+    else:
+        click.echo("  [FAIL] 'claude' not in PATH. Install Claude Code CLI.")
+        ok = False
+
+    # Check Python venv
+    from synapse_os.spawner import _find_venv_python
+    venv_py = _find_venv_python()
+    try:
+        result = subprocess.run([venv_py, "-c", "import mcp; print('ok')"], capture_output=True, text=True, timeout=10)
+        if "ok" in result.stdout:
+            click.echo(f"  [OK] MCP package available ({venv_py})")
+        else:
+            click.echo(f"  [FAIL] MCP package not importable in {venv_py}")
+            ok = False
+    except Exception:
+        click.echo(f"  [FAIL] Cannot run {venv_py}")
+        ok = False
+
+    if ok:
+        click.echo("\nAll checks passed! Ready to go.")
+    else:
+        click.echo("\nSome checks failed. Fix the issues above first.")
+        raise SystemExit(1)
 
 
 @cli.command()
