@@ -4,6 +4,7 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 
 from redis.asyncio import Redis
 
@@ -12,6 +13,7 @@ from synapse_os.config import Config
 from synapse_os.cron_engine import CronEngine
 from synapse_os.feedback_watcher import FeedbackWatcher
 from synapse_os.health_checker import HealthChecker
+from synapse_os.models import AgentRole, InboxMessage
 from synapse_os.process_manager import ProcessManager
 from synapse_os.registry import AgentRegistry
 from synapse_os.spacetimedb_client import SpacetimeDBClient
@@ -40,6 +42,7 @@ class Daemon:
 
         self._cron.register("health_check", config.heartbeat_timeout_seconds, self._health_check_tick)
         self._cron.register("feedback_poll", config.feedback_poll_interval_seconds, self._feedback_poll_tick)
+        self._cron.register("standup", config.standup_interval_seconds, self._standup_tick)
 
     async def run(self) -> None:
         logger.info("Synapse OS daemon starting")
@@ -73,7 +76,6 @@ class Daemon:
         blocked = await self._health.check_blocked()
         for agent in blocked:
             if agent.manager_id:
-                from synapse_os.models import InboxMessage
                 msg = InboxMessage(
                     msg_type="agent_blocked",
                     payload={"agent_id": agent.agent_id, "status": agent.status},
@@ -83,6 +85,30 @@ class Daemon:
 
     async def _feedback_poll_tick(self) -> None:
         self._feedback_hwm = await self._feedback.poll_once(self._feedback_hwm)
+
+    async def _standup_tick(self) -> None:
+        workers = await self._registry.list_agents(role=AgentRole.WORKER)
+        deadline_epoch = int(time.time()) + self._config.standup_interval_seconds
+
+        managers_notified: set[str] = set()
+        for worker in workers:
+            standup_request = InboxMessage(
+                msg_type="standup_request",
+                payload={"manager_id": worker.manager_id, "deadline_epoch": deadline_epoch},
+                sender="orchestrator",
+            )
+            await self._brain.push_inbox(worker.agent_id, standup_request.to_json())
+            logger.info("Sent standup_request to worker %s", worker.agent_id)
+
+            if worker.manager_id and worker.manager_id not in managers_notified:
+                standup_tick_msg = InboxMessage(
+                    msg_type="standup_tick",
+                    payload={},
+                    sender="orchestrator",
+                )
+                await self._brain.push_manager_inbox(worker.manager_id, standup_tick_msg.to_json())
+                managers_notified.add(worker.manager_id)
+                logger.info("Sent standup_tick to manager %s", worker.manager_id)
 
 
 def main() -> None:
