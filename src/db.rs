@@ -76,7 +76,11 @@ impl Db {
                 agent TEXT,
                 event_type TEXT NOT NULL,
                 detail TEXT NOT NULL,
-                tokens_used INTEGER DEFAULT 0
+                tokens_used INTEGER DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                ticket_id TEXT,
+                model TEXT
             );
             CREATE TABLE IF NOT EXISTS counters (
                 name TEXT PRIMARY KEY,
@@ -91,6 +95,16 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_ticket_keywords_keyword ON ticket_keywords(keyword);"
         )?;
+
+        // Additive migrations: add new columns to existing events tables.
+        // SQLite returns an error when the column already exists; we ignore it.
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE events ADD COLUMN input_tokens INTEGER DEFAULT 0;
+             ALTER TABLE events ADD COLUMN output_tokens INTEGER DEFAULT 0;
+             ALTER TABLE events ADD COLUMN ticket_id TEXT;
+             ALTER TABLE events ADD COLUMN model TEXT;"
+        );
+
         Ok(())
     }
 
@@ -406,20 +420,72 @@ impl Db {
     pub fn log_event(&self, agent: Option<&str>, event_type: &str, detail: &str, tokens: Option<i64>) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO events (timestamp, agent, event_type, detail, tokens_used) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO events (timestamp, agent, event_type, detail, tokens_used, input_tokens, output_tokens) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0)",
             params![now, agent, event_type, detail, tokens.unwrap_or(0)],
+        )?;
+        Ok(())
+    }
+
+    /// Log an event with detailed token breakdown (input/output separate) and ticket/model metadata.
+    pub fn log_token_event(
+        &self,
+        agent: Option<&str>,
+        event_type: &str,
+        detail: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        ticket_id: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let total = input_tokens + output_tokens;
+        self.conn.execute(
+            "INSERT INTO events (timestamp, agent, event_type, detail, tokens_used, input_tokens, output_tokens, ticket_id, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![now, agent, event_type, detail, total, input_tokens, output_tokens, ticket_id, model],
         )?;
         Ok(())
     }
 
     pub fn recent_events(&self, limit: usize) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, agent, event_type, detail, tokens_used FROM events ORDER BY id DESC LIMIT ?1"
+            "SELECT id, timestamp, agent, event_type, detail, tokens_used, input_tokens, output_tokens, ticket_id, model
+             FROM events ORDER BY id DESC LIMIT ?1"
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| Ok(Event {
             id: row.get(0)?, timestamp: row.get(1)?, agent: row.get(2)?,
             event_type: row.get(3)?, detail: row.get(4)?, tokens_used: row.get(5)?,
+            input_tokens: row.get(6)?, output_tokens: row.get(7)?,
+            ticket_id: row.get(8)?, model: row.get(9)?,
         }))?;
         rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Returns per-ticket token usage (summed across all events for each ticket).
+    pub fn token_breakdown_by_ticket(&self) -> Result<Vec<crate::models::TicketTokenUsage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ticket_id, SUM(input_tokens), SUM(output_tokens)
+             FROM events
+             WHERE ticket_id IS NOT NULL
+             GROUP BY ticket_id
+             ORDER BY ticket_id"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::models::TicketTokenUsage {
+                ticket_id: row.get(0)?,
+                input_tokens: row.get(1)?,
+                output_tokens: row.get(2)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Returns total (input_tokens, output_tokens) across all events.
+    pub fn total_token_details(&self) -> Result<(i64, i64)> {
+        self.conn.query_row(
+            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) FROM events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(Into::into)
     }
 }

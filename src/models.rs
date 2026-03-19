@@ -53,4 +53,29 @@ pub struct Event {
     pub event_type: String,
     pub detail: String,
     pub tokens_used: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub ticket_id: Option<String>,
+    pub model: Option<String>,
+}
+
+/// Per-ticket token usage summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TicketTokenUsage {
+    pub ticket_id: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+/// Pricing constants per million tokens.
+pub mod pricing {
+    pub const SONNET_INPUT_PER_M: f64 = 3.0;
+    pub const SONNET_OUTPUT_PER_M: f64 = 15.0;
+    pub const OPUS_INPUT_PER_M: f64 = 15.0;
+    pub const OPUS_OUTPUT_PER_M: f64 = 75.0;
+
+    pub fn estimate_cost(input_tokens: i64, output_tokens: i64, input_per_m: f64, output_per_m: f64) -> f64 {
+        (input_tokens as f64 / 1_000_000.0) * input_per_m
+            + (output_tokens as f64 / 1_000_000.0) * output_per_m
+    }
 }

@@ -61,6 +61,20 @@ impl Spawner {
                 .with_context(|| format!("Failed to create worktrees directory: {}", parent.display()))?;
         }
 
+        // Remove any stale worktree at this path from a previous run before creating a new one.
+        if worktree_path.exists() {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&worktree_path)
+                .current_dir(&self.project_dir)
+                .status();
+            let _ = std::fs::remove_dir_all(&worktree_path);
+            let _ = Command::new("git")
+                .args(["worktree", "prune"])
+                .current_dir(&self.project_dir)
+                .status();
+        }
+
         let status = Command::new("git")
             .arg("worktree")
             .arg("add")
@@ -337,6 +351,8 @@ impl Spawner {
         let _ = Command::new("git")
             .args(["merge", "--abort"])
             .current_dir(&self.project_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
 
         Ok(false)
@@ -345,7 +361,9 @@ impl Spawner {
     /// Deletes a local branch. Best-effort — errors are ignored.
     pub fn delete_branch(&self, branch: &str) {
         let _ = Command::new("git")
-            .args(["branch", "-d", branch])
+            // Merge conflicts can leave the branch "not fully merged".
+            // Use -D so we can always discard the failed topic branch.
+            .args(["branch", "-D", branch])
             .current_dir(&self.project_dir)
             .status();
     }

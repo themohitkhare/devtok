@@ -10,6 +10,7 @@ pub mod log;
 pub mod acs_dir;
 pub mod evolve;
 pub mod report;
+pub mod cost;
 
 use clap::{Parser, Subcommand};
 
@@ -97,4 +98,6 @@ pub enum Commands {
     Inbox(inbox::InboxCommands),
     /// Generate a current progress report in .acs/reports/progress.md
     Report,
+    /// Show token usage and estimated cost breakdown
+    Cost,
 }

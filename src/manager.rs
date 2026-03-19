@@ -142,6 +142,63 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
     }
 
     // -----------------------------------------------------------------------
+    // 0b. Re-queue stale `in_progress` tickets
+    // -----------------------------------------------------------------------
+    //
+    // If a worker is currently "working" on ticket X but there are other
+    // tickets also stuck as `in_progress` assigned to that worker (e.g.
+    // after a crash or inconsistent DB state), we re-queue the mismatch back
+    // to `pending` so the bounded evolution loop can make progress.
+    {
+        let (agents, in_progress_tickets) = {
+            let guard = db.lock().unwrap();
+            let agents = guard.list_agents()?;
+            let tickets = guard.list_tickets(Some("in_progress"))?;
+            (agents, tickets)
+        };
+
+        for ticket in in_progress_tickets {
+            let assignee_id = match ticket.assignee.as_deref() {
+                Some(a) if !a.is_empty() => a,
+                _ => continue,
+            };
+
+            let agent = agents.iter().find(|a| a.id == assignee_id);
+            let should_requeue = match agent {
+                None => true,
+                Some(agent) => agent.current_ticket.as_deref() != Some(ticket.id.as_str()),
+            };
+
+            if should_requeue {
+                let note = format!(
+                    "Re-queued stale in_progress: assignee={} current_ticket={:?}",
+                    assignee_id,
+                    agents
+                        .iter()
+                        .find(|a| a.id == assignee_id)
+                        .and_then(|a| a.current_ticket.as_deref())
+                );
+
+                let guard = db.lock().unwrap();
+                guard.update_ticket(
+                    &ticket.id,
+                    "pending",
+                    Some(&note),
+                    None,
+                    Some(None),
+                )?;
+                guard.log_event(
+                    Some(assignee_id),
+                    "ticket_requeued_stale_in_progress",
+                    &format!("ticket {} re-queued; assignee working on different ticket", ticket.id),
+                    None,
+                )?;
+                eprintln!("[manager] re-queued stale ticket {} -> pending", ticket.id);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // 1. Claim and assign tickets to idle workers
     // -----------------------------------------------------------------------
     {
@@ -703,6 +760,38 @@ mod tests {
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
         assert_eq!(ticket.status, "blocked", "should stay blocked if blocker doesn't exist");
+    }
+
+    #[test]
+    fn requeues_stale_in_progress_assigned_to_working_agent_on_other_ticket() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-0", "worker", "backend-dev").unwrap();
+
+            // Agent is working on t-001.
+            g.update_agent("w-0", "working", Some("t-001"), None).unwrap();
+
+            // Two tickets are in_progress and both assigned to w-0:
+            // - t-001 matches current_ticket and should remain in_progress.
+            // - t-002 mismatches and should be re-queued to pending.
+            let t1 = g.create_ticket("T1", "Do", "general", 1).unwrap();
+            let t2 = g.create_ticket("T2", "Do", "general", 1).unwrap();
+            g.update_ticket(&t1, "in_progress", None, None, Some(Some("w-0")))
+                .unwrap();
+            g.update_ticket(&t2, "in_progress", None, None, Some(Some("w-0")))
+                .unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let tt1 = g.get_ticket("t-001").unwrap().unwrap();
+        let tt2 = g.get_ticket("t-002").unwrap().unwrap();
+
+        assert_eq!(tt1.status, "in_progress");
+        assert_eq!(tt2.status, "pending");
+        assert!(tt2.assignee.is_none());
     }
 
     // -----------------------------------------------------------------------

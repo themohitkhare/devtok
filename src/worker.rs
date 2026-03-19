@@ -267,7 +267,9 @@ async fn handle_ticket_assignment(
                     tracing_log(worker_id, &format!("ticket {} completed successfully", ticket_id));
 
                     // --- (3a) Parse log file for token usage (best effort) ---
-                    let tokens = parse_token_usage_from_log(&spawner.log_path(worker_id));
+                    let (input_tokens, output_tokens) =
+                        parse_token_usage_from_log(&spawner.log_path(worker_id))
+                            .unwrap_or((0, 0));
 
                     // --- (3b) Gate merge via `cargo test` (if Rust project) ---
                     // We run tests inside the worker's worktree before the manager merges.
@@ -291,11 +293,14 @@ async fn handle_ticket_assignment(
                             worker_id,
                         )?;
                         db.update_agent(worker_id, "idle", None, None)?;
-                        db.log_event(
+                        db.log_token_event(
                             Some(worker_id),
                             "ticket_complete",
                             &format!("ticket {} completed", ticket_id),
-                            tokens,
+                            input_tokens,
+                            output_tokens,
+                            Some(&ticket_id),
+                            model.as_deref(),
                         )?;
                     }
 
@@ -349,17 +354,17 @@ async fn handle_ticket_assignment(
     Ok(())
 }
 
-/// Attempts to extract total token usage from the worker's log file.
+/// Attempts to extract token usage from the worker's log file.
 ///
 /// Claude's JSON output mode emits a top-level object with a `"usage"` key
 /// containing `{ "input_tokens": N, "output_tokens": M }`. This function
-/// scans every line of the log looking for such an object and returns the
-/// sum of input + output tokens from the last matching entry found.
+/// scans every line of the log looking for such an object and returns
+/// (input_tokens, output_tokens) from the last matching entry found.
 ///
 /// Returns `None` if parsing fails or the log doesn't exist.
-fn parse_token_usage_from_log(log_path: &std::path::Path) -> Option<i64> {
+fn parse_token_usage_from_log(log_path: &std::path::Path) -> Option<(i64, i64)> {
     let contents = std::fs::read_to_string(log_path).ok()?;
-    let mut total: Option<i64> = None;
+    let mut last: Option<(i64, i64)> = None;
 
     for line in contents.lines() {
         let trimmed = line.trim();
@@ -377,13 +382,13 @@ fn parse_token_usage_from_log(log_path: &std::path::Path) -> Option<i64> {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
                 if input + output > 0 {
-                    total = Some(input + output);
+                    last = Some((input, output));
                 }
             }
         }
     }
 
-    total
+    last
 }
 
 /// Lightweight structured logging to stderr.

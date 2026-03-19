@@ -24,11 +24,33 @@ pub fn execute() -> Result<()> {
         }
     }
 
-    // Token usage
-    let events = db.recent_events(100)?;
-    let total_tokens: i64 = events.iter().filter_map(|e| e.tokens_used).sum();
+    // Token usage summary with cost estimate
+    let (input_tokens, output_tokens) = db.total_token_details()?;
+    let total_tokens = input_tokens + output_tokens;
     if total_tokens > 0 {
-        println!("\nTokens used: {}", total_tokens);
+        use crate::models::pricing;
+        let sonnet_cost = pricing::estimate_cost(
+            input_tokens,
+            output_tokens,
+            pricing::SONNET_INPUT_PER_M,
+            pricing::SONNET_OUTPUT_PER_M,
+        );
+        let opus_cost = pricing::estimate_cost(
+            input_tokens,
+            output_tokens,
+            pricing::OPUS_INPUT_PER_M,
+            pricing::OPUS_OUTPUT_PER_M,
+        );
+        println!(
+            "\nTokens: {} ({} in / {} out)",
+            crate::cli::cost::fmt_tokens(total_tokens),
+            crate::cli::cost::fmt_tokens(input_tokens),
+            crate::cli::cost::fmt_tokens(output_tokens),
+        );
+        println!(
+            "  Est. cost: ${:.4} Sonnet / ${:.4} Opus  (run 'acs cost' for per-ticket breakdown)",
+            sonnet_cost, opus_cost
+        );
     }
 
     Ok(())

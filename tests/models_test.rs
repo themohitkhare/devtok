@@ -102,12 +102,19 @@ fn test_event_serialize_deserialize_roundtrip() {
         event_type: "ticket_completed".into(),
         detail: "Completed t-001".into(),
         tokens_used: Some(1500),
+        input_tokens: Some(1000),
+        output_tokens: Some(500),
+        ticket_id: Some("t-001".into()),
+        model: Some("claude-sonnet-4-6".into()),
     };
     let json = serde_json::to_string(&event).unwrap();
     let deserialized: Event = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.id, 42);
     assert_eq!(deserialized.tokens_used, Some(1500));
     assert_eq!(deserialized.agent, Some("w-0".into()));
+    assert_eq!(deserialized.input_tokens, Some(1000));
+    assert_eq!(deserialized.output_tokens, Some(500));
+    assert_eq!(deserialized.ticket_id, Some("t-001".into()));
 }
 
 #[test]
@@ -119,9 +126,15 @@ fn test_event_with_null_agent_and_tokens() {
         event_type: "system_start".into(),
         detail: "Started".into(),
         tokens_used: None,
+        input_tokens: None,
+        output_tokens: None,
+        ticket_id: None,
+        model: None,
     };
     let json = serde_json::to_string(&event).unwrap();
     let deserialized: Event = serde_json::from_str(&json).unwrap();
     assert!(deserialized.agent.is_none());
     assert!(deserialized.tokens_used.is_none());
+    assert!(deserialized.input_tokens.is_none());
+    assert!(deserialized.ticket_id.is_none());
 }
