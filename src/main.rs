@@ -50,6 +50,7 @@ fn main() -> ExitCode {
         cli::Commands::Cleanup => cli::cleanup::execute(),
         cli::Commands::Status => cli::status::execute(),
         cli::Commands::Log { follow, limit } => cli::log::execute(follow, limit),
+        cli::Commands::Report => cli::report::execute(),
     };
 
     match result {

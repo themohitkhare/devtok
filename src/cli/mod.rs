@@ -9,6 +9,7 @@ pub mod status;
 pub mod log;
 pub mod acs_dir;
 pub mod evolve;
+pub mod report;
 
 use clap::{Parser, Subcommand};
 
@@ -94,4 +95,6 @@ pub enum Commands {
     /// Agent inbox operations
     #[command(subcommand)]
     Inbox(inbox::InboxCommands),
+    /// Generate a current progress report in .acs/reports/progress.md
+    Report,
 }

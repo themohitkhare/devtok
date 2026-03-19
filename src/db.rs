@@ -336,6 +336,25 @@ impl Db {
         ).optional().map_err(Into::into)
     }
 
+    pub fn list_all_knowledge(&self) -> Result<Vec<KnowledgeEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT domain, key, value, version, updated_at FROM knowledge ORDER BY domain, key"
+        )?;
+        let rows = stmt.query_map([], |row| Ok(KnowledgeEntry {
+            domain: row.get(0)?, key: row.get(1)?, value: row.get(2)?,
+            version: row.get(3)?, updated_at: row.get(4)?,
+        }))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    pub fn total_tokens_used(&self) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COALESCE(SUM(tokens_used), 0) FROM events",
+            [],
+            |row| row.get(0),
+        ).map_err(Into::into)
+    }
+
     pub fn write_knowledge(&self, domain: &str, key: &str, value: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(

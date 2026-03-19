@@ -86,6 +86,11 @@ pub fn execute(spec: Option<String>, auto: bool) -> Result<()> {
             &format!("Created {} tickets", count),
             None,
         )?;
+
+        // Generate bootstrap summary report.
+        if let Err(e) = crate::cli::report::generate_bootstrap_report(&acs_dir, &db) {
+            eprintln!("[report] warning: failed to generate bootstrap report: {:#}", e);
+        }
     } else {
         println!("Run `acs init --auto` to auto-analyze, or `acs init --spec <file>` to bootstrap from a spec.");
     }

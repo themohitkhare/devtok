@@ -68,6 +68,7 @@ pub fn execute(
 
         for iter in 0..max_iterations {
             eprintln!("[evolve] iteration {}/{}", iter + 1, max_iterations);
+            let milestone_num = iter + 1;
 
             // Optional planning step.
             if plan_each_iteration {
@@ -96,6 +97,16 @@ pub fn execute(
                 backend.clone(),
             )
             .await?;
+
+            // Generate milestone report after each bounded run.
+            {
+                let db_guard = db.lock().unwrap();
+                if let Err(e) = crate::cli::report::generate_milestone_report(
+                    &acs_dir, &db_guard, milestone_num,
+                ) {
+                    eprintln!("[report] warning: failed to generate milestone report: {:#}", e);
+                }
+            }
 
             if !bootstrap_after_run {
                 // If caller doesn't want additional tickets, exit after first run.
