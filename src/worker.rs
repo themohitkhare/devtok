@@ -140,8 +140,10 @@ async fn handle_ticket_assignment(
     }
 
     // --- (c) Create spawner ---
-    // Workers may use multiple providers (claude/codex/agent) to execute tickets.
-    let spawner = Spawner::new_with_agent_config(project_dir, &config.agents);
+    // Workers may use multiple providers (claude/codex/agent/custom) to execute tickets.
+    // Custom backends from [backends.*] config are passed through so templates are expanded.
+    let spawner = Spawner::new_with_agent_config(project_dir, &config.agents)
+        .with_backends(config.backends.clone());
 
     // --- (d) Create worktree ---
     let worktree = spawner.create_worktree(worker_id, &ticket_id)?;

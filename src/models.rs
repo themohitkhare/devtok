@@ -59,6 +59,20 @@ pub struct Event {
     pub model: Option<String>,
 }
 
+/// A milestone groups tickets into a logical phase gated by CEO approval.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Milestone {
+    pub id: i64,
+    pub name: String,
+    pub goal: String,
+    /// Status: pending | active | awaiting_approval | approved | rejected
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// Ticket IDs belonging to this milestone (populated on demand)
+    pub tickets: Vec<String>,
+}
+
 /// Per-ticket token usage summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TicketTokenUsage {

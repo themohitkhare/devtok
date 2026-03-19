@@ -93,7 +93,23 @@ impl Db {
                 PRIMARY KEY (ticket_id, keyword),
                 FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
             );
-            CREATE INDEX IF NOT EXISTS idx_ticket_keywords_keyword ON ticket_keywords(keyword);"
+            CREATE INDEX IF NOT EXISTS idx_ticket_keywords_keyword ON ticket_keywords(keyword);
+            CREATE TABLE IF NOT EXISTS milestones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS milestone_tickets (
+                milestone_id INTEGER NOT NULL,
+                ticket_id TEXT NOT NULL,
+                PRIMARY KEY (milestone_id, ticket_id),
+                FOREIGN KEY (milestone_id) REFERENCES milestones(id) ON DELETE CASCADE,
+                FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_milestone_tickets_milestone ON milestone_tickets(milestone_id);"
         )?;
 
         // Additive migrations: add new columns to existing events tables.
@@ -478,6 +494,231 @@ impl Db {
             })
         })?;
         rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    // --- Milestones ---
+
+    pub fn create_milestone(&self, name: &str, goal: &str) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO milestones (name, goal, status, created_at, updated_at) VALUES (?1, ?2, 'pending', ?3, ?3)",
+            params![name, goal, now],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn assign_ticket_to_milestone(&self, milestone_id: i64, ticket_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO milestone_tickets (milestone_id, ticket_id) VALUES (?1, ?2)",
+            params![milestone_id, ticket_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_milestones(&self) -> Result<Vec<crate::models::Milestone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, goal, status, created_at, updated_at FROM milestones ORDER BY id"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(crate::models::Milestone {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                goal: row.get(2)?,
+                status: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                tickets: vec![],
+            })
+        })?;
+        let mut milestones: Vec<crate::models::Milestone> = rows
+            .map(|r| r.map_err(Into::into))
+            .collect::<Result<_>>()?;
+        // Populate tickets for each milestone
+        for ms in &mut milestones {
+            ms.tickets = self.get_milestone_ticket_ids(ms.id)?;
+        }
+        Ok(milestones)
+    }
+
+    pub fn get_milestone(&self, id: i64) -> Result<Option<crate::models::Milestone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, goal, status, created_at, updated_at FROM milestones WHERE id = ?1"
+        )?;
+        let ms = stmt.query_row(params![id], |row| {
+            Ok(crate::models::Milestone {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                goal: row.get(2)?,
+                status: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                tickets: vec![],
+            })
+        }).optional()?;
+        if let Some(mut ms) = ms {
+            ms.tickets = self.get_milestone_ticket_ids(ms.id)?;
+            return Ok(Some(ms));
+        }
+        Ok(None)
+    }
+
+    pub fn get_active_milestone(&self) -> Result<Option<crate::models::Milestone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, goal, status, created_at, updated_at FROM milestones WHERE status = 'active' ORDER BY id LIMIT 1"
+        )?;
+        let ms = stmt.query_row([], |row| {
+            Ok(crate::models::Milestone {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                goal: row.get(2)?,
+                status: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                tickets: vec![],
+            })
+        }).optional()?;
+        if let Some(mut ms) = ms {
+            ms.tickets = self.get_milestone_ticket_ids(ms.id)?;
+            return Ok(Some(ms));
+        }
+        Ok(None)
+    }
+
+    pub fn get_awaiting_approval_milestone(&self) -> Result<Option<crate::models::Milestone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, goal, status, created_at, updated_at FROM milestones WHERE status = 'awaiting_approval' ORDER BY id LIMIT 1"
+        )?;
+        let ms = stmt.query_row([], |row| {
+            Ok(crate::models::Milestone {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                goal: row.get(2)?,
+                status: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                tickets: vec![],
+            })
+        }).optional()?;
+        if let Some(mut ms) = ms {
+            ms.tickets = self.get_milestone_ticket_ids(ms.id)?;
+            return Ok(Some(ms));
+        }
+        Ok(None)
+    }
+
+    pub fn update_milestone_status(&self, id: i64, status: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE milestones SET status = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, status, now],
+        )?;
+        Ok(())
+    }
+
+    /// Activate the first pending milestone if no milestone is currently active.
+    /// Returns the activated milestone id, or None if already have an active one.
+    pub fn activate_first_pending_milestone(&self) -> Result<Option<i64>> {
+        // If there's already an active milestone, do nothing
+        let active: Option<i64> = self.conn.query_row(
+            "SELECT id FROM milestones WHERE status = 'active' LIMIT 1",
+            [],
+            |row| row.get(0),
+        ).optional()?;
+        if active.is_some() {
+            return Ok(None);
+        }
+        // Activate the lowest-id pending milestone
+        let next: Option<i64> = self.conn.query_row(
+            "SELECT id FROM milestones WHERE status = 'pending' ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        ).optional()?;
+        if let Some(next_id) = next {
+            self.update_milestone_status(next_id, "active")?;
+            return Ok(Some(next_id));
+        }
+        Ok(None)
+    }
+
+    /// Approve the current awaiting_approval milestone and activate the next pending one.
+    /// Returns (approved_id, next_activated_id).
+    pub fn approve_milestone(&self) -> Result<Option<(i64, Option<i64>)>> {
+        let ms = self.get_awaiting_approval_milestone()?;
+        if let Some(ms) = ms {
+            self.update_milestone_status(ms.id, "approved")?;
+            let next = self.activate_first_pending_milestone()?;
+            return Ok(Some((ms.id, next)));
+        }
+        Ok(None)
+    }
+
+    /// Reject the current awaiting_approval milestone. Sets it back to 'rejected'.
+    /// Returns the rejected milestone id.
+    pub fn reject_milestone(&self) -> Result<Option<i64>> {
+        let ms = self.get_awaiting_approval_milestone()?;
+        if let Some(ms) = ms {
+            self.update_milestone_status(ms.id, "rejected")?;
+            return Ok(Some(ms.id));
+        }
+        Ok(None)
+    }
+
+    pub fn get_milestone_ticket_ids(&self, milestone_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ticket_id FROM milestone_tickets WHERE milestone_id = ?1 ORDER BY ticket_id"
+        )?;
+        let rows = stmt.query_map(params![milestone_id], |row| row.get(0))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Returns true when ALL tickets in the milestone are 'completed'.
+    pub fn is_milestone_complete(&self, milestone_id: i64) -> Result<bool> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM milestone_tickets WHERE milestone_id = ?1",
+            params![milestone_id],
+            |row| row.get(0),
+        )?;
+        if total == 0 {
+            return Ok(false);
+        }
+        let not_done: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM milestone_tickets mt
+             JOIN tickets t ON mt.ticket_id = t.id
+             WHERE mt.milestone_id = ?1 AND t.status != 'completed'",
+            params![milestone_id],
+            |row| row.get(0),
+        )?;
+        Ok(not_done == 0)
+    }
+
+    /// Check whether any milestones exist in the DB.
+    pub fn has_milestones(&self) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM milestones",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Claim the next pending ticket within a specific milestone for an agent.
+    pub fn claim_next_milestone_ticket(&self, agent_id: &str, milestone_id: i64) -> Result<Option<Ticket>> {
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+        let ticket: Option<Ticket> = tx.query_row(
+            "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2
+             WHERE id = (
+                 SELECT t.id FROM tickets t
+                 JOIN milestone_tickets mt ON t.id = mt.ticket_id
+                 WHERE t.status = 'pending' AND t.assignee IS NULL AND mt.milestone_id = ?3
+                 ORDER BY t.priority, t.created_at LIMIT 1
+             )
+             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at",
+            params![agent_id, now, milestone_id],
+            Self::row_to_ticket,
+        ).optional()?;
+        tx.commit()?;
+        Ok(ticket)
     }
 
     /// Returns total (input_tokens, output_tokens) across all events.

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -5,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use anyhow::{bail, Context, Result};
 use rand::Rng;
 
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, BackendTemplate};
 
 pub struct Spawner {
     project_dir: PathBuf,
@@ -13,11 +14,13 @@ pub struct Spawner {
     claude_path: String,
     codex_path: Option<String>,
     agent_path: Option<String>,
+    /// Custom backend templates keyed by backend name (from `[backends.*]` config).
+    backends: HashMap<String, BackendTemplate>,
     tool_path: String,
 }
 
 impl Spawner {
-    /// Backwards-compatible constructor: only `claude` is enabled.
+    /// Backwards-compatible constructor: only `claude` is enabled, no custom backends.
     pub fn new(project_dir: &Path, claude_path: &str, tool_path: &str) -> Self {
         let acs_dir = project_dir.join(".acs");
         Spawner {
@@ -27,6 +30,7 @@ impl Spawner {
             codex_path: None,
             agent_path: None,
             tool_path: tool_path.to_string(),
+            backends: HashMap::new(),
         }
     }
 
@@ -42,7 +46,14 @@ impl Spawner {
             codex_path,
             agent_path,
             tool_path: agents.tool_path.clone(),
+            backends: HashMap::new(),
         }
+    }
+
+    /// Attach custom backend templates loaded from `config.backends`.
+    pub fn with_backends(mut self, backends: HashMap<String, BackendTemplate>) -> Self {
+        self.backends = backends;
+        self
     }
 
     /// Creates a git worktree at `.acs/worktrees/{worker_id}` on a new branch
@@ -123,10 +134,10 @@ impl Spawner {
 
     /// Spawns a provider subprocess inside `worktree`.
     ///
-    /// The provider is selected via `provider`:
-    /// - `claude`
-    /// - `codex`
-    /// - `agent`
+    /// Provider resolution order:
+    /// 1. If `provider` matches a key in `self.backends`, use the command template
+    ///    with `{prompt}` and `{system_prompt}` expanded (custom backend).
+    /// 2. Built-in providers: `claude`, `codex`, `agent`.
     ///
     /// stdout/stderr are redirected to `.acs/logs/{worker_id}.log`. Returns the `Child` handle.
     pub fn spawn_provider(
@@ -157,6 +168,21 @@ impl Spawner {
         // Combine "system prompt" + ticket instructions because codex/agent do not
         // necessarily support Claude-style `--append-system-prompt`.
         let combined_prompt = format!("{}\n\n{}", system_prompt, prompt);
+
+        // --- Custom backend via [backends.*] config section ---
+        if let Some(template) = self.backends.get(provider) {
+            let (program, args) = template
+                .expand(prompt, system_prompt)
+                .ok_or_else(|| anyhow::anyhow!("backend '{}' has an empty command template", provider))?;
+            let mut cmd = Command::new(&program);
+            cmd.args(&args)
+                .current_dir(worktree)
+                .stdout(Stdio::from(log_file))
+                .stderr(Stdio::from(log_file_stderr));
+            return cmd
+                .spawn()
+                .with_context(|| format!("Failed to spawn custom backend '{}' (program: '{}') in '{}'", provider, program, worktree.display()));
+        }
 
         let child = match provider {
             "claude" => {
@@ -224,7 +250,7 @@ impl Spawner {
                 }
                 cmd.arg(combined_prompt).spawn()
             }
-            other => bail!("unknown provider '{}'", other),
+            other => bail!("unknown provider '{}' (not a built-in and not in [backends] config)", other),
         }
         .with_context(|| format!("Failed to spawn provider '{}' in '{}'", provider, worktree.display()))?;
 

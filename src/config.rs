@@ -4,6 +4,44 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// A named backend definition with a command template.
+///
+/// The `command` field is a whitespace-split command template where `{prompt}`
+/// and `{system_prompt}` are expanded at spawn time. Example:
+///
+/// ```toml
+/// [backends.my-claude]
+/// command = "claude -p {prompt} --append-system-prompt {system_prompt} --dangerously-skip-permissions --output-format json"
+/// ```
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct BackendTemplate {
+    /// Command template. Whitespace-tokenised; `{prompt}` and `{system_prompt}`
+    /// tokens are replaced with the actual values before spawning.
+    pub command: String,
+}
+
+impl BackendTemplate {
+    /// Expand `{prompt}` and `{system_prompt}` in the command template and
+    /// return `(program, args)` ready to pass to `std::process::Command`.
+    ///
+    /// Returns `None` when the command template is empty.
+    pub fn expand(&self, prompt: &str, system_prompt: &str) -> Option<(String, Vec<String>)> {
+        let tokens: Vec<String> = self
+            .command
+            .split_whitespace()
+            .map(|tok| match tok {
+                "{prompt}" => prompt.to_string(),
+                "{system_prompt}" => system_prompt.to_string(),
+                other => other.to_string(),
+            })
+            .collect();
+
+        let mut it = tokens.into_iter();
+        let program = it.next()?;
+        Some((program, it.collect()))
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub project: ProjectConfig,
@@ -13,6 +51,10 @@ pub struct Config {
     pub personas: PersonaConfig,
     #[serde(default)]
     pub agents: AgentConfig,
+    /// Named backend definitions with command templates.
+    /// Keys are backend names; values define the command template to run.
+    #[serde(default)]
+    pub backends: HashMap<String, BackendTemplate>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -125,6 +167,7 @@ impl Config {
             manager: ManagerConfig::default(),
             personas: PersonaConfig::default(),
             agents: AgentConfig::default(),
+            backends: HashMap::new(),
         }
     }
 
@@ -202,6 +245,20 @@ claude_path = "{}"
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!("\nagent_models = [{}]", models));
+        }
+
+        // Serialize [backends.*] sections
+        let mut backend_names: Vec<&String> = self.backends.keys().collect();
+        backend_names.sort(); // deterministic output
+        for name in backend_names {
+            let tpl = &self.backends[name];
+            if !tpl.command.is_empty() {
+                out.push_str(&format!(
+                    "\n\n[backends.{}]\ncommand = \"{}\"",
+                    name,
+                    tpl.command.replace('\\', "\\\\").replace('"', "\\\""),
+                ));
+            }
         }
 
         out
