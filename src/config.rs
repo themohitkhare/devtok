@@ -260,9 +260,13 @@ fn default_persona_mapping() -> HashMap<String, String> {
     m.insert("backend".into(), "backend-dev".into());
     m.insert("devops".into(), "devops".into());
     m.insert("qa".into(), "qa".into());
+    m.insert("qa-lead".into(), "qa-lead".into());
     m.insert("infra".into(), "devops".into());
     m.insert("core".into(), "tech-lead".into());
     m.insert("general".into(), "backend-dev".into());
+    // New specialist personas
+    m.insert("pm".into(), "pm".into());
+    m.insert("management".into(), "senior-manager".into());
     m
 }
 
@@ -305,7 +309,7 @@ impl Config {
             manager: ManagerConfig::default(),
             personas: PersonaConfig::default(),
             agents: AgentConfig::default(),
-            backends: HashMap::new(),
+            backends: BackendsConfig::default(),
         }
     }
 
@@ -386,10 +390,10 @@ claude_path = "{}"
         }
 
         // Serialize [backends.*] sections
-        let mut backend_names: Vec<&String> = self.backends.keys().collect();
+        let mut backend_names: Vec<&String> = self.backends.definitions.keys().collect();
         backend_names.sort(); // deterministic output
         for name in backend_names {
-            let tpl = &self.backends[name];
+            let tpl = &self.backends.definitions[name];
             if !tpl.command.is_empty() {
                 out.push_str(&format!(
                     "\n\n[backends.{}]\ncommand = \"{}\"",
@@ -439,6 +443,14 @@ mod tests {
         let cfg = Config::default_for("test");
         assert_eq!(cfg.persona_for_domain("nonexistent"), "backend-dev");
         assert_eq!(cfg.persona_for_domain(""), "backend-dev");
+    }
+
+    #[test]
+    fn persona_for_domain_returns_new_specialist_mappings() {
+        let cfg = Config::default_for("test");
+        assert_eq!(cfg.persona_for_domain("pm"), "pm");
+        assert_eq!(cfg.persona_for_domain("management"), "senior-manager");
+        assert_eq!(cfg.persona_for_domain("qa-lead"), "qa-lead");
     }
 
     #[test]
@@ -525,6 +537,7 @@ name = "minimal"
     fn backend_template_expand_basic() {
         let t = BackendTemplate {
             command: "mytool --task {prompt} --ctx {system_prompt}".to_string(),
+            ..Default::default()
         };
         let (prog, args) = t.expand("do the thing", "you are an AI").unwrap();
         assert_eq!(prog, "mytool");
@@ -535,6 +548,7 @@ name = "minimal"
     fn backend_template_expand_prompt_with_spaces() {
         let t = BackendTemplate {
             command: "echo {prompt}".to_string(),
+            ..Default::default()
         };
         // The full prompt string (including spaces) replaces the {prompt} token as one arg.
         let (prog, args) = t.expand("hello world foo", "sys").unwrap();
@@ -546,6 +560,7 @@ name = "minimal"
     fn backend_template_expand_no_placeholders() {
         let t = BackendTemplate {
             command: "echo static".to_string(),
+            ..Default::default()
         };
         let (prog, args) = t.expand("unused", "unused").unwrap();
         assert_eq!(prog, "echo");
@@ -554,7 +569,7 @@ name = "minimal"
 
     #[test]
     fn backend_template_expand_empty_returns_none() {
-        let t = BackendTemplate { command: "".to_string() };
+        let t = BackendTemplate { command: "".to_string(), ..Default::default() };
         assert!(t.expand("p", "s").is_none());
     }
 
@@ -576,23 +591,24 @@ command = "/usr/local/bin/myai --task {prompt}"
         write!(tmp, "{}", toml_content).unwrap();
         let cfg = Config::load(tmp.path()).expect("should parse");
 
-        assert_eq!(cfg.backends.len(), 2);
-        assert!(cfg.backends.contains_key("my-claude"));
-        assert!(cfg.backends.contains_key("custom"));
+        assert_eq!(cfg.backends.definitions.len(), 2);
+        assert!(cfg.backends.definitions.contains_key("my-claude"));
+        assert!(cfg.backends.definitions.contains_key("custom"));
 
-        let mc = &cfg.backends["my-claude"];
+        let mc = &cfg.backends.definitions["my-claude"];
         assert!(mc.command.contains("{prompt}"));
         assert!(mc.command.contains("{system_prompt}"));
 
-        let cu = &cfg.backends["custom"];
+        let cu = &cfg.backends.definitions["custom"];
         assert!(cu.command.contains("{prompt}"));
     }
 
     #[test]
     fn to_toml_serializes_backends() {
         let mut cfg = Config::default_for("proj");
-        cfg.backends.insert("my-backend".to_string(), BackendTemplate {
+        cfg.backends.definitions.insert("my-backend".to_string(), BackendTemplate {
             command: "mytool {prompt} {system_prompt}".to_string(),
+            ..Default::default()
         });
         let toml_str = cfg.to_toml();
         assert!(toml_str.contains("[backends.my-backend]"), "missing backends section");
@@ -600,7 +616,7 @@ command = "/usr/local/bin/myai --task {prompt}"
 
         // Should round-trip
         let reparsed: Config = toml::from_str(&toml_str).expect("should parse generated TOML");
-        assert_eq!(reparsed.backends["my-backend"].command, "mytool {prompt} {system_prompt}");
+        assert_eq!(reparsed.backends.definitions["my-backend"].command, "mytool {prompt} {system_prompt}");
     }
 
     #[test]
@@ -609,6 +625,6 @@ command = "/usr/local/bin/myai --task {prompt}"
         let mut tmp = NamedTempFile::new().unwrap();
         write!(tmp, "{}", toml_content).unwrap();
         let cfg = Config::load(tmp.path()).expect("should load");
-        assert!(cfg.backends.is_empty());
+        assert!(cfg.backends.definitions.is_empty());
     }
 }

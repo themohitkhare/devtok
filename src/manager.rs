@@ -9,6 +9,28 @@ use crate::db::Db;
 use crate::models::*;
 use crate::spawner::Spawner;
 
+/// Builds a pre-loaded KB context string for a worker's ticket assignment.
+///
+/// Reads the most relevant KB entries for the ticket's domain and returns them
+/// as a formatted markdown string so the worker has immediate context without
+/// needing a round-trip to the DB at startup.
+fn build_kb_context(db: &Db, domain: &str) -> String {
+    let keys_to_fetch: &[(&str, &str)] = &[
+        (domain, "stack"),
+        ("general", "architecture"),
+        ("general", "conventions"),
+        ("architecture", "api-contracts"),
+    ];
+
+    let mut parts = Vec::new();
+    for &(d, k) in keys_to_fetch {
+        if let Ok(Some(entry)) = db.read_knowledge(d, k) {
+            parts.push(format!("**{}/{}:** {}", entry.domain, entry.key, entry.value));
+        }
+    }
+    parts.join("\n\n")
+}
+
 pub async fn run_loop(
     db: Arc<Mutex<Db>>,
     config: &Config,
@@ -222,6 +244,12 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 let work_type = select_provider_for_ticket(&config.agents, &worker.id, &ticket.id);
                 let model = select_model_for_provider(&work_type, &config.agents, ticket.priority);
 
+                // Pre-load KB entries so the worker has immediate context.
+                let kb_context = {
+                    let guard = db.lock().unwrap();
+                    build_kb_context(&guard, &ticket.domain)
+                };
+
                 let mut payload = json!({
                     "ticket_id":   ticket.id,
                     "title":       ticket.title,
@@ -229,6 +257,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                     "domain":      ticket.domain,
                     "persona":     persona,
                     "work_type":   work_type,
+                    "kb_context":  kb_context,
                 });
                 if let Some(m) = model {
                     payload["model"] = json!(m);
@@ -912,5 +941,89 @@ mod tests {
         assert_eq!(g.get_ticket("t-004").unwrap().unwrap().status, "pending");
         // t-005: in_progress → completed (completion message)
         assert_eq!(g.get_ticket("t-005").unwrap().unwrap().status, "completed");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_kb_context: assembles KB entries for the assignment payload
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_kb_context_returns_empty_when_no_entries() {
+        let db = Db::open_memory().expect("in-memory db");
+        let ctx = build_kb_context(&db, "backend");
+        assert!(ctx.is_empty(), "should be empty when KB has no entries");
+    }
+
+    #[test]
+    fn build_kb_context_includes_domain_stack_and_general_entries() {
+        let db = Db::open_memory().expect("in-memory db");
+        db.write_knowledge("backend", "stack", "Rust, Axum").unwrap();
+        db.write_knowledge("general", "architecture", "Single-binary CLI").unwrap();
+        db.write_knowledge("general", "conventions", "Rust 2021 edition").unwrap();
+        db.write_knowledge("architecture", "api-contracts", "GET /users -> {id, name}").unwrap();
+
+        let ctx = build_kb_context(&db, "backend");
+        assert!(ctx.contains("backend/stack"), "should include domain/stack");
+        assert!(ctx.contains("Rust, Axum"), "should include stack value");
+        assert!(ctx.contains("general/architecture"), "should include general/architecture");
+        assert!(ctx.contains("general/conventions"), "should include conventions");
+        assert!(ctx.contains("architecture/api-contracts"), "should include api-contracts");
+    }
+
+    #[test]
+    fn build_kb_context_skips_missing_entries_gracefully() {
+        let db = Db::open_memory().expect("in-memory db");
+        db.write_knowledge("backend", "stack", "Node.js, Express").unwrap();
+
+        let ctx = build_kb_context(&db, "backend");
+        assert!(ctx.contains("backend/stack"));
+        assert!(ctx.contains("Node.js, Express"));
+        assert!(!ctx.contains("general/architecture"));
+        assert!(!ctx.contains("general/conventions"));
+    }
+
+    #[test]
+    fn assignment_payload_includes_kb_context() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            g.create_ticket("Task A", "Do A", "backend", 1).unwrap();
+            g.write_knowledge("backend", "stack", "Rust, Axum").unwrap();
+            g.write_knowledge("general", "architecture", "Single-binary").unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let msg = g.pop_inbox("w-1").unwrap().expect("worker should have received an assignment");
+        assert_eq!(msg.msg_type, "ticket_assignment");
+
+        let payload: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
+        let kb_context = payload["kb_context"].as_str().unwrap_or("");
+        assert!(!kb_context.is_empty(), "kb_context should be non-empty when KB has entries");
+        assert!(kb_context.contains("backend/stack"), "kb_context should contain domain stack");
+        assert!(kb_context.contains("Rust, Axum"), "kb_context should contain stack value");
+        assert!(kb_context.contains("general/architecture"), "kb_context should contain architecture");
+    }
+
+    #[test]
+    fn assignment_payload_kb_context_empty_when_kb_empty() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            g.create_ticket("Task A", "Do A", "backend", 1).unwrap();
+            // No KB entries written
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let msg = g.pop_inbox("w-1").unwrap().expect("worker should have received an assignment");
+        let payload: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
+        let kb_context = payload["kb_context"].as_str().unwrap_or("missing");
+        // Should be present in payload but empty string
+        assert_eq!(kb_context, "", "kb_context should be empty string when KB has no entries");
     }
 }
