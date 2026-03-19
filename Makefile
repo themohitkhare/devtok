@@ -3,7 +3,7 @@
 # Self-evolve dev loop:
 #   1. Run `make install` to build and install the acs binary
 #   2. Run `acs init --auto` to bootstrap ticket backlog from the repo
-#   3. Run `make evolve` to start the self-evolve loop (manager + workers)
+#   3. Run `make evolve` to start the self-evolve loop (bounded manager + workers)
 #      Workers pick up tickets, execute them in isolated git worktrees, and
 #      commit changes to feature branches. The manager reviews and merges.
 #   4. Run `make status` at any time to check ticket progress
@@ -53,7 +53,7 @@ fmt:
 # Set WORKERS env var to control parallelism, e.g.: make evolve WORKERS=4
 WORKERS ?= 2
 evolve:
-	acs run --workers $(WORKERS)
+	acs evolve --workers $(WORKERS)
 
 # Show current ticket progress and agent status.
 status:
@@ -98,7 +98,7 @@ help:
 	@echo "  make fmt           Auto-format source code"
 	@echo "  make install       Install acs binary via cargo install"
 	@echo "  make install-nextest  Install cargo-nextest for parallel tests"
-	@echo "  make evolve        Start the ACS self-evolve loop (acs run)"
+	@echo "  make evolve        Start the ACS self-evolve loop (acs evolve)"
 	@echo "  make status        Show ticket progress (acs status)"
 	@echo "  make clean         Remove .acs/ workspace (destructive)"
 	@echo "  make clean-build   Remove Rust build artifacts (cargo clean)"
@@ -106,5 +106,5 @@ help:
 	@echo "Self-evolve dev loop:"
 	@echo "  1. make install    # build and install acs"
 	@echo "  2. acs init --auto # bootstrap ticket backlog"
-	@echo "  3. make evolve     # start manager + workers"
+	@echo "  3. make evolve     # start bounded manager + workers"
 	@echo "  4. make status     # monitor progress"
