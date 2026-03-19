@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub project: ProjectConfig,
     #[serde(default)]
@@ -15,14 +15,14 @@ pub struct Config {
     pub agents: AgentConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ProjectConfig {
     pub name: String,
     #[serde(default = "default_workers")]
     pub default_workers: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ManagerConfig {
     #[serde(default = "default_cycle")]
     pub cycle_seconds: u64,
@@ -32,13 +32,13 @@ pub struct ManagerConfig {
     pub worker_poll_seconds: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct PersonaConfig {
     #[serde(default = "default_persona_mapping")]
     pub mapping: HashMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AgentConfig {
     #[serde(default = "default_tool_path")]
     pub tool_path: String,

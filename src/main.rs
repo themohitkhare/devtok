@@ -7,9 +7,9 @@ fn main() -> anyhow::Result<()> {
         cli::Commands::Ticket(cmd) => cli::ticket::execute(cmd),
         cli::Commands::Kb(cmd) => cli::kb::execute(cmd),
         cli::Commands::Inbox(cmd) => cli::inbox::execute(cmd),
-        cli::Commands::Status => { println!("TODO: status"); Ok(()) },
-        cli::Commands::Log { .. } => { println!("TODO: log"); Ok(()) },
         cli::Commands::Init { spec, auto } => cli::init::execute(spec, auto),
-        cli::Commands::Run { .. } => { println!("TODO: run"); Ok(()) },
+        cli::Commands::Run { workers } => cli::run::execute(workers),
+        cli::Commands::Status => cli::status::execute(),
+        cli::Commands::Log { follow, limit } => cli::log::execute(follow, limit),
     }
 }

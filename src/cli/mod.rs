@@ -2,6 +2,9 @@ pub mod ticket;
 pub mod kb;
 pub mod inbox;
 pub mod init;
+pub mod run;
+pub mod status;
+pub mod log;
 
 use clap::{Parser, Subcommand};
 
