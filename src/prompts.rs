@@ -226,6 +226,11 @@ Begin by reading all tickets and knowledge base entries.
 ///
 /// The worker agent receives a specific ticket assignment and executes it
 /// in an isolated git worktree, committing changes and reporting back to the manager.
+///
+/// `kb_context` is a pre-loaded snapshot of relevant KB entries. When non-empty it
+/// is inlined at the top of the prompt so the agent has it immediately — but the
+/// agent is still required to re-read the KB before coding so it picks up any
+/// entries written by concurrent workers after this snapshot was taken.
 pub fn worker_prompt(
     ticket_id: &str,
     title: &str,
@@ -233,9 +238,19 @@ pub fn worker_prompt(
     domain: &str,
     persona: &str,
     tool_path: &str,
+    kb_context: &str,
 ) -> String {
     let role = persona_display_name(persona);
     let persona_guidance = persona_specific_guidance(persona);
+
+    let kb_section = if kb_context.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n## Pre-loaded Knowledge Base Context\n\nThe following KB entries were fetched at assignment time. You MUST still re-read the KB before coding (newer entries may exist), but use this as a starting point:\n\n{}\n",
+            kb_context
+        )
+    };
 
     format!(
         r#"You are a {role} for ACS (Auto Consulting Service).
@@ -250,7 +265,7 @@ You have been assigned a ticket to complete. Work methodically, run tests, commi
 
 **Description:**
 {description}
-
+{kb_section}
 ## How to Use the CLI
 
 Use the Bash tool to run these commands:
@@ -262,16 +277,18 @@ Use the Bash tool to run these commands:
 {tool_path} ticket update --id {ticket_id} --status blocked --notes "Blocked because ..."
 ```
 
-### Read from the knowledge base (get context)
+### Read from the knowledge base (REQUIRED before coding)
 ```bash
 {tool_path} kb read --domain {domain} --key stack
 {tool_path} kb read --domain general --key architecture
 {tool_path} kb read --domain general --key conventions
+{tool_path} kb read --domain architecture --key api-contracts
 ```
 
-### Write to the knowledge base (share discoveries)
+### Write to the knowledge base (REQUIRED after completing work)
 ```bash
 {tool_path} kb write --domain {domain} --key stack --value "Rust, Axum"
+{tool_path} kb write --domain {domain} --key <discovery-key> --value "<what you learned>"
 ```
 
 ### Notify the manager when done
@@ -281,6 +298,8 @@ Use the Bash tool to run these commands:
 
 ## Execution Workflow
 
+**IMPORTANT:** Steps 2 and 6 are MANDATORY. You must read the KB before writing any code, and you must write your findings back when done.
+
 Follow these steps in order:
 
 1. **Mark as in-progress**
@@ -288,12 +307,14 @@ Follow these steps in order:
    {tool_path} ticket update --id {ticket_id} --status in_progress
    ```
 
-2. **Read the knowledge base** for relevant context before writing any code:
+2. **READ the knowledge base — REQUIRED before writing any code:**
    ```bash
    {tool_path} kb read --domain {domain} --key stack
    {tool_path} kb read --domain general --key architecture
    {tool_path} kb read --domain general --key conventions
+   {tool_path} kb read --domain architecture --key api-contracts
    ```
+   Study the output carefully. If entries are missing, explore the repo to fill in the gaps.
 
 3. **Implement the work** — write code, configuration, tests as required by the ticket description and acceptance criteria.
 
@@ -305,12 +326,19 @@ Follow these steps in order:
    git commit -m "feat({domain}): <what you did>"
    ```
 
-6. **Mark as review_pending**
+6. **WRITE your findings to the KB — REQUIRED after completing work:**
+   Document anything you discovered about the codebase, tech stack, conventions, or API contracts that future workers should know. At minimum update the domain stack entry, and write dedicated entries for significant discoveries:
+   ```bash
+   {tool_path} kb write --domain {domain} --key stack --value "<updated stack info>"
+   {tool_path} kb write --domain {domain} --key <topic> --value "<your findings>"
+   ```
+
+7. **Mark as review_pending**
    ```bash
    {tool_path} ticket update --id {ticket_id} --status review_pending
    ```
 
-7. **Notify the manager**
+8. **Notify the manager**
    ```bash
    {tool_path} inbox push --recipient manager --type ticket_completed --payload '{{"ticket_id":"{ticket_id}","status":"review_pending"}}' --sender {ticket_id}
    ```
@@ -321,7 +349,7 @@ Follow these steps in order:
 - Run the test suite before committing (`cargo test`, `npm test`, or appropriate for the stack).
 - Commit frequently — don't bundle unrelated changes in one commit.
 - If you are blocked by a missing dependency or another ticket, update the ticket status to `blocked` with a clear note, then stop.
-- If you discover important information about the codebase, write it to the knowledge base so future workers benefit.
+- **Always write KB entries after completing work** — your discoveries help all future workers.
 
 {persona_guidance}
 "#,
@@ -330,6 +358,7 @@ Follow these steps in order:
         title = title,
         domain = domain,
         description = description,
+        kb_section = kb_section,
         tool_path = tool_path,
         persona_guidance = persona_guidance,
     )
@@ -521,19 +550,19 @@ mod tests {
 
     #[test]
     fn test_worker_prompt_contains_role_backend_dev() {
-        let prompt = worker_prompt("t-001", "Build auth", "Add login", "backend", "backend-dev", "acs");
+        let prompt = worker_prompt("t-001", "Build auth", "Add login", "backend", "backend-dev", "acs", "");
         assert!(prompt.contains("You are a Backend Dev for ACS"));
     }
 
     #[test]
     fn test_worker_prompt_contains_role_qa() {
-        let prompt = worker_prompt("t-002", "Write tests", "Test login", "qa", "qa", "acs");
+        let prompt = worker_prompt("t-002", "Write tests", "Test login", "qa", "qa", "acs", "");
         assert!(prompt.contains("You are a QA Engineer for ACS"));
     }
 
     #[test]
     fn test_worker_prompt_contains_ticket_details() {
-        let prompt = worker_prompt("t-001", "Build auth", "Add OAuth login flow", "backend", "backend-dev", "acs");
+        let prompt = worker_prompt("t-001", "Build auth", "Add OAuth login flow", "backend", "backend-dev", "acs", "");
         assert!(prompt.contains("t-001"));
         assert!(prompt.contains("Build auth"));
         assert!(prompt.contains("Add OAuth login flow"));
@@ -542,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_worker_prompt_contains_tool_path() {
-        let prompt = worker_prompt("t-001", "Test", "Desc", "backend", "backend-dev", "/usr/local/bin/acs");
+        let prompt = worker_prompt("t-001", "Test", "Desc", "backend", "backend-dev", "/usr/local/bin/acs", "");
         assert!(prompt.contains("/usr/local/bin/acs ticket update"));
         assert!(prompt.contains("/usr/local/bin/acs kb read"));
         assert!(prompt.contains("/usr/local/bin/acs inbox push"));
@@ -550,13 +579,41 @@ mod tests {
 
     #[test]
     fn test_worker_prompt_persona_guidance_frontend() {
-        let prompt = worker_prompt("t-001", "Build UI", "Add nav", "frontend", "frontend-dev", "acs");
+        let prompt = worker_prompt("t-001", "Build UI", "Add nav", "frontend", "frontend-dev", "acs", "");
         assert!(prompt.contains("Frontend Dev Guidance"));
     }
 
     #[test]
     fn test_worker_prompt_persona_guidance_devops() {
-        let prompt = worker_prompt("t-001", "Add CI", "Setup pipeline", "devops", "devops", "acs");
+        let prompt = worker_prompt("t-001", "Add CI", "Setup pipeline", "devops", "devops", "acs", "");
         assert!(prompt.contains("DevOps Engineer Guidance"));
+    }
+
+    #[test]
+    fn test_worker_prompt_kb_context_section_shown_when_provided() {
+        let kb = "**core/stack:** Rust, Tokio\n**general/architecture:** Single-binary CLI";
+        let prompt = worker_prompt("t-001", "Test", "Desc", "core", "tech-lead", "acs", kb);
+        assert!(prompt.contains("Pre-loaded Knowledge Base Context"));
+        assert!(prompt.contains("Rust, Tokio"));
+    }
+
+    #[test]
+    fn test_worker_prompt_kb_context_section_absent_when_empty() {
+        let prompt = worker_prompt("t-001", "Test", "Desc", "core", "tech-lead", "acs", "");
+        assert!(!prompt.contains("Pre-loaded Knowledge Base Context"));
+    }
+
+    #[test]
+    fn test_worker_prompt_requires_kb_read_before_coding() {
+        let prompt = worker_prompt("t-001", "Test", "Desc", "backend", "backend-dev", "acs", "");
+        assert!(prompt.contains("REQUIRED before"));
+        assert!(prompt.contains("api-contracts"));
+    }
+
+    #[test]
+    fn test_worker_prompt_requires_kb_write_after_work() {
+        let prompt = worker_prompt("t-001", "Test", "Desc", "backend", "backend-dev", "acs", "");
+        assert!(prompt.contains("REQUIRED after completing work"));
+        assert!(prompt.contains("kb write"));
     }
 }

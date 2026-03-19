@@ -124,6 +124,7 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
         .as_str()
         .unwrap_or_else(|| config.persona_for_domain(&domain))
         .to_string();
+    let kb_context = val["kb_context"].as_str().unwrap_or("").to_string();
 
     // Provider selection: forced_provider (from --backend flag) > payload override > config-based selection
     let provider = forced_provider.unwrap_or_else(|| {
@@ -164,6 +165,7 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
         &domain,
         &persona,
         &config.agents.tool_path,
+        &kb_context,
     );
 
     // --- (f) Build task prompt ---
