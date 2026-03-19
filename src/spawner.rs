@@ -693,6 +693,7 @@ mod tests {
                 // Use `echo` so the process succeeds without a real AI binary.
                 // Template: echo {prompt} {system_prompt}
                 command: "echo {prompt} {system_prompt}".to_string(),
+                ..Default::default()
             },
         );
 
@@ -723,6 +724,7 @@ mod tests {
             "claude".to_string(),
             BackendTemplate {
                 command: "echo custom-override {prompt}".to_string(),
+                ..Default::default()
             },
         );
 
@@ -754,7 +756,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let mut backends = HashMap::new();
-        backends.insert("foo".to_string(), BackendTemplate { command: "foo {prompt}".to_string() });
+        backends.insert("foo".to_string(), BackendTemplate { command: "foo {prompt}".to_string(), ..Default::default() });
 
         let s = Spawner::new(tmp.path(), "claude", "acs").with_backends(backends);
         assert!(s.backends.contains_key("foo"));
