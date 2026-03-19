@@ -236,3 +236,35 @@ fn test_ticket_without_acs_dir_errors() {
         .unwrap();
     assert!(!output.status.success());
 }
+
+// --- Plan CLI tests ---
+
+#[test]
+fn test_plan_without_acs_dir_errors() {
+    let bin = acs_bin();
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = Command::new(&bin)
+        .args(["plan"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(".acs/") || stderr.contains("not found"));
+}
+
+#[test]
+fn test_plan_without_tickets_errors() {
+    let bin = acs_bin();
+    let dir = setup_test_dir();
+
+    let output = Command::new(&bin)
+        .args(["plan"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("No tickets found"));
+}

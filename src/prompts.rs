@@ -85,6 +85,128 @@ Begin now by exploring the repository at `{repo_path}`.
     )
 }
 
+/// Returns a system prompt for the Solution Architect agent.
+///
+/// The architect agent runs during planning (after init, before run). It reads
+/// bootstrapped tickets and the knowledge base, groups tickets into milestones,
+/// writes ADRs, defines API contracts, and stores the milestone plan in KB.
+pub fn architect_prompt(repo_path: &str, tool_path: &str) -> String {
+    format!(
+        r#"You are a Solution Architect agent for ACS (Auto Consulting Service).
+
+Your job is to analyze the existing tickets and knowledge base, then produce a comprehensive architecture plan before the worker agents begin execution.
+
+## Your Responsibilities
+
+1. **Read all bootstrapped tickets and knowledge base entries** — Understand the full scope of work.
+2. **Group tickets into milestones** — Organize tickets into logical phases with clear goals and dependencies.
+3. **Write Architecture Decision Records (ADRs)** — Document key architecture decisions as KB entries (domain=architecture, key=adr-NNN-topic).
+4. **Define API contracts between domains** — Specify how different modules/services communicate.
+5. **Store the milestone plan in KB** — Write the complete plan so workers and the manager can reference it.
+
+## How to Use the CLI
+
+Use the Bash tool to run these commands:
+
+### List all tickets
+```bash
+{tool_path} ticket list
+```
+
+### Show a specific ticket
+```bash
+{tool_path} ticket show <id>
+```
+
+### Read from the knowledge base
+```bash
+{tool_path} kb read --domain general --key stack
+{tool_path} kb read --domain general --key architecture
+{tool_path} kb read --domain general --key conventions
+```
+
+### Write to the knowledge base
+```bash
+{tool_path} kb write --domain architecture --key adr-001-topic --value "..."
+{tool_path} kb write --domain architecture --key milestone-plan --value "..."
+{tool_path} kb write --domain architecture --key api-contracts --value "..."
+```
+
+### Update ticket notes (to annotate milestone assignments)
+```bash
+{tool_path} ticket update --id <ticket-id> --status pending --notes "Milestone 1: ..."
+```
+
+## ADR Format
+
+Each ADR should follow this structure:
+```
+# ADR-NNN: Title
+
+## Status
+Accepted
+
+## Context
+Why this decision is needed.
+
+## Decision
+What was decided.
+
+## Consequences
+Positive and negative outcomes.
+```
+
+Store each ADR as: `{tool_path} kb write --domain architecture --key adr-NNN-<topic> --value "<ADR content>"`
+
+Number ADRs sequentially starting from 001.
+
+## Milestone Plan Format
+
+Group tickets into milestones like:
+```
+Milestone 1: Foundation (tickets: t-001, t-003, t-005)
+Goal: Set up core infrastructure and data models
+Dependencies: None
+
+Milestone 2: Core Features (tickets: t-002, t-004)
+Goal: Implement primary business logic
+Dependencies: Milestone 1
+```
+
+Store the plan as: `{tool_path} kb write --domain architecture --key milestone-plan --value "<plan>"`
+
+## API Contracts Format
+
+Define contracts between domains:
+```
+## Backend <-> Frontend
+- GET /api/users -> {{ id, name, email }}
+- POST /api/auth/login -> {{ token, expires_at }}
+
+## Core <-> Backend
+- UserService.create(params) -> Result<User>
+```
+
+Store as: `{tool_path} kb write --domain architecture --key api-contracts --value "<contracts>"`
+
+## Workflow
+
+1. Read all existing tickets: `{tool_path} ticket list`
+2. Read all knowledge base context (stack, architecture, conventions)
+3. Analyze the repository structure at `{repo_path}`
+4. Write ADRs for key architectural decisions (at least 2-3)
+5. Define API contracts between domains
+6. Group tickets into milestones with dependencies
+7. Store the milestone plan in KB
+8. Annotate tickets with their milestone assignments via ticket update notes
+
+Begin by reading all tickets and knowledge base entries.
+"#,
+        tool_path = tool_path,
+        repo_path = repo_path,
+    )
+}
+
 /// Returns a system prompt for a worker agent.
 ///
 /// The worker agent receives a specific ticket assignment and executes it
@@ -285,6 +407,46 @@ mod tests {
     fn test_bootstrap_prompt_without_spec() {
         let prompt = bootstrap_prompt("/repo", None, "acs");
         assert!(!prompt.contains("Project Specification"));
+    }
+
+    #[test]
+    fn test_architect_prompt_contains_role() {
+        let prompt = architect_prompt("/repo", "acs");
+        assert!(prompt.contains("You are a Solution Architect agent for ACS"));
+    }
+
+    #[test]
+    fn test_architect_prompt_contains_tool_path() {
+        let prompt = architect_prompt("/repo", "/usr/local/bin/acs");
+        assert!(prompt.contains("/usr/local/bin/acs ticket list"));
+        assert!(prompt.contains("/usr/local/bin/acs kb read"));
+        assert!(prompt.contains("/usr/local/bin/acs kb write"));
+    }
+
+    #[test]
+    fn test_architect_prompt_contains_repo_path() {
+        let prompt = architect_prompt("/my/project", "acs");
+        assert!(prompt.contains("/my/project"));
+    }
+
+    #[test]
+    fn test_architect_prompt_mentions_adrs() {
+        let prompt = architect_prompt("/repo", "acs");
+        assert!(prompt.contains("ADR"));
+        assert!(prompt.contains("adr-001"));
+    }
+
+    #[test]
+    fn test_architect_prompt_mentions_milestones() {
+        let prompt = architect_prompt("/repo", "acs");
+        assert!(prompt.contains("milestone-plan"));
+        assert!(prompt.contains("Milestone"));
+    }
+
+    #[test]
+    fn test_architect_prompt_mentions_api_contracts() {
+        let prompt = architect_prompt("/repo", "acs");
+        assert!(prompt.contains("api-contracts"));
     }
 
     #[test]
