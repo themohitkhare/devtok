@@ -4,5 +4,6 @@ pub mod db;
 pub mod manager;
 pub mod models;
 pub mod prompts;
+pub mod quality;
 pub mod spawner;
 pub mod worker;

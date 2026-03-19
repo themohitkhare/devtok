@@ -69,7 +69,7 @@ fn score_one(db: &Db, ticket_id: &str) -> Result<()> {
     // We look for an exact branch match or just pass None.
     let branch = find_branch_for_ticket(ticket_id);
     let notes = &ticket.notes;
-    let score = score_ticket_from_branch(db, ticket_id, branch.as_deref(), notes)?;
+    let score = score_ticket_from_branch(db, &std::env::current_dir()?, ticket_id, branch.as_deref(), notes)?;
 
     let out = serde_json::to_string_pretty(&score)?;
     println!("{}", out);
@@ -87,7 +87,7 @@ fn score_all(db: &Db) -> Result<()> {
     for ticket in &tickets {
         let branch = find_branch_for_ticket(&ticket.id);
         let _score =
-            score_ticket_from_branch(db, &ticket.id, branch.as_deref(), &ticket.notes)?;
+            score_ticket_from_branch(db, &std::env::current_dir()?, &ticket.id, branch.as_deref(), &ticket.notes)?;
     }
 
     let scores = db.list_quality_scores()?;

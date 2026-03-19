@@ -81,6 +81,17 @@ pub struct TicketTokenUsage {
     pub output_tokens: i64,
 }
 
+/// Persisted quality scoring for a ticket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityScore {
+    pub ticket_id: String,
+    pub tests_added: bool,
+    pub docs_updated: bool,
+    pub acceptance_criteria_met: bool,
+    pub score: i32,
+    pub computed_at: String,
+}
+
 /// Pricing constants per million tokens.
 pub mod pricing {
     pub const SONNET_INPUT_PER_M: f64 = 3.0;

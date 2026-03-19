@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
+use std::fs;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 use crate::cli::cleanup;
+use crate::cli::health;
 use crate::config::Config;
 use crate::db::Db;
 use crate::manager;
@@ -18,9 +20,17 @@ pub fn execute(workers: usize, backend: Option<String>) -> Result<()> {
 
     let config = Config::load(&acs_dir.join("config.toml"))?;
     let db = Arc::new(Mutex::new(Db::open(&acs_dir.join("project.db"))?));
+    write_run_pid(&acs_dir)?;
+
+    // Startup diagnostics: if any health check reports `warn` or `error`,
+    // print a one-line warning but still proceed to start manager/workers.
+    let report = health::run_health_checks(&project_dir, &acs_dir, &config);
+    if report.overall != "ok" {
+        eprintln!("Health warning: {}", report.short_summary());
+    }
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    let run_result = rt.block_on(async {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // Register workers
@@ -110,8 +120,29 @@ pub fn execute(workers: usize, backend: Option<String>) -> Result<()> {
 
         println!("Stopped.");
         Ok::<(), anyhow::Error>(())
-    })?;
+    });
 
+    let _ = remove_run_pid_if_owned(&acs_dir);
+    run_result?;
+
+    Ok(())
+}
+
+fn write_run_pid(acs_dir: &std::path::Path) -> Result<()> {
+    let pid_path = acs_dir.join("run.pid");
+    fs::write(&pid_path, format!("{}\n", std::process::id()))
+        .with_context(|| format!("Failed to write {}", pid_path.display()))?;
+    Ok(())
+}
+
+fn remove_run_pid_if_owned(acs_dir: &std::path::Path) -> Result<()> {
+    let pid_path = acs_dir.join("run.pid");
+    let current = std::process::id().to_string();
+    if let Ok(existing) = fs::read_to_string(&pid_path) {
+        if existing.trim() == current {
+            let _ = fs::remove_file(&pid_path);
+        }
+    }
     Ok(())
 }
 

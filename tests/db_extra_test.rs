@@ -217,3 +217,19 @@ fn test_log_event_without_tokens() {
     let events = db.recent_events(1).unwrap();
     assert_eq!(events[0].tokens_used, Some(0)); // defaults to 0 in SQL
 }
+
+#[test]
+fn test_recent_events_for_agent_filters_by_worker() {
+    let db = Db::open_memory().unwrap();
+    db.log_event(Some("w-0"), "test", "for w-0 a", None).unwrap();
+    db.log_event(Some("w-1"), "test", "for w-1", None).unwrap();
+    db.log_event(Some("w-0"), "test", "for w-0 b", None).unwrap();
+
+    let w0 = db.recent_events_for_agent("w-0", 10).unwrap();
+    assert_eq!(w0.len(), 2);
+    assert!(w0.iter().all(|e| e.agent.as_deref() == Some("w-0")));
+
+    let w1 = db.recent_events_for_agent("w-1", 10).unwrap();
+    assert_eq!(w1.len(), 1);
+    assert_eq!(w1[0].agent.as_deref(), Some("w-1"));
+}

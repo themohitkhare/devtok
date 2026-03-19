@@ -7,7 +7,48 @@ use tokio::time::{sleep, Duration};
 use crate::config::Config;
 use crate::db::Db;
 use crate::models::*;
+use crate::prompts;
+use crate::quality::score_ticket_from_branch;
 use crate::spawner::Spawner;
+
+/// Builds a structured pre-loaded list of KB entries for a worker's ticket assignment.
+///
+/// This is used to enrich the `ticket_assignment` payload with immediate context.
+fn build_kb_context_entries(db: &Db, domain: &str) -> Vec<crate::models::KnowledgeEntry> {
+    let keys_to_fetch: &[(&str, &str)] = &[
+        // Domain-owned tech stack.
+        (domain, "stack"),
+        // Domain-owned API contracts (if present).
+        (domain, "api-contracts"),
+        // Cross-domain architecture/conventions for consistent implementation style.
+        ("general", "architecture"),
+        ("general", "conventions"),
+        // Cross-domain API contracts (if present).
+        ("architecture", "api-contracts"),
+    ];
+
+    let mut out = Vec::new();
+    for &(d, k) in keys_to_fetch {
+        if let Ok(Some(entry)) = db.read_knowledge(d, k) {
+            out.push(entry);
+        }
+    }
+    out
+}
+
+fn format_kb_context(entries: &[crate::models::KnowledgeEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| format!("**{}/{}:** {}", entry.domain, entry.key, entry.value))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Builds a pre-loaded KB context string for a worker's ticket assignment.
+fn build_kb_context(db: &Db, domain: &str) -> String {
+    let entries = build_kb_context_entries(db, domain);
+    format_kb_context(&entries)
+}
 
 pub async fn run_loop(
     db: Arc<Mutex<Db>>,
@@ -109,15 +150,27 @@ fn select_model_for_provider(
     }
 }
 
+fn get_diff_for_branch(branch: &str, project_dir: &std::path::Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["diff", "main...", branch])
+        .current_dir(project_dir)
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => String::new(),
+    }
+}
+
 fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path) -> Result<()> {
     let mut assignments = 0usize;
     let mut completions = 0usize;
     let mut unblocked = 0usize;
     let mut reviewed = 0usize;
     let mut merged = 0usize;
+    let mut milestones_ready = 0usize;
 
     // -----------------------------------------------------------------------
-    // 0. Auto-review: promote review_pending → completed (v1 — no code review)
+    // 0. Review: promote review_pending tickets — auto-approve
     // -----------------------------------------------------------------------
     {
         let review_tickets = {
@@ -126,16 +179,21 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
         };
 
         for ticket in review_tickets {
-            {
-                let guard = db.lock().unwrap();
-                guard.update_ticket(&ticket.id, "completed", Some("Auto-reviewed by manager"), None, None)?;
-                guard.log_event(
-                    Some("mgr"),
-                    "ticket_reviewed",
-                    &format!("ticket {} auto-reviewed and completed", ticket.id),
-                    None,
-                )?;
-            }
+            // Auto-review path
+            let guard = db.lock().unwrap();
+            guard.update_ticket(
+                &ticket.id,
+                "completed",
+                Some("Auto-reviewed by manager"),
+                None,
+                None,
+            )?;
+            guard.log_event(
+                Some("mgr"),
+                "ticket_reviewed",
+                &format!("ticket {} auto-reviewed and completed", ticket.id),
+                None,
+            )?;
             eprintln!("[manager] auto-reviewed ticket {} → completed", ticket.id);
             reviewed += 1;
         }
@@ -222,6 +280,18 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 let work_type = select_provider_for_ticket(&config.agents, &worker.id, &ticket.id);
                 let model = select_model_for_provider(&work_type, &config.agents, ticket.priority);
 
+                // Pre-load KB entries so the worker has immediate context.
+                let (kb_entries, kb_context) = {
+                    let guard = db.lock().unwrap();
+                    let entries = build_kb_context_entries(&guard, &ticket.domain);
+                    let context = format_kb_context(&entries);
+                    let entries_payload = entries
+                        .iter()
+                        .map(|e| json!({ "domain": e.domain, "key": e.key, "value": e.value }))
+                        .collect::<Vec<_>>();
+                    (entries_payload, context)
+                };
+
                 let mut payload = json!({
                     "ticket_id":   ticket.id,
                     "title":       ticket.title,
@@ -229,6 +299,8 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                     "domain":      ticket.domain,
                     "persona":     persona,
                     "work_type":   work_type,
+                    "kb_context":  kb_context,
+                    "kb_entries":  kb_entries,
                 });
                 if let Some(m) = model {
                     payload["model"] = json!(m);
@@ -303,8 +375,12 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 let spawner = Spawner::new(project_dir, &config.agents.claude_path, &config.agents.tool_path);
 
                 if tests_passed {
-                    {
+                    let ticket_notes = {
                         let guard = db.lock().unwrap();
+                        let notes = guard
+                            .get_ticket(&ticket_id)?
+                            .map(|t| t.notes)
+                            .unwrap_or_default();
                         guard.update_ticket(&ticket_id, "completed", None, None, None)?;
                         guard.log_event(
                             Some(&msg.sender),
@@ -315,7 +391,8 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                             ),
                             None,
                         )?;
-                    }
+                        notes
+                    };
 
                     eprintln!(
                         "[manager] ticket {} completed by {} via {} (tests passed)",
@@ -326,6 +403,24 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                     // Attempt to merge the worker branch into main
                     match spawner.find_branch_for_ticket(&ticket_id) {
                         Ok(Some(branch)) => {
+                            // Auto-score while the branch still exists and before merging
+                            // it into `main` (quality detection runs `git diff main...<branch>`).
+                            if let Err(e) = {
+                                let guard = db.lock().unwrap();
+                                score_ticket_from_branch(
+                                    &*guard,
+                                    project_dir,
+                                    &ticket_id,
+                                    Some(&branch),
+                                    &ticket_notes,
+                                )
+                            } {
+                                eprintln!(
+                                    "[manager] quality scoring failed for ticket {} on branch {}: {}",
+                                    ticket_id, branch, e
+                                );
+                            }
+
                             match spawner.merge_branch(&branch) {
                                 Ok(true) => {
                                     // Merge succeeded — clean up the branch
@@ -480,11 +575,72 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
     }
 
     // -----------------------------------------------------------------------
-    // 4. Log summary
+    // 4. Milestone auto-transition (CEO gate)
+    // -----------------------------------------------------------------------
+    //
+    // When ALL tickets in an active milestone are terminal (completed/cancelled),
+    // automatically move the milestone to `awaiting_approval` and notify the CEO.
+    {
+        let active_milestones = {
+            let guard = db.lock().unwrap();
+            guard
+                .list_milestones()?
+                .into_iter()
+                .filter(|m| m.status == "active")
+                .collect::<Vec<_>>()
+        };
+
+        for ms in active_milestones {
+            let terminal = {
+                let guard = db.lock().unwrap();
+                guard.is_milestone_complete(ms.id)?
+            };
+
+            if !terminal {
+                continue;
+            }
+
+            let ticket_ids = ms.tickets.clone();
+            let milestone_name = ms.name.clone();
+
+            {
+                let guard = db.lock().unwrap();
+                guard.update_milestone_status(ms.id, "awaiting_approval")?;
+                guard.log_event(
+                    Some("mgr"),
+                    "milestone_ready_for_review",
+                    &format!(
+                        "milestone {} '{}' ready for review; tickets={:?}",
+                        ms.id, milestone_name, ticket_ids
+                    ),
+                    None,
+                )?;
+
+                let payload = json!({
+                    "milestone_id": ms.id,
+                    "milestone_name": milestone_name,
+                    "ticket_ids": ticket_ids,
+                    "status": "awaiting_approval"
+                })
+                .to_string();
+
+                guard.push_inbox("ceo", "milestone_ready_for_review", &payload, "mgr")?;
+            }
+
+            milestones_ready += 1;
+            eprintln!(
+                "[manager] milestone {} transitioned active → awaiting_approval",
+                ms.id
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Log summary
     // -----------------------------------------------------------------------
     eprintln!(
-        "[manager] cycle complete — assigned: {}, reviewed: {}, completions: {}, merged: {}, unblocked: {}",
-        assignments, reviewed, completions, merged, unblocked
+        "[manager] cycle complete — assigned: {}, reviewed: {}, completions: {}, merged: {}, unblocked: {}, milestones_ready: {}",
+        assignments, reviewed, completions, merged, unblocked, milestones_ready
     );
 
     Ok(())
@@ -701,6 +857,126 @@ mod tests {
         assert_eq!(g.get_ticket("t-002").unwrap().unwrap().status, "completed");
     }
 
+    #[test]
+    fn process_completions_computes_quality_score_from_branch_diff() {
+        use std::fs;
+        use std::process::Command;
+
+        let (db, config) = setup();
+
+        // Create an actual git repo so `git diff main...<branch>` works.
+        let repo = tempfile::tempdir().unwrap();
+        let repo_path = repo.path();
+
+        Command::new("git")
+            .args(["init"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        // Rename default branch to `main`.
+        Command::new("git")
+            .args(["branch", "-M", "main"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        fs::write(repo_path.join("README.md"), "base readme").unwrap();
+        fs::create_dir_all(repo_path.join("src")).unwrap();
+        fs::write(repo_path.join("src/lib.rs"), "pub fn base() {}").unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init", "--no-gpg-sign"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // Create an ACS branch for ticket t-001.
+        Command::new("git")
+            .args(["checkout", "-b", "acs/t-001-abc123"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // Add doc and test changes so the quality module can detect them.
+        fs::write(
+            repo_path.join("README.md"),
+            "changed readme with enough content to count as docs update",
+        )
+        .unwrap();
+        fs::create_dir_all(repo_path.join("tests")).unwrap();
+        fs::write(
+            repo_path.join("tests/quality_test.rs"),
+            "#[test]\nfn it_works() { assert!(true); }\n",
+        )
+        .unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "acs changes", "--no-gpg-sign"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        // Ensure `main` is checked out so manager's merge targets it.
+        Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+
+        {
+            let g = db.lock().unwrap();
+            g.create_ticket("Task A", "Do A", "general", 1).unwrap();
+            g.update_ticket(
+                "t-001",
+                "in_progress",
+                Some("AC verified - all tests pass"),
+                None,
+                None,
+            )
+            .unwrap();
+
+            g.push_inbox(
+                "mgr",
+                "ticket_completed",
+                r#"{"ticket_id":"t-001","tests_passed":true,"work_type":"backend","model":"claude"}"#,
+                "w-1",
+            )
+            .unwrap();
+        }
+
+        run_cycle(&db, &config, repo_path).unwrap();
+
+        let g = db.lock().unwrap();
+        let score = g
+            .get_quality_score("t-001")
+            .unwrap()
+            .expect("quality score should be computed");
+        assert!(score.tests_added);
+        assert!(score.docs_updated);
+        assert!(score.acceptance_criteria_met);
+        assert_eq!(score.score, 100);
+    }
+
     // -----------------------------------------------------------------------
     // unblock_tickets: resets blocked tickets when blocker completes
     // -----------------------------------------------------------------------
@@ -871,6 +1147,93 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // milestone_auto_transition: active → awaiting_approval
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn milestone_auto_transition_to_awaiting_approval_when_all_tickets_terminal() {
+        let (db, config) = setup();
+
+        let milestone_id = {
+            let g = db.lock().unwrap();
+            let mid = g.create_milestone("Milestone 1", "Goal").unwrap();
+            g.update_milestone_status(mid, "active").unwrap();
+
+            let t1 = g.create_ticket("T1", "D1", "general", 1).unwrap();
+            g.update_ticket(&t1, "completed", None, None, None).unwrap();
+            g.assign_ticket_to_milestone(mid, &t1).unwrap();
+
+            let t2 = g.create_ticket("T2", "D2", "general", 1).unwrap();
+            g.update_ticket(&t2, "cancelled", None, None, None).unwrap();
+            g.assign_ticket_to_milestone(mid, &t2).unwrap();
+
+            mid
+        };
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let ms = g.get_milestone(milestone_id).unwrap().unwrap();
+        assert_eq!(ms.status, "awaiting_approval");
+
+        let ceo_msg = g.pop_inbox("ceo").unwrap();
+        assert!(ceo_msg.is_some(), "ceo should have a milestone message");
+        let ceo_msg = ceo_msg.unwrap();
+        assert_eq!(ceo_msg.msg_type, "milestone_ready_for_review");
+
+        let payload: serde_json::Value = serde_json::from_str(&ceo_msg.payload).unwrap();
+        assert_eq!(
+            payload["milestone_id"].as_i64().unwrap(),
+            milestone_id,
+            "payload milestone_id mismatch"
+        );
+        assert_eq!(payload["status"].as_str().unwrap(), "awaiting_approval");
+
+        let events = g.recent_events(20).unwrap();
+        let ready_event = events
+            .iter()
+            .find(|e| e.event_type == "milestone_ready_for_review");
+        assert!(ready_event.is_some(), "should log milestone_ready_for_review event");
+        assert!(
+            ready_event.unwrap().detail.contains(&milestone_id.to_string()),
+            "event detail should include milestone_id"
+        );
+    }
+
+    #[test]
+    fn milestone_auto_transition_does_not_trigger_until_all_tickets_terminal() {
+        let (db, config) = setup();
+
+        let milestone_id = {
+            let g = db.lock().unwrap();
+            let mid = g.create_milestone("Milestone 1", "Goal").unwrap();
+            g.update_milestone_status(mid, "active").unwrap();
+
+            let t1 = g.create_ticket("T1", "D1", "general", 1).unwrap();
+            g.update_ticket(&t1, "completed", None, None, None).unwrap();
+            g.assign_ticket_to_milestone(mid, &t1).unwrap();
+
+            // Non-terminal ticket blocks transition
+            let t2 = g.create_ticket("T2", "D2", "general", 1).unwrap();
+            g.assign_ticket_to_milestone(mid, &t2).unwrap(); // status remains `pending`
+
+            mid
+        };
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let ms = g.get_milestone(milestone_id).unwrap().unwrap();
+        assert_eq!(ms.status, "active");
+
+        let ceo_msg = g.pop_inbox("ceo").unwrap();
+        assert!(
+            ceo_msg.is_none(),
+            "ceo should not receive a message until milestone is complete"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Integration: full cycle with mixed state
     // -----------------------------------------------------------------------
 
@@ -912,5 +1275,96 @@ mod tests {
         assert_eq!(g.get_ticket("t-004").unwrap().unwrap().status, "pending");
         // t-005: in_progress → completed (completion message)
         assert_eq!(g.get_ticket("t-005").unwrap().unwrap().status, "completed");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_kb_context: assembles KB entries for the assignment payload
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_kb_context_returns_empty_when_no_entries() {
+        let db = Db::open_memory().expect("in-memory db");
+        let ctx = build_kb_context(&db, "backend");
+        assert!(ctx.is_empty(), "should be empty when KB has no entries");
+    }
+
+    #[test]
+    fn build_kb_context_includes_domain_stack_and_general_entries() {
+        let db = Db::open_memory().expect("in-memory db");
+        db.write_knowledge("backend", "stack", "Rust, Axum").unwrap();
+        db.write_knowledge("general", "architecture", "Single-binary CLI").unwrap();
+        db.write_knowledge("general", "conventions", "Rust 2021 edition").unwrap();
+        db.write_knowledge("architecture", "api-contracts", "GET /users -> {id, name}").unwrap();
+
+        let ctx = build_kb_context(&db, "backend");
+        assert!(ctx.contains("backend/stack"), "should include domain/stack");
+        assert!(ctx.contains("Rust, Axum"), "should include stack value");
+        assert!(ctx.contains("general/architecture"), "should include general/architecture");
+        assert!(ctx.contains("general/conventions"), "should include conventions");
+        assert!(ctx.contains("architecture/api-contracts"), "should include api-contracts");
+    }
+
+    #[test]
+    fn build_kb_context_skips_missing_entries_gracefully() {
+        let db = Db::open_memory().expect("in-memory db");
+        db.write_knowledge("backend", "stack", "Node.js, Express").unwrap();
+
+        let ctx = build_kb_context(&db, "backend");
+        assert!(ctx.contains("backend/stack"));
+        assert!(ctx.contains("Node.js, Express"));
+        assert!(!ctx.contains("general/architecture"));
+        assert!(!ctx.contains("general/conventions"));
+    }
+
+    #[test]
+    fn assignment_payload_includes_kb_context() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            g.create_ticket("Task A", "Do A", "backend", 1).unwrap();
+            g.write_knowledge("backend", "stack", "Rust, Axum").unwrap();
+            g.write_knowledge("general", "architecture", "Single-binary").unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let msg = g.pop_inbox("w-1").unwrap().expect("worker should have received an assignment");
+        assert_eq!(msg.msg_type, "ticket_assignment");
+
+        let payload: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
+        let kb_context = payload["kb_context"].as_str().unwrap_or("");
+        let kb_entries = payload["kb_entries"].as_array().unwrap();
+        assert!(!kb_context.is_empty(), "kb_context should be non-empty when KB has entries");
+        assert!(kb_context.contains("backend/stack"), "kb_context should contain domain stack");
+        assert!(kb_context.contains("Rust, Axum"), "kb_context should contain stack value");
+        assert!(kb_context.contains("general/architecture"), "kb_context should contain architecture");
+        assert!(
+            kb_entries.iter().any(|e| e["domain"] == "backend" && e["key"] == "stack"),
+            "kb_entries should include backend/stack"
+        );
+    }
+
+    #[test]
+    fn assignment_payload_kb_context_empty_when_kb_empty() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            g.create_ticket("Task A", "Do A", "backend", 1).unwrap();
+            // No KB entries written
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let msg = g.pop_inbox("w-1").unwrap().expect("worker should have received an assignment");
+        let payload: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
+        let kb_context = payload["kb_context"].as_str().unwrap_or("missing");
+        let kb_entries = payload["kb_entries"].as_array().unwrap();
+        // Should be present in payload but empty string
+        assert_eq!(kb_context, "", "kb_context should be empty string when KB has no entries");
+        assert!(kb_entries.is_empty(), "kb_entries should be empty when KB has no entries");
     }
 }

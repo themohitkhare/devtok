@@ -1,10 +1,14 @@
 use anyhow::Result;
 use crate::db::Db;
 
-pub fn execute() -> Result<()> {
+pub fn execute(live: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let acs_dir = crate::cli::acs_dir::resolve_acs_dir(&cwd)?;
     let db = Db::open(&acs_dir.join("project.db"))?;
+
+    if live {
+        return crate::cli::status_live::run(&db);
+    }
 
     // Ticket summary
     let counts = db.count_by_status()?;

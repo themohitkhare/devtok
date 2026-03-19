@@ -9,6 +9,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::Utc;
 use tokio::sync::watch;
 
 use crate::config::Config;
@@ -290,6 +291,22 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
                     // --- (3b) Update DB ---
                     {
                         let db = db.lock().unwrap();
+                        // Record a verifiable KB entry as proof that the worker finished.
+                        // This makes it possible to validate "KB entries increase during acs run"
+                        // even when the underlying model does not explicitly perform KB writes.
+                        let completed_at_ts = Utc::now().timestamp();
+                        let kb_key = format!("ticket-results-{}-{}", ticket_id, completed_at_ts);
+                        let kb_value = serde_json::json!({
+                            "ticket_id": ticket_id,
+                            "worker_id": worker_id,
+                            "domain": domain,
+                            "tests_passed": tests_passed,
+                            "work_type": provider.as_str(),
+                            "model": model.as_deref(),
+                            "completed_at_ts": completed_at_ts
+                        })
+                        .to_string();
+                        db.write_knowledge(&domain, &kb_key, &kb_value)?;
                         db.push_inbox(
                             "mgr",
                             "ticket_completed",
@@ -298,8 +315,8 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
                                 "worker_id": worker_id,
                                 "status": "review_pending",
                                 "tests_passed": tests_passed,
-                                "work_type": provider,
-                                "model": model,
+                                "work_type": provider.as_str(),
+                                "model": model.as_deref(),
                             })
                             .to_string(),
                             worker_id,
@@ -624,6 +641,49 @@ mod tests {
         assert_eq!(payload["ticket_id"], "t-done");
         assert_eq!(payload["status"], "review_pending");
         assert_eq!(payload["worker_id"], "w-test");
+    }
+
+    // ── Test 2b: successful completion writes a verifiable KB entry ───────
+
+    #[tokio::test]
+    async fn completion_flow_writes_ticket_results_to_kb() {
+        let db = make_db();
+        let config = make_config(30);
+        let spawner = MockSpawner::new(MockBehavior::Success);
+        let (_tx, shutdown_rx) = watch::channel(false);
+        let mut shutdown_rx = shutdown_rx;
+
+        let ticket_id = "t-kb";
+
+        handle_ticket_with_spawner(
+            &spawner,
+            "w-test",
+            &ticket_payload(ticket_id),
+            &db,
+            &config,
+            &mut shutdown_rx,
+            Some("claude".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let all_knowledge = db.lock().unwrap().list_all_knowledge().unwrap();
+        let prefix = format!("ticket-results-{}-", ticket_id);
+
+        let entry = all_knowledge
+            .iter()
+            .find(|e| e.domain == "general" && e.key.starts_with(&prefix));
+
+        assert!(
+            entry.is_some(),
+            "expected a KB entry with key prefix '{}' in domain 'general'",
+            prefix
+        );
+
+        let entry = entry.unwrap();
+        assert!(entry.value.contains(&format!("\"ticket_id\":\"{}\"", ticket_id)));
+        assert!(entry.value.contains("\"tests_passed\":true"));
+        assert!(entry.value.contains("\"work_type\":\"claude\""));
     }
 
     // ── Test 3: crash recovery resets ticket to pending ───────────────

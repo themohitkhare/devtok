@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use chrono::Utc;
+use std::path::Path;
 
 use crate::db::Db;
 use crate::models::QualityScore;
@@ -51,12 +52,13 @@ pub fn compute_score(
 /// - `ticket_notes`: the ticket's notes field, checked for AC verification markers.
 pub fn score_ticket_from_branch(
     db: &Db,
+    project_dir: &Path,
     ticket_id: &str,
     branch_name: Option<&str>,
     ticket_notes: &str,
 ) -> Result<QualityScore> {
     let (tests_added, docs_updated) = if let Some(branch) = branch_name {
-        detect_changes_in_branch(branch)
+        detect_changes_in_branch(project_dir, branch)
     } else {
         (false, false)
     };
@@ -70,11 +72,12 @@ pub fn score_ticket_from_branch(
 
 /// Check the diff of a branch against `main` for test/doc file changes.
 /// Returns `(tests_added, docs_updated)`.
-fn detect_changes_in_branch(branch: &str) -> (bool, bool) {
+fn detect_changes_in_branch(project_dir: &Path, branch: &str) -> (bool, bool) {
     use std::process::Command;
 
     let output = Command::new("git")
         .args(["diff", "--name-only", &format!("main...{}", branch)])
+        .current_dir(project_dir)
         .output();
 
     let output = match output {
@@ -175,7 +178,7 @@ pub fn check_north_star(db: &Db, project_dir: &std::path::Path) -> Result<NorthS
 fn check_readme(project_dir: &std::path::Path) -> bool {
     let readme = project_dir.join("README.md");
     if let Ok(meta) = std::fs::metadata(&readme) {
-        meta.len() > 100
+        meta.len() >= 100
     } else {
         false
     }
@@ -358,7 +361,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         // Write a README
-        std::fs::write(dir.path().join("README.md"), "# Test\n\nThis is a test readme with more than 100 bytes of content to pass the check.\n").unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            "# Test\n\nThis is a test readme with more than 100 bytes of content to pass the check.\n\nAdditional padding content to ensure the README is definitely above the threshold.\n",
+        )
+        .unwrap();
         // No src/ directory, so TODO check passes trivially
 
         let status = check_north_star(&db, dir.path()).unwrap();

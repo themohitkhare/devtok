@@ -204,6 +204,20 @@ Define contracts between domains:
 
 Store as: `{tool_path} kb write --domain architecture --key api-contracts --value "<contracts>"`
 
+## Spawning Specialist Sub-Agents
+
+After producing the architecture plan you may create tickets that will be executed by specialist agents:
+
+- **Project Manager (PM)** — set `--domain pm` on tickets that require milestone tracking, status reporting, or escalation management. The PM persona is assigned automatically by the domain→persona mapping.
+- **QA Lead** — set `--domain qa-lead` on tickets that require acceptance-criteria verification or test-suite auditing (not feature implementation). The QA Lead verifies that work is complete before tickets are closed.
+- **Senior Manager** — set `--domain management` on tickets that require architecture review or cross-team oversight decisions.
+
+Example:
+```bash
+{tool_path} ticket create --title "Verify milestone 1 acceptance criteria" --description "..." --domain qa-lead --priority 2 --non-interactive
+{tool_path} ticket create --title "Write weekly status report" --description "..." --domain pm --priority 3 --non-interactive
+```
+
 ## Workflow
 
 1. Read all existing tickets: `{tool_path} ticket list`
@@ -214,11 +228,49 @@ Store as: `{tool_path} kb write --domain architecture --key api-contracts --valu
 6. Group tickets into milestones with dependencies
 7. Store the milestone plan in KB
 8. Annotate tickets with their milestone assignments via ticket update notes
+9. Optionally create PM/QA-Lead/Senior-Manager tickets for oversight and verification
 
 Begin by reading all tickets and knowledge base entries.
 "#,
         tool_path = tool_path,
         repo_path = repo_path,
+    )
+}
+
+/// Returns a system prompt for the Tech Lead (code-review) agent.
+///
+/// The manager spawns this agent when `config.quality.code_review` is enabled.
+/// The reviewer validates the worker branch and then notifies the manager
+/// via `acs inbox push` with `tests_passed` set appropriately.
+pub fn tech_lead_review_prompt(ticket_id: &str, branch: &str, tool_path: &str) -> String {
+    format!(
+        r#"You are a Tech Lead reviewer for ACS (Auto Consulting Service).
+
+You must review the changes for ticket `{ticket_id}` on git branch `{branch}`.
+
+Your tasks:
+1. Inspect the diff (at minimum review `git diff main...{branch}`).
+2. Run tests if available:
+   - If `Cargo.toml` exists, run `cargo test`.
+   - Otherwise, if `package.json` exists, run `npm test`.
+3. Decide whether the branch is safe to merge.
+
+## How to Notify the Manager
+If the review passes, push:
+```bash
+{tool_path} inbox push --recipient mgr --type ticket_completed --payload '{{"ticket_id":"{ticket_id}","tests_passed":true}}' --sender {ticket_id}
+```
+
+If tests fail or the review is not safe, push:
+```bash
+{tool_path} inbox push --recipient mgr --type ticket_completed --payload '{{"ticket_id":"{ticket_id}","tests_passed":false}}' --sender {ticket_id}
+```
+
+Do not block for user input. Provide only the CLI commands needed to complete the inbox push.
+"#,
+        ticket_id = ticket_id,
+        branch = branch,
+        tool_path = tool_path,
     )
 }
 
@@ -280,6 +332,7 @@ Use the Bash tool to run these commands:
 ### Read from the knowledge base (REQUIRED before coding)
 ```bash
 {tool_path} kb read --domain {domain} --key stack
+{tool_path} kb read --domain {domain} --key api-contracts
 {tool_path} kb read --domain general --key architecture
 {tool_path} kb read --domain general --key conventions
 {tool_path} kb read --domain architecture --key api-contracts
@@ -307,9 +360,10 @@ Follow these steps in order:
    {tool_path} ticket update --id {ticket_id} --status in_progress
    ```
 
-2. **READ the knowledge base — REQUIRED before writing any code:**
+2. **READ the knowledge base — REQUIRED before writing any code (STOP if you haven't run these):**
    ```bash
    {tool_path} kb read --domain {domain} --key stack
+   {tool_path} kb read --domain {domain} --key api-contracts
    {tool_path} kb read --domain general --key architecture
    {tool_path} kb read --domain general --key conventions
    {tool_path} kb read --domain architecture --key api-contracts
@@ -327,10 +381,11 @@ Follow these steps in order:
    ```
 
 6. **WRITE your findings to the KB — REQUIRED after completing work:**
-   Document anything you discovered about the codebase, tech stack, conventions, or API contracts that future workers should know. At minimum update the domain stack entry, and write dedicated entries for significant discoveries:
+   Document anything you discovered about the codebase, tech stack, conventions, or API contracts that future workers should know. At minimum update the domain stack entry, and write dedicated entries for significant discoveries (use the `ticket_id` to make keys unique):
    ```bash
    {tool_path} kb write --domain {domain} --key stack --value "<updated stack info>"
-   {tool_path} kb write --domain {domain} --key <topic> --value "<your findings>"
+   {tool_path} kb write --domain {domain} --key worker-findings-{ticket_id} --value "<your findings>"
+   {tool_path} kb write --domain architecture --key api-contracts --value "<updated api contracts if relevant>"
    ```
 
 7. **Mark as review_pending**
@@ -369,8 +424,11 @@ fn persona_display_name(persona: &str) -> &str {
         "frontend-dev" => "Frontend Dev",
         "backend-dev" => "Backend Dev",
         "qa" => "QA Engineer",
+        "qa-lead" => "QA Lead",
         "devops" => "DevOps Engineer",
         "tech-lead" => "Tech Lead",
+        "pm" => "Project Manager",
+        "senior-manager" => "Senior Manager",
         other => other,
     }
 }
@@ -471,6 +529,36 @@ fn persona_specific_guidance(persona: &str) -> String {
             - Prefer incremental, reviewable changes over large rewrites.\n\
             - Update the knowledge base with any significant architectural decisions you make.\n\
             - Leave clear inline comments for non-obvious design choices."
+        }
+        "pm" => {
+            "## Project Manager Guidance\n\n\
+            - Your primary focus is tracking milestones, surfacing blockers, and keeping stakeholders informed.\n\
+            - At the start of every session, read the milestone plan from the knowledge base and check ticket statuses.\n\
+            - Write concise status reports (what is done, what is in-progress, what is blocked) and store them as KB entries: `kb write --domain pm --key status-<date> --value \"...\"`.\n\
+            - When a ticket is blocked, create an escalation: update the ticket with `--status blocked --notes \"...\"` and push an inbox message to manager with type `escalation`.\n\
+            - Track milestone completion: when all tickets in a milestone are done, write a milestone summary to the KB.\n\
+            - Do not write code — coordinate, document, and escalate."
+        }
+        "senior-manager" => {
+            "## Senior Manager Guidance\n\n\
+            - You oversee the work of multiple workers and own the health of the overall project.\n\
+            - Review architecture decision records (ADRs) in the KB and flag concerns before workers implement them.\n\
+            - Approve or reject milestone completions based on ticket outcomes and quality scores.\n\
+            - When reviewing architecture decisions, check: correctness, scalability, maintainability, and alignment with project goals.\n\
+            - Write feedback to the KB under `kb write --domain management --key review-<topic> --value \"...\"`.\n\
+            - Escalate systemic issues (repeated blockers, quality regressions) to the CEO via inbox messages.\n\
+            - Do not write implementation code — focus on oversight, decisions, and feedback."
+        }
+        "qa-lead" => {
+            "## QA Lead Guidance\n\n\
+            - Your sole focus is test quality and acceptance criteria verification — you do not implement features.\n\
+            - Before marking any ticket as review_pending, verify every acceptance criterion listed in the ticket description is met.\n\
+            - Write or review test suites (unit, integration, e2e) and ensure coverage of happy paths, edge cases, and error conditions.\n\
+            - If acceptance criteria are ambiguous, document the interpretation in the ticket notes before testing.\n\
+            - When criteria are NOT met, update the ticket status to `blocked` with specific notes on what is missing.\n\
+            - Log test results as KB entries: `kb write --domain qa --key test-results-<ticket-id> --value \"...\"`.\n\
+            - Track open defects discovered during verification as new tickets — do not fix them inline.\n\
+            - Prefer deterministic tests; flag any flaky tests as defects."
         }
         _ => "## Guidelines\n\nApply sound engineering judgment appropriate to your assigned domain.",
     }
@@ -615,5 +703,69 @@ mod tests {
         let prompt = worker_prompt("t-001", "Test", "Desc", "backend", "backend-dev", "acs", "");
         assert!(prompt.contains("REQUIRED after completing work"));
         assert!(prompt.contains("kb write"));
+    }
+
+    // ── New persona tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_worker_prompt_pm_display_name() {
+        let prompt = worker_prompt("t-010", "Write status report", "Track milestones", "pm", "pm", "acs", "");
+        assert!(prompt.contains("You are a Project Manager for ACS"));
+    }
+
+    #[test]
+    fn test_worker_prompt_pm_guidance() {
+        let prompt = worker_prompt("t-010", "Write status report", "Track milestones", "pm", "pm", "acs", "");
+        assert!(prompt.contains("Project Manager Guidance"));
+        assert!(prompt.contains("escalation"));
+        assert!(prompt.contains("status report"));
+    }
+
+    #[test]
+    fn test_worker_prompt_senior_manager_display_name() {
+        let prompt = worker_prompt("t-011", "Review arch", "Oversee workers", "management", "senior-manager", "acs", "");
+        assert!(prompt.contains("You are a Senior Manager for ACS"));
+    }
+
+    #[test]
+    fn test_worker_prompt_senior_manager_guidance() {
+        let prompt = worker_prompt("t-011", "Review arch", "Oversee workers", "management", "senior-manager", "acs", "");
+        assert!(prompt.contains("Senior Manager Guidance"));
+        assert!(prompt.contains("architecture"));
+        assert!(prompt.contains("oversight"));
+    }
+
+    #[test]
+    fn test_worker_prompt_qa_lead_display_name() {
+        let prompt = worker_prompt("t-012", "Verify criteria", "Check tests", "qa-lead", "qa-lead", "acs", "");
+        assert!(prompt.contains("You are a QA Lead for ACS"));
+    }
+
+    #[test]
+    fn test_worker_prompt_qa_lead_guidance() {
+        let prompt = worker_prompt("t-012", "Verify criteria", "Check tests", "qa-lead", "qa-lead", "acs", "");
+        assert!(prompt.contains("QA Lead Guidance"));
+        assert!(prompt.contains("acceptance criteria verification"));
+    }
+
+    #[test]
+    fn test_architect_prompt_mentions_pm_spawning() {
+        let prompt = architect_prompt("/repo", "acs");
+        assert!(prompt.contains("Project Manager (PM)"));
+        assert!(prompt.contains("--domain pm"));
+    }
+
+    #[test]
+    fn test_architect_prompt_mentions_qa_lead_spawning() {
+        let prompt = architect_prompt("/repo", "acs");
+        assert!(prompt.contains("QA Lead"));
+        assert!(prompt.contains("--domain qa-lead"));
+    }
+
+    #[test]
+    fn test_architect_prompt_mentions_senior_manager_spawning() {
+        let prompt = architect_prompt("/repo", "acs");
+        assert!(prompt.contains("Senior Manager"));
+        assert!(prompt.contains("--domain management"));
     }
 }

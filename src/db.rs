@@ -109,7 +109,15 @@ impl Db {
                 FOREIGN KEY (milestone_id) REFERENCES milestones(id) ON DELETE CASCADE,
                 FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
             );
-            CREATE INDEX IF NOT EXISTS idx_milestone_tickets_milestone ON milestone_tickets(milestone_id);"
+            CREATE INDEX IF NOT EXISTS idx_milestone_tickets_milestone ON milestone_tickets(milestone_id);
+            CREATE TABLE IF NOT EXISTS quality_scores (
+                ticket_id TEXT PRIMARY KEY,
+                tests_added INTEGER NOT NULL,
+                docs_updated INTEGER NOT NULL,
+                acceptance_criteria_met INTEGER NOT NULL,
+                score INTEGER NOT NULL,
+                computed_at TEXT NOT NULL
+            );"
         )?;
 
         // Additive migrations: add new columns to existing events tables.
@@ -477,6 +485,23 @@ impl Db {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    pub fn recent_events_for_agent(&self, agent: &str, limit: usize) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, agent, event_type, detail, tokens_used, input_tokens, output_tokens, ticket_id, model
+             FROM events
+             WHERE agent = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![agent, limit as i64], |row| Ok(Event {
+            id: row.get(0)?, timestamp: row.get(1)?, agent: row.get(2)?,
+            event_type: row.get(3)?, detail: row.get(4)?, tokens_used: row.get(5)?,
+            input_tokens: row.get(6)?, output_tokens: row.get(7)?,
+            ticket_id: row.get(8)?, model: row.get(9)?,
+        }))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
     /// Returns per-ticket token usage (summed across all events for each ticket).
     pub fn token_breakdown_by_ticket(&self) -> Result<Vec<crate::models::TicketTokenUsage>> {
         let mut stmt = self.conn.prepare(
@@ -671,7 +696,8 @@ impl Db {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
-    /// Returns true when ALL tickets in the milestone are 'completed'.
+    /// Returns true when ALL tickets in the milestone are terminal
+    /// (`completed`, `cancelled`, `wont_fix`).
     pub fn is_milestone_complete(&self, milestone_id: i64) -> Result<bool> {
         let total: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM milestone_tickets WHERE milestone_id = ?1",
@@ -684,7 +710,8 @@ impl Db {
         let not_done: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM milestone_tickets mt
              JOIN tickets t ON mt.ticket_id = t.id
-             WHERE mt.milestone_id = ?1 AND t.status != 'completed'",
+             WHERE mt.milestone_id = ?1
+               AND t.status NOT IN ('completed', 'cancelled', 'wont_fix')",
             params![milestone_id],
             |row| row.get(0),
         )?;
@@ -728,5 +755,63 @@ impl Db {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).map_err(Into::into)
+    }
+
+    // --- Quality Scores ---
+
+    pub fn upsert_quality_score(&self, score: &QualityScore) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO quality_scores (ticket_id, tests_added, docs_updated, acceptance_criteria_met, score, computed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(ticket_id) DO UPDATE SET
+                 tests_added = excluded.tests_added,
+                 docs_updated = excluded.docs_updated,
+                 acceptance_criteria_met = excluded.acceptance_criteria_met,
+                 score = excluded.score,
+                 computed_at = excluded.computed_at",
+            params![
+                score.ticket_id,
+                score.tests_added as i32,
+                score.docs_updated as i32,
+                score.acceptance_criteria_met as i32,
+                score.score,
+                score.computed_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_quality_score(&self, ticket_id: &str) -> Result<Option<QualityScore>> {
+        self.conn
+            .query_row(
+                "SELECT ticket_id, tests_added, docs_updated, acceptance_criteria_met, score, computed_at
+                 FROM quality_scores
+                 WHERE ticket_id = ?1",
+                params![ticket_id],
+                |row| Self::row_to_quality_score(row),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_quality_scores(&self) -> Result<Vec<QualityScore>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ticket_id, tests_added, docs_updated, acceptance_criteria_met, score, computed_at
+             FROM quality_scores
+             ORDER BY computed_at DESC, ticket_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| Self::row_to_quality_score(row))?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    fn row_to_quality_score(row: &rusqlite::Row) -> rusqlite::Result<QualityScore> {
+        Ok(QualityScore {
+            ticket_id: row.get(0)?,
+            tests_added: row.get::<_, i32>(1)? != 0,
+            docs_updated: row.get::<_, i32>(2)? != 0,
+            acceptance_criteria_met: row.get::<_, i32>(3)? != 0,
+            score: row.get(4)?,
+            computed_at: row.get(5)?,
+        })
     }
 }
