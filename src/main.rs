@@ -63,6 +63,7 @@ fn main() -> ExitCode {
         } => cli::log::execute(follow, limit, worker, filters),
         cli::Commands::Report => cli::report::execute(),
         cli::Commands::Cost => cli::cost::execute(),
+        cli::Commands::Export { format, out } => cli::export::execute(format, out),
         cli::Commands::Milestone(cmd) => cli::milestone::execute(cmd),
         cli::Commands::Check => cli::check::execute(),
         cli::Commands::Approve => cli::approve::execute(),

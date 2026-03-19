@@ -4,6 +4,7 @@ pub mod check;
 pub mod cleanup;
 pub mod cost;
 pub mod evolve;
+pub mod export;
 pub mod health;
 pub mod inbox;
 pub mod init;
@@ -132,6 +133,15 @@ pub enum Commands {
     Report,
     /// Show token usage and estimated cost breakdown
     Cost,
+    /// Export project summary as markdown or json
+    Export {
+        /// Output format
+        #[arg(long, value_enum, default_value_t = export::ExportFormat::Markdown)]
+        format: export::ExportFormat,
+        /// Optional output file path; defaults to stdout
+        #[arg(long)]
+        out: Option<String>,
+    },
     /// Manage milestones
     #[command(subcommand)]
     Milestone(milestone::MilestoneCommands),
