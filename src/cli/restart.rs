@@ -23,10 +23,10 @@ pub fn execute(workers: Option<usize>, backend: Option<String>, wait_seconds: u6
             .unwrap_or_default()
     );
 
-    crate::cli::run::execute(workers, backend)
+    crate::cli::run::execute(workers, backend, false, 1)
 }
 
-fn stop_existing_if_any(acs_dir: &Path, wait_seconds: u64) -> Result<()> {
+pub fn stop_existing_if_any(acs_dir: &Path, wait_seconds: u64) -> Result<()> {
     let pid_path = acs_dir.join("run.pid");
     if !pid_path.is_file() {
         println!("No running ACS instance found (no run.pid).");
@@ -50,7 +50,10 @@ fn stop_existing_if_any(acs_dir: &Path, wait_seconds: u64) -> Result<()> {
     }
 
     if !is_alive(pid) {
-        eprintln!("Warning: run.pid points to non-running pid {}; removing stale file.", pid);
+        eprintln!(
+            "Warning: run.pid points to non-running pid {}; removing stale file.",
+            pid
+        );
         let _ = fs::remove_file(&pid_path);
         return Ok(());
     }

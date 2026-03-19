@@ -9,6 +9,7 @@ use crate::db::Db;
 pub struct CleanupReport {
     pub branches_found: Vec<String>,
     pub branches_deleted: Vec<String>,
+    pub branch_delete_failures: Vec<String>,
     pub worktrees_removed: Vec<String>,
     pub pruned: bool,
 }
@@ -22,11 +23,15 @@ pub fn run_cleanup(project_dir: &Path, db: &Db) -> Result<CleanupReport> {
     let acs_branches = list_acs_branches(project_dir)?;
 
     let mut deleted = Vec::new();
+    let mut delete_failures = Vec::new();
     for branch in &acs_branches {
         if let Some(ticket_id) = extract_ticket_id(branch) {
             if is_ticket_completed(db, &ticket_id)? {
-                delete_branch(project_dir, branch);
-                deleted.push(branch.clone());
+                if delete_branch(project_dir, branch)? {
+                    deleted.push(branch.clone());
+                } else {
+                    delete_failures.push(branch.clone());
+                }
             }
         }
     }
@@ -37,6 +42,7 @@ pub fn run_cleanup(project_dir: &Path, db: &Db) -> Result<CleanupReport> {
     Ok(CleanupReport {
         branches_found: acs_branches,
         branches_deleted: deleted,
+        branch_delete_failures: delete_failures,
         worktrees_removed: removed_worktrees,
         pruned: true,
     })
@@ -57,7 +63,14 @@ fn list_acs_branches(project_dir: &Path) -> Result<Vec<String>> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let branches: Vec<String> = stdout
         .lines()
-        .map(|l| l.trim().trim_start_matches("* ").trim().to_string())
+        .map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .trim_start_matches("* ")
+                .trim_start_matches("+ ")
+                .trim()
+                .to_string()
+        })
         .filter(|l| !l.is_empty())
         .collect();
 
@@ -91,12 +104,15 @@ fn is_ticket_completed(db: &Db, ticket_id: &str) -> Result<bool> {
     }
 }
 
-/// Delete a local git branch (best-effort, using -D to force).
-fn delete_branch(project_dir: &Path, branch: &str) {
-    let _ = Command::new("git")
+/// Delete a local git branch using `-D`.
+/// Returns `Ok(true)` when deletion succeeds, `Ok(false)` when git rejects deletion.
+fn delete_branch(project_dir: &Path, branch: &str) -> Result<bool> {
+    let status = Command::new("git")
         .args(["branch", "-D", branch])
         .current_dir(project_dir)
-        .status();
+        .status()
+        .with_context(|| format!("Failed to run git branch -D {}", branch))?;
+    Ok(status.success())
 }
 
 /// Scan `.acs/worktrees/` for directories that are not registered as active
@@ -157,9 +173,7 @@ fn list_active_worktree_paths(project_dir: &Path) -> Result<Vec<std::path::PathB
     let paths: Vec<std::path::PathBuf> = stdout
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
-        .map(|p| {
-            std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p))
-        })
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p)))
         .collect();
 
     Ok(paths)
@@ -191,6 +205,7 @@ pub fn execute() -> Result<()> {
     let output = serde_json::json!({
         "branches_found": report.branches_found,
         "branches_deleted": report.branches_deleted,
+        "branch_delete_failures": report.branch_delete_failures,
         "worktrees_removed": report.worktrees_removed,
         "pruned": report.pruned,
     });
@@ -222,10 +237,7 @@ mod tests {
     #[test]
     fn extract_ticket_id_no_suffix() {
         // Branch without random suffix — returns full rest
-        assert_eq!(
-            extract_ticket_id("acs/t-001"),
-            Some("t-001".to_string())
-        );
+        assert_eq!(extract_ticket_id("acs/t-001"), Some("t-001".to_string()));
     }
 
     #[test]
@@ -246,7 +258,8 @@ mod tests {
     fn is_ticket_completed_returns_true_for_completed() {
         let db = Db::open_memory().unwrap();
         let id = db.create_ticket("test", "desc", "general", 1).unwrap();
-        db.update_ticket(&id, "completed", None, None, None).unwrap();
+        db.update_ticket(&id, "completed", None, None, None)
+            .unwrap();
         assert!(is_ticket_completed(&db, &id).unwrap());
     }
 
@@ -254,7 +267,8 @@ mod tests {
     fn is_ticket_completed_returns_false_for_in_progress() {
         let db = Db::open_memory().unwrap();
         let id = db.create_ticket("test", "desc", "general", 1).unwrap();
-        db.update_ticket(&id, "in_progress", None, None, None).unwrap();
+        db.update_ticket(&id, "in_progress", None, None, None)
+            .unwrap();
         assert!(!is_ticket_completed(&db, &id).unwrap());
     }
 
@@ -270,7 +284,11 @@ mod tests {
         let repo = tmp.path();
 
         // Init git repo
-        Command::new("git").args(["init"]).current_dir(repo).output().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
         Command::new("git")
             .args(["commit", "--allow-empty", "-m", "init"])
             .current_dir(repo)
@@ -289,11 +307,16 @@ mod tests {
         let db = Db::open(&repo.join(".acs/project.db")).unwrap();
         // Manually insert ticket t-001
         db.create_ticket("task one", "desc", "general", 1).unwrap();
-        db.update_ticket("t-001", "completed", None, None, None).unwrap();
+        db.update_ticket("t-001", "completed", None, None, None)
+            .unwrap();
 
         let report = run_cleanup(repo, &db).unwrap();
-        assert!(report.branches_found.contains(&"acs/t-001-abcd".to_string()));
-        assert!(report.branches_deleted.contains(&"acs/t-001-abcd".to_string()));
+        assert!(report
+            .branches_found
+            .contains(&"acs/t-001-abcd".to_string()));
+        assert!(report
+            .branches_deleted
+            .contains(&"acs/t-001-abcd".to_string()));
         assert!(report.pruned);
 
         // Verify branch is actually gone
@@ -311,7 +334,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let repo = tmp.path();
 
-        Command::new("git").args(["init"]).current_dir(repo).output().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
         Command::new("git")
             .args(["commit", "--allow-empty", "-m", "init"])
             .current_dir(repo)
@@ -327,10 +354,16 @@ mod tests {
         std::fs::create_dir_all(repo.join(".acs")).unwrap();
         let db = Db::open(&repo.join(".acs/project.db")).unwrap();
         db.create_ticket("task one", "desc", "general", 1).unwrap();
-        db.update_ticket("t-001", "in_progress", None, None, None).unwrap();
+        db.update_ticket("t-001", "in_progress", None, None, None)
+            .unwrap();
 
         let report = run_cleanup(repo, &db).unwrap();
-        assert!(report.branches_found.contains(&"acs/t-001-abcd".to_string()));
-        assert!(report.branches_deleted.is_empty(), "should not delete in_progress branch");
+        assert!(report
+            .branches_found
+            .contains(&"acs/t-001-abcd".to_string()));
+        assert!(
+            report.branches_deleted.is_empty(),
+            "should not delete in_progress branch"
+        );
     }
 }

@@ -19,6 +19,7 @@ pub mod restart;
 pub mod run;
 pub mod status;
 pub mod status_live;
+pub mod stop;
 pub mod ticket;
 
 use clap::{Parser, Subcommand};
@@ -51,6 +52,12 @@ pub enum Commands {
         /// Backend provider: claude, cursor, codex, or mixed (first half claude, second half cursor)
         #[arg(long)]
         backend: Option<String>,
+        /// Enable autoscaling workers based on queue depth
+        #[arg(long, default_value = "false")]
+        autoscale: bool,
+        /// Minimum workers to keep when autoscaling
+        #[arg(long, default_value = "1")]
+        min_workers: usize,
     },
     /// Iteratively run manager/workers + incremental bootstrap (self-development loop)
     Evolve {
@@ -99,6 +106,12 @@ pub enum Commands {
         /// Backend provider: claude, cursor, codex, or mixed
         #[arg(long)]
         backend: Option<String>,
+        /// Seconds to wait for graceful shutdown before SIGKILL
+        #[arg(long, default_value = "20")]
+        wait_seconds: u64,
+    },
+    /// Gracefully stop a running ACS instance
+    Stop {
         /// Seconds to wait for graceful shutdown before SIGKILL
         #[arg(long, default_value = "20")]
         wait_seconds: u64,

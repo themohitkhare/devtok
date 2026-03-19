@@ -25,7 +25,12 @@ fn main() -> ExitCode {
         cli::Commands::Inbox(cmd) => cli::inbox::execute(cmd),
         cli::Commands::Init { spec, auto } => cli::init::execute(spec, auto),
         cli::Commands::Plan => cli::plan::execute(),
-        cli::Commands::Run { workers, backend } => cli::run::execute(workers, backend),
+        cli::Commands::Run {
+            workers,
+            backend,
+            autoscale,
+            min_workers,
+        } => cli::run::execute(workers, backend, autoscale, min_workers),
         cli::Commands::Health => cli::health::execute(),
         cli::Commands::Evolve {
             workers,
@@ -54,6 +59,7 @@ fn main() -> ExitCode {
             backend,
             wait_seconds,
         } => cli::restart::execute(workers, backend, wait_seconds),
+        cli::Commands::Stop { wait_seconds } => cli::stop::execute(wait_seconds),
         cli::Commands::Status { live } => cli::status::execute(live),
         cli::Commands::Log {
             follow,
