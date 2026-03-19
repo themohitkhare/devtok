@@ -173,7 +173,7 @@ async fn handle_ticket_assignment(
             // --- (4b) Update DB ---
             {
                 let db = db.lock().unwrap();
-                db.update_ticket(&ticket_id, "blocked", Some("Worker timed out"), None)?;
+                db.update_ticket(&ticket_id, "blocked", Some("Worker timed out"), None, Some(None))?;
                 db.update_agent(worker_id, "idle", None, None)?;
                 db.log_event(
                     Some(worker_id),
@@ -192,20 +192,7 @@ async fn handle_ticket_assignment(
             tracing_log(worker_id, &format!("spawn_blocking error for ticket {}: {}", ticket_id, join_err));
             {
                 let db = db.lock().unwrap();
-                db.update_ticket(&ticket_id, "pending", None, None)?;
-                // Clear assignee so the ticket can be re-queued
-                {
-                    // Re-use update_ticket but also clear assignee via a direct call
-                    // update_ticket does not clear assignee; do it via update_agent path.
-                    // We need to clear the assignee on the ticket row.
-                    // The db API doesn't expose a clear-assignee helper; call update_ticket
-                    // a second time is a no-op for status. Work around by using claim_next_ticket
-                    // indirection is unnecessary — the ticket is already set to pending with no
-                    // assignee field change. We expose a separate clear via the notes field only.
-                    // For correctness, set assignee to NULL via the existing update path using a
-                    // raw workaround: drop and re-insert. Instead, just log and leave status=pending.
-                    // The manager loop will notice pending tickets with a stale assignee and reassign.
-                }
+                db.update_ticket(&ticket_id, "pending", None, None, Some(None))?;
                 db.update_agent(worker_id, "idle", None, None)?;
                 db.log_event(
                     Some(worker_id),
@@ -262,7 +249,7 @@ async fn handle_ticket_assignment(
                     {
                         let db = db.lock().unwrap();
                         // Re-enqueue: set back to pending and clear assignee
-                        db.update_ticket(&ticket_id, "pending", None, None)?;
+                        db.update_ticket(&ticket_id, "pending", None, None, Some(None))?;
                         db.update_agent(worker_id, "idle", None, None)?;
                         db.log_event(
                             Some(worker_id),
@@ -281,7 +268,7 @@ async fn handle_ticket_assignment(
 
                     {
                         let db = db.lock().unwrap();
-                        db.update_ticket(&ticket_id, "pending", None, None)?;
+                        db.update_ticket(&ticket_id, "pending", None, None, Some(None))?;
                         db.update_agent(worker_id, "idle", None, None)?;
                         db.log_event(
                             Some(worker_id),

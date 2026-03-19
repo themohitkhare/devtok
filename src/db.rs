@@ -137,12 +137,35 @@ impl Db {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
-    pub fn update_ticket(&self, id: &str, status: &str, notes: Option<&str>, blocked_by: Option<&str>) -> Result<()> {
+    /// Update a ticket's status and optional fields.
+    ///
+    /// `assignee` uses `Option<Option<&str>>`:
+    /// - `None` → leave assignee unchanged
+    /// - `Some(None)` → clear assignee (set to NULL)
+    /// - `Some(Some(val))` → set assignee to `val`
+    pub fn update_ticket(
+        &self,
+        id: &str,
+        status: &str,
+        notes: Option<&str>,
+        blocked_by: Option<&str>,
+        assignee: Option<Option<&str>>,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        self.conn.execute(
-            "UPDATE tickets SET status = ?2, notes = COALESCE(?3, notes), blocked_by = ?4, updated_at = ?5 WHERE id = ?1",
-            params![id, status, notes, blocked_by, now],
-        )?;
+        match assignee {
+            Some(new_assignee) => {
+                self.conn.execute(
+                    "UPDATE tickets SET status = ?2, notes = COALESCE(?3, notes), blocked_by = ?4, assignee = ?5, updated_at = ?6 WHERE id = ?1",
+                    params![id, status, notes, blocked_by, new_assignee, now],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "UPDATE tickets SET status = ?2, notes = COALESCE(?3, notes), blocked_by = ?4, updated_at = ?5 WHERE id = ?1",
+                    params![id, status, notes, blocked_by, now],
+                )?;
+            }
+        }
         Ok(())
     }
 

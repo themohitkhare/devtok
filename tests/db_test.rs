@@ -87,3 +87,39 @@ fn test_events() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].tokens_used, Some(1500));
 }
+
+#[test]
+fn test_update_ticket_clear_assignee() {
+    let db = Db::open_memory().unwrap();
+    db.create_ticket("Task", "Desc", "backend", 1).unwrap();
+
+    // Claim assigns the ticket
+    let claimed = db.claim_next_ticket("w-0").unwrap().unwrap();
+    assert_eq!(claimed.assignee.as_deref(), Some("w-0"));
+
+    // update_ticket with assignee=None leaves assignee unchanged
+    db.update_ticket("t-001", "pending", None, None, None).unwrap();
+    let t = db.get_ticket("t-001").unwrap().unwrap();
+    assert_eq!(t.assignee.as_deref(), Some("w-0"), "assignee should be unchanged");
+
+    // update_ticket with assignee=Some(None) clears assignee to NULL
+    db.update_ticket("t-001", "pending", None, None, Some(None)).unwrap();
+    let t = db.get_ticket("t-001").unwrap().unwrap();
+    assert!(t.assignee.is_none(), "assignee should be cleared");
+
+    // After clearing, claim_next_ticket can pick it up again
+    let reclaimed = db.claim_next_ticket("w-1").unwrap().unwrap();
+    assert_eq!(reclaimed.id, "t-001");
+    assert_eq!(reclaimed.assignee.as_deref(), Some("w-1"));
+}
+
+#[test]
+fn test_update_ticket_set_assignee() {
+    let db = Db::open_memory().unwrap();
+    db.create_ticket("Task", "Desc", "backend", 1).unwrap();
+
+    // Set assignee via update_ticket
+    db.update_ticket("t-001", "in_progress", None, None, Some(Some("w-5"))).unwrap();
+    let t = db.get_ticket("t-001").unwrap().unwrap();
+    assert_eq!(t.assignee.as_deref(), Some("w-5"));
+}

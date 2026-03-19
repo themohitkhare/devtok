@@ -47,7 +47,7 @@ pub fn execute(cmd: TicketCommands) -> Result<()> {
         TicketCommands::Create { title, description, domain, priority, blocked_by } => {
             let id = db.create_ticket(&title, &description, &domain, priority)?;
             if let Some(blocked) = blocked_by {
-                db.update_ticket(&id, "pending", None, Some(&blocked))?;
+                db.update_ticket(&id, "pending", None, Some(&blocked), None)?;
             }
             let out = serde_json::json!({ "status": "created", "id": id });
             println!("{}", serde_json::to_string_pretty(&out)?);
@@ -57,7 +57,7 @@ pub fn execute(cmd: TicketCommands) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&tickets)?);
         }
         TicketCommands::Update { id, status, notes, blocked_by } => {
-            db.update_ticket(&id, &status, notes.as_deref(), blocked_by.as_deref())?;
+            db.update_ticket(&id, &status, notes.as_deref(), blocked_by.as_deref(), None)?;
             let out = serde_json::json!({ "status": "updated" });
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
