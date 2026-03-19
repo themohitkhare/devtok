@@ -159,7 +159,10 @@ fn group_knowledge_by_domain(entries: &[KnowledgeEntry]) -> BTreeMap<String, Vec
 fn extract_adrs(entries: &[KnowledgeEntry]) -> Vec<AdrEntry> {
     entries
         .iter()
-        .filter(|e| e.key.starts_with("adr") || e.key.starts_with("decision"))
+        .filter(|e| {
+            let normalized_key = e.key.to_ascii_lowercase();
+            normalized_key.starts_with("adr") || normalized_key.starts_with("decision")
+        })
         .map(|e| AdrEntry {
             domain: e.domain.clone(),
             key: e.key.clone(),
@@ -360,5 +363,39 @@ mod tests {
         assert!(markdown.contains("## Knowledge Base (Grouped by Domain)"));
         assert!(markdown.contains("## Token Usage and Estimated Cost"));
         assert!(markdown.contains("## Architecture Decisions (ADRs)"));
+    }
+
+    #[test]
+    fn adr_extraction_is_case_insensitive() {
+        let entries = vec![
+            KnowledgeEntry {
+                domain: "architecture".to_string(),
+                key: "ADR-001".to_string(),
+                value: "Use SQLite".to_string(),
+                version: 1,
+                updated_at: "2026-03-20T00:00:00Z".to_string(),
+            },
+            KnowledgeEntry {
+                domain: "architecture".to_string(),
+                key: "Decision-Auth-Flow".to_string(),
+                value: "Use token auth".to_string(),
+                version: 1,
+                updated_at: "2026-03-20T00:00:00Z".to_string(),
+            },
+            KnowledgeEntry {
+                domain: "core".to_string(),
+                key: "stack".to_string(),
+                value: "Rust".to_string(),
+                version: 1,
+                updated_at: "2026-03-20T00:00:00Z".to_string(),
+            },
+        ];
+
+        let adrs = extract_adrs(&entries);
+        assert_eq!(adrs.len(), 2);
+        assert!(adrs.iter().any(|entry| entry.key == "ADR-001"));
+        assert!(adrs
+            .iter()
+            .any(|entry| entry.key == "Decision-Auth-Flow"));
     }
 }
