@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "synapse-os-tools": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["-m", "synapse_os.tools.server"],
+      "env": {
+        "SYNAPSE_REDIS_URL": "${SYNAPSE_REDIS_URL}",
+        "SYNAPSE_AGENT_ID": "${SYNAPSE_AGENT_ID}",
+        "SYNAPSE_AGENT_ROLE": "${SYNAPSE_AGENT_ROLE}",
+        "SYNAPSE_MANAGER_ID": "${SYNAPSE_MANAGER_ID}",
+        "PYTHONPATH": "${SYNAPSE_PYTHONPATH}"
+      }
+    }
+  }
+}
