@@ -9,13 +9,16 @@ use std::time::Duration;
 pub enum InboxCommands {
     /// Push a message to an agent's inbox
     Push {
-        #[arg(long)]
-        recipient: String,
-        #[arg(long)]
+        /// Recipient agent id (alias: --recipient)
+        #[arg(long, alias = "recipient")]
+        to: String,
+        /// Message type (alias: --msg-type)
+        #[arg(long = "type", alias = "msg-type")]
         msg_type: String,
         #[arg(long)]
         payload: String,
-        #[arg(long)]
+        /// Sender id (defaults to "system")
+        #[arg(long, default_value = "system")]
         sender: String,
     },
     /// Pop the next unread message from an agent's inbox
@@ -32,8 +35,8 @@ pub fn execute(cmd: InboxCommands) -> Result<()> {
     let db = Db::open(Path::new(".acs/project.db"))?;
 
     match cmd {
-        InboxCommands::Push { recipient, msg_type, payload, sender } => {
-            db.push_inbox(&recipient, &msg_type, &payload, &sender)?;
+        InboxCommands::Push { to, msg_type, payload, sender } => {
+            db.push_inbox(&to, &msg_type, &payload, &sender)?;
             let out = serde_json::json!({ "status": "pushed" });
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
