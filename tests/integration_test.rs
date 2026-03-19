@@ -151,3 +151,56 @@ fn test_status_on_empty_project() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Tickets: 0"));
 }
+
+#[test]
+fn test_errors_are_json() {
+    let bin = acs_bin();
+    // Run in a temp dir without .acs/ — should produce a JSON error
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = Command::new(&bin)
+        .args(["status"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "should fail without .acs/");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim())
+        .expect("error output should be valid JSON");
+    assert!(parsed["error"].is_string(), "should have an 'error' field");
+    assert!(parsed["error"].as_str().unwrap().contains(".acs/ not found"));
+}
+
+#[test]
+fn test_ticket_not_found_is_json_error() {
+    let bin = acs_bin();
+    let dir = setup_test_dir();
+
+    let output = Command::new(&bin)
+        .args(["ticket", "show", "t-999"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim())
+        .expect("error output should be valid JSON");
+    assert!(parsed["error"].as_str().unwrap().contains("not found"));
+}
+
+#[test]
+fn test_kb_not_found_is_json_error() {
+    let bin = acs_bin();
+    let dir = setup_test_dir();
+
+    let output = Command::new(&bin)
+        .args(["kb", "read", "--domain", "x", "--key", "y"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim())
+        .expect("error output should be valid JSON");
+    assert!(parsed["error"].as_str().unwrap().contains("not found"));
+}
