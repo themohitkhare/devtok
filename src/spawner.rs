@@ -124,6 +124,53 @@ impl Spawner {
         Ok(worktree_path)
     }
 
+    /// Creates a git worktree at `.acs/worktrees/{reviewer_id}` checking out an
+    /// *existing* branch (no `-b`). Used by the Tech Lead review flow to review
+    /// a worker's branch without creating a new one.
+    pub fn create_review_worktree(&self, reviewer_id: &str, branch: &str) -> Result<PathBuf> {
+        let worktree_path = self.acs_dir.join("worktrees").join(reviewer_id);
+
+        // Ensure parent directory exists
+        if let Some(parent) = worktree_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create worktrees directory: {}", parent.display()))?;
+        }
+
+        // Remove any stale worktree at this path before creating a new one.
+        if worktree_path.exists() {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&worktree_path)
+                .current_dir(&self.project_dir)
+                .status();
+            let _ = std::fs::remove_dir_all(&worktree_path);
+            let _ = Command::new("git")
+                .args(["worktree", "prune"])
+                .current_dir(&self.project_dir)
+                .status();
+        }
+
+        // Checkout the existing branch — no -b flag.
+        let status = Command::new("git")
+            .arg("worktree")
+            .arg("add")
+            .arg(&worktree_path)
+            .arg(branch)
+            .current_dir(&self.project_dir)
+            .status()
+            .with_context(|| format!("Failed to run git worktree add for branch '{}'", branch))?;
+
+        if !status.success() {
+            bail!(
+                "git worktree add failed for reviewer '{}' on branch '{}'",
+                reviewer_id,
+                branch
+            );
+        }
+
+        Ok(worktree_path)
+    }
+
     /// Removes the git worktree at `.acs/worktrees/{worker_id}`. Errors are
     /// silently ignored if the worktree does not exist.
     pub fn remove_worktree(&self, worker_id: &str) -> Result<()> {

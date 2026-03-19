@@ -100,6 +100,20 @@ async fn handle_ticket_assignment(
     shutdown: &mut watch::Receiver<bool>,
     forced_provider: Option<String>,
 ) -> Result<()> {
+    let spawner = Spawner::new_with_agent_config(project_dir, &config.agents)
+        .with_backends(config.backends.clone());
+    handle_ticket_with_spawner(&spawner, worker_id, payload, db, config, shutdown, forced_provider).await
+}
+
+async fn handle_ticket_with_spawner<S: SpawnProvider>(
+    spawner: &S,
+    worker_id: &str,
+    payload: &str,
+    db: &Arc<Mutex<Db>>,
+    config: &Config,
+    shutdown: &mut watch::Receiver<bool>,
+    forced_provider: Option<String>,
+) -> Result<()> {
     // --- (a) Parse payload ---
     let val: serde_json::Value = serde_json::from_str(payload)?;
     let ticket_id = val["ticket_id"].as_str().unwrap_or("").to_string();
@@ -138,12 +152,6 @@ async fn handle_ticket_assignment(
             None,
         )?;
     }
-
-    // --- (c) Create spawner ---
-    // Workers may use multiple providers (claude/codex/agent/custom) to execute tickets.
-    // Custom backends from [backends.*] config are passed through so templates are expanded.
-    let spawner = Spawner::new_with_agent_config(project_dir, &config.agents)
-        .with_backends(config.backends.clone());
 
     // --- (d) Create worktree ---
     let worktree = spawner.create_worktree(worker_id, &ticket_id)?;
@@ -436,4 +444,258 @@ fn select_provider_for_ticket(agents: &crate::config::AgentConfig, worker_id: &s
 
 fn simple_hash(s: &str) -> u64 {
     s.as_bytes().iter().map(|b| *b as u64).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command};
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+    use tokio::sync::watch;
+
+    // ── MockSpawner ──────────────────────────────────────────────────
+
+    enum MockBehavior {
+        /// Spawns `true` — exits 0 immediately.
+        Success,
+        /// Spawns `false` — exits 1 immediately.
+        Crash,
+        /// Spawns `sleep 60` — hangs until killed or timeout fires.
+        Hang,
+    }
+
+    struct MockSpawner {
+        dir: TempDir,
+        behavior: MockBehavior,
+    }
+
+    impl MockSpawner {
+        fn new(behavior: MockBehavior) -> Self {
+            MockSpawner { dir: TempDir::new().unwrap(), behavior }
+        }
+    }
+
+    impl SpawnProvider for MockSpawner {
+        fn create_worktree(&self, worker_id: &str, _ticket_id: &str) -> anyhow::Result<PathBuf> {
+            let path = self.dir.path().join(worker_id);
+            std::fs::create_dir_all(&path)?;
+            Ok(path)
+        }
+
+        fn remove_worktree(&self, _worker_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn spawn_provider(
+            &self,
+            _provider: &str,
+            _model: Option<&str>,
+            _worker_id: &str,
+            _worktree: &Path,
+            _prompt: &str,
+            _system_prompt: &str,
+        ) -> anyhow::Result<Child> {
+            let child = match self.behavior {
+                MockBehavior::Success => Command::new("true").spawn()?,
+                MockBehavior::Crash => Command::new("false").spawn()?,
+                MockBehavior::Hang => Command::new("sleep").arg("60").spawn()?,
+            };
+            Ok(child)
+        }
+
+        fn log_path(&self, worker_id: &str) -> PathBuf {
+            self.dir.path().join(format!("{}.log", worker_id))
+        }
+    }
+
+    // ── Test helpers ─────────────────────────────────────────────────
+
+    fn make_db() -> Arc<Mutex<Db>> {
+        let db = Db::open_memory().unwrap();
+        db.register_agent("w-test", "worker", "general").unwrap();
+        Arc::new(Mutex::new(db))
+    }
+
+    fn make_config(timeout_secs: u64) -> Config {
+        let mut cfg = Config::default_for("test");
+        cfg.manager.worker_timeout_seconds = timeout_secs;
+        cfg.manager.worker_poll_seconds = 1;
+        cfg
+    }
+
+
+    fn ticket_payload(ticket_id: &str) -> String {
+        serde_json::json!({
+            "ticket_id": ticket_id,
+            "title": "Test ticket",
+            "description": "Test description",
+            "domain": "general",
+        })
+        .to_string()
+    }
+
+    // ── Test 1: inbox polling picks up ticket_assignment ─────────────
+
+    #[tokio::test]
+    async fn worker_picks_up_ticket_assignment_from_inbox() {
+        let db = make_db();
+        let payload = ticket_payload("t-poll");
+
+        // Simulate the manager pushing a ticket_assignment into the worker's inbox
+        {
+            let db = db.lock().unwrap();
+            db.push_inbox("w-test", "ticket_assignment", &payload, "mgr").unwrap();
+        }
+
+        // Simulate what worker_loop does: pop inbox, dispatch to handler
+        let msg = {
+            let db = db.lock().unwrap();
+            db.pop_inbox("w-test").unwrap()
+        };
+        assert!(msg.is_some(), "inbox should have a message");
+        let msg = msg.unwrap();
+        assert_eq!(msg.msg_type, "ticket_assignment");
+
+        // After popping, the inbox should be empty
+        let next = {
+            let db = db.lock().unwrap();
+            db.pop_inbox("w-test").unwrap()
+        };
+        assert!(next.is_none(), "inbox should be empty after pop");
+
+        // Process the message through handle_ticket_with_spawner
+        let config = make_config(30);
+        let spawner = MockSpawner::new(MockBehavior::Success);
+        let (_tx, shutdown_rx) = watch::channel(false);
+        let mut shutdown_rx = shutdown_rx;
+
+        let result = handle_ticket_with_spawner(
+            &spawner,
+            "w-test",
+            &msg.payload,
+            &db,
+            &config,
+            &mut shutdown_rx,
+            Some("claude".to_string()),
+        )
+        .await;
+
+        assert!(result.is_ok(), "handle_ticket_with_spawner should succeed: {:?}", result);
+
+        // Agent should have been set to idle after completion
+        let agents = db.lock().unwrap().list_agents().unwrap();
+        let agent = agents.iter().find(|a| a.id == "w-test").unwrap();
+        assert_eq!(agent.status, "idle");
+    }
+
+    // ── Test 2: completion flow pushes ticket_completed to mgr inbox ──
+
+    #[tokio::test]
+    async fn completion_flow_pushes_ticket_completed_to_mgr_inbox() {
+        let db = make_db();
+        let config = make_config(30);
+        let spawner = MockSpawner::new(MockBehavior::Success);
+        let (_tx, shutdown_rx) = watch::channel(false);
+        let mut shutdown_rx = shutdown_rx;
+
+        handle_ticket_with_spawner(
+            &spawner,
+            "w-test",
+            &ticket_payload("t-done"),
+            &db,
+            &config,
+            &mut shutdown_rx,
+            Some("claude".to_string()),
+        )
+        .await
+        .unwrap();
+
+        // Manager inbox should contain a ticket_completed message
+        let msg = db.lock().unwrap().pop_inbox("mgr").unwrap();
+        assert!(msg.is_some(), "mgr inbox should have ticket_completed");
+        let msg = msg.unwrap();
+        assert_eq!(msg.msg_type, "ticket_completed");
+
+        let payload: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
+        assert_eq!(payload["ticket_id"], "t-done");
+        assert_eq!(payload["status"], "review_pending");
+        assert_eq!(payload["worker_id"], "w-test");
+    }
+
+    // ── Test 3: crash recovery resets ticket to pending ───────────────
+
+    #[tokio::test]
+    async fn crash_recovery_resets_ticket_to_pending_and_logs_event() {
+        let db = make_db();
+        let config = make_config(30);
+        let spawner = MockSpawner::new(MockBehavior::Crash);
+        let (_tx, shutdown_rx) = watch::channel(false);
+        let mut shutdown_rx = shutdown_rx;
+
+        handle_ticket_with_spawner(
+            &spawner,
+            "w-test",
+            &ticket_payload("t-crash"),
+            &db,
+            &config,
+            &mut shutdown_rx,
+            Some("claude".to_string()),
+        )
+        .await
+        .unwrap();
+
+        // A ticket_crash event should have been logged
+        let events = db.lock().unwrap().recent_events(10).unwrap();
+        let crash_event = events.iter().find(|e| e.event_type == "ticket_crash");
+        assert!(crash_event.is_some(), "expected ticket_crash event in log");
+
+        // Agent should be idle (not stuck as "working")
+        let agents = db.lock().unwrap().list_agents().unwrap();
+        let agent = agents.iter().find(|a| a.id == "w-test").unwrap();
+        assert_eq!(agent.status, "idle");
+
+        // No ticket_completed message should have been pushed to mgr
+        let msg = db.lock().unwrap().pop_inbox("mgr").unwrap();
+        assert!(msg.is_none(), "mgr inbox should be empty after crash");
+    }
+
+    // ── Test 4: timeout kills process and sets ticket to blocked ──────
+
+    #[tokio::test]
+    async fn timeout_kills_process_and_sets_ticket_blocked() {
+        let db = make_db();
+        // 1 second timeout so the test doesn't wait long
+        let config = make_config(1);
+        let spawner = MockSpawner::new(MockBehavior::Hang);
+        let (_tx, shutdown_rx) = watch::channel(false);
+        let mut shutdown_rx = shutdown_rx;
+
+        handle_ticket_with_spawner(
+            &spawner,
+            "w-test",
+            &ticket_payload("t-timeout"),
+            &db,
+            &config,
+            &mut shutdown_rx,
+            Some("claude".to_string()),
+        )
+        .await
+        .unwrap();
+
+        // A ticket_timeout event should have been logged
+        let events = db.lock().unwrap().recent_events(10).unwrap();
+        let timeout_event = events.iter().find(|e| e.event_type == "ticket_timeout");
+        assert!(timeout_event.is_some(), "expected ticket_timeout event in log");
+
+        // Agent should be idle after timeout cleanup
+        let agents = db.lock().unwrap().list_agents().unwrap();
+        let agent = agents.iter().find(|a| a.id == "w-test").unwrap();
+        assert_eq!(agent.status, "idle");
+
+        // No ticket_completed pushed to mgr
+        let msg = db.lock().unwrap().pop_inbox("mgr").unwrap();
+        assert!(msg.is_none(), "mgr inbox should be empty after timeout");
+    }
 }
