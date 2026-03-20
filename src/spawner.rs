@@ -7,6 +7,17 @@ use rand::Rng;
 
 use crate::config::{AgentConfig, BackendTemplate, BackendsConfig};
 
+/// Outcome of a `merge_branch` operation.
+#[derive(Debug, PartialEq)]
+pub enum MergeOutcome {
+    /// Branch was rebased onto base and merged successfully.
+    Success,
+    /// Rebase conflicted — rebase was aborted; branch needs manual rebase.
+    RebaseConflict,
+    /// Rebase succeeded but the subsequent merge conflicted — merge was aborted.
+    MergeConflict,
+}
+
 /// Abstraction over subprocess spawning so worker logic can be unit-tested
 /// without invoking the real Claude Code binary.
 pub trait SpawnProvider {
@@ -493,30 +504,84 @@ impl Spawner {
         Ok(branch)
     }
 
-    /// Merges the given branch into `base_branch` using `--no-ff`.
+    /// Rebases `branch` onto `base_branch`, then merges using `--no-ff`.
     ///
-    /// Ensures `base_branch` is checked out in the project directory before
-    /// running the merge so the operation never targets a stale branch.
+    /// This is the primary defence against stale-history conflicts: worker
+    /// branches are created from a point in time, then main advances. By
+    /// rebasing first we ensure the worker's commits apply cleanly on top of
+    /// the current main before we attempt the merge.
     ///
-    /// Returns `Ok(true)` if merge succeeded, `Ok(false)` if there were
-    /// conflicts (merge is aborted), or `Err` on unexpected failures.
-    pub fn merge_branch(&self, branch: &str, base_branch: &str) -> Result<bool> {
-        // Ensure we are on the base branch before merging.
+    /// Strategy:
+    /// 1. `git fetch origin <base_branch>` (best-effort — no remote is fine).
+    /// 2. Checkout `branch`, run `git rebase <base_branch>`.
+    ///    On conflict: abort rebase, restore `base_branch`, return `RebaseConflict`.
+    /// 3. On successful rebase: checkout `base_branch`, run `git merge --no-ff`.
+    ///    On merge conflict: abort, return `MergeConflict`.
+    /// 4. Return `Success`.
+    pub fn merge_branch(&self, branch: &str, base_branch: &str) -> Result<MergeOutcome> {
+        // Step 1: best-effort fetch so local base_branch is current.
+        let _ = Command::new("git")
+            .args(["fetch", "origin", base_branch])
+            .current_dir(&self.project_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        // Step 2: checkout the worker branch and rebase onto base_branch.
+        let checkout_ok = Command::new("git")
+            .args(["checkout", branch])
+            .current_dir(&self.project_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("Failed to git checkout {}", branch))?
+            .success();
+
+        if !checkout_ok {
+            // Branch disappeared between find and merge.
+            let _ = checkout_base_branch(&self.project_dir, base_branch);
+            return Ok(MergeOutcome::RebaseConflict);
+        }
+
+        let rebase_ok = Command::new("git")
+            .args(["rebase", base_branch])
+            .current_dir(&self.project_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("Failed to run git rebase {}", base_branch))?
+            .success();
+
+        if !rebase_ok {
+            let _ = Command::new("git")
+                .args(["rebase", "--abort"])
+                .current_dir(&self.project_dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = checkout_base_branch(&self.project_dir, base_branch);
+            return Ok(MergeOutcome::RebaseConflict);
+        }
+
+        eprintln!("[manager] rebased {} onto {} before merge", branch, base_branch);
+
+        // Step 3: back to base_branch, then merge.
         checkout_base_branch(&self.project_dir, base_branch)?;
 
-        let status = Command::new("git")
+        let merge_ok = Command::new("git")
             .args(["merge", "--no-ff", branch])
             .current_dir(&self.project_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .status()
-            .with_context(|| format!("Failed to run git merge --no-ff {}", branch))?;
+            .with_context(|| format!("Failed to run git merge --no-ff {}", branch))?
+            .success();
 
-        if status.success() {
-            return Ok(true);
+        if merge_ok {
+            return Ok(MergeOutcome::Success);
         }
 
-        // Merge failed — abort to restore clean state
+        // Merge failed — abort to restore clean state.
         let _ = Command::new("git")
             .args(["merge", "--abort"])
             .current_dir(&self.project_dir)
@@ -524,7 +589,7 @@ impl Spawner {
             .stderr(Stdio::null())
             .status();
 
-        Ok(false)
+        Ok(MergeOutcome::MergeConflict)
     }
 
     /// Deletes a local branch. Best-effort — errors are ignored.
