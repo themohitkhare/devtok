@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use std::sync::{Arc, Mutex};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
 
@@ -164,8 +164,7 @@ fn post_merge_ci_check(db: Arc<Mutex<Db>>, project_dir: std::path::PathBuf, bran
     tokio::spawn(async move {
         let branch_for_error = branch.clone();
 
-        let cargo_outcome = tokio::task::spawn_blocking(move || run_cargo_test(&project_dir))
-            .await;
+        let cargo_outcome = tokio::task::spawn_blocking(move || run_cargo_test(&project_dir)).await;
 
         let cargo_outcome = match cargo_outcome {
             Ok(Ok(outcome)) => outcome,
@@ -202,6 +201,68 @@ fn post_merge_ci_check(db: Arc<Mutex<Db>>, project_dir: std::path::PathBuf, bran
             );
         }
     });
+}
+
+/// Returns the checkpoint branch name and last-committed timestamp for `ticket_id`.
+///
+/// Resolution order:
+/// 1. KB entry `core/checkpoint-<ticket_id>` (written by the worker checkpoint loop).
+/// 2. Git `branch --list 'acs/<ticket_id>-*'` as a fallback.
+fn find_checkpoint_info(
+    db: &Arc<Mutex<Db>>,
+    project_dir: &std::path::Path,
+    ticket_id: &str,
+) -> (Option<String>, Option<String>) {
+    let kb_key = format!("checkpoint-{}", ticket_id);
+
+    // 1. Try KB entry written by checkpoint loop.
+    let kb_entry = {
+        let guard = db.lock().unwrap();
+        guard.read_knowledge("core", &kb_key).ok().flatten()
+    };
+
+    if let Some(entry) = kb_entry {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&entry.value) {
+            let branch = v.get("branch").and_then(|b| b.as_str()).map(|s| s.to_string());
+            let committed_at = v
+                .get("checkpointed_at")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string());
+            return (branch, committed_at);
+        }
+    }
+
+    // 2. Fallback: query git for any existing acs/<ticket_id>-* branch.
+    let pattern = format!("acs/{}-*", ticket_id);
+    let output = Command::new("git")
+        .args(["branch", "--list", &pattern])
+        .current_dir(project_dir)
+        .output();
+
+    if let Ok(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // `git branch` lines are prefixed with "  " or "* " — strip that.
+        let branch = stdout
+            .lines()
+            .map(|l| l.trim().trim_start_matches("* ").trim().to_string())
+            .filter(|l| !l.is_empty())
+            .next();
+
+        if let Some(ref b) = branch {
+            // Get the last commit timestamp from that branch.
+            let log_out = Command::new("git")
+                .args(["log", "-1", "--format=%cI", b])
+                .current_dir(project_dir)
+                .output();
+            let committed_at = log_out
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty());
+            return (branch, committed_at);
+        }
+    }
+
+    (None, None)
 }
 
 /// Builds a pre-loaded KB context string for tests.
@@ -343,7 +404,10 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
             {
                 let guard = db.lock().unwrap();
                 if let Err(e) = guard.upsert_quality_score(&score) {
-                    eprintln!("[manager] quality scoring failed for ticket {}: {}", ticket.id, e);
+                    eprintln!(
+                        "[manager] quality scoring failed for ticket {}: {}",
+                        ticket.id, e
+                    );
                 }
             }
 
@@ -411,23 +475,26 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
             // Only treat mismatched assignments as stale once the ticket has
             // aged past the configured worker timeout. This prevents immediate
             // re-queue churn while workers are starting up.
-            let age_secs = now
-                .signed_duration_since(updated_at_utc)
-                .num_seconds();
+            let age_secs = now.signed_duration_since(updated_at_utc).num_seconds();
             let is_old_enough = age_secs >= timeout_seconds as i64;
 
             if should_requeue && is_old_enough {
-                let note = format!(
-                    "Re-queued stale in_progress: assignee={} current_ticket={:?}",
+                let failure_note = format!(
+                    "**[Attempt failed - timeout/stale]** Last assignee: `{}`, Reason: worker was assigned to a different ticket (current_ticket={:?})",
                     assignee_id,
                     agents
                         .iter()
                         .find(|a| a.id == assignee_id)
                         .and_then(|a| a.current_ticket.as_deref())
                 );
+                let new_notes = if ticket.notes.is_empty() {
+                    failure_note
+                } else {
+                    format!("{}\n\n---\n{}", ticket.notes, failure_note)
+                };
 
                 let guard = db.lock().unwrap();
-                guard.update_ticket(&ticket.id, "pending", Some(&note), None, Some(None))?;
+                guard.update_ticket(&ticket.id, "pending", Some(&new_notes), None, Some(None))?;
                 guard.log_event(
                     Some(assignee_id),
                     "ticket_requeued_stale_in_progress",
@@ -475,18 +542,29 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                     (entries_payload, context)
                 };
 
+                // Check for a prior checkpoint for this ticket (KB first, then git fallback).
+                let (checkpoint_branch, checkpoint_committed_at) =
+                    find_checkpoint_info(db, project_dir, &ticket.id);
+
                 let mut payload = json!({
-                    "ticket_id":   ticket.id,
-                    "title":       ticket.title,
-                    "description": ticket.description,
-                    "domain":      ticket.domain,
-                    "persona":     persona,
-                    "work_type":   work_type,
-                    "kb_context":  kb_context,
-                    "kb_entries":  kb_entries,
+                    "ticket_id":              ticket.id,
+                    "title":                  ticket.title,
+                    "description":            ticket.description,
+                    "domain":                 ticket.domain,
+                    "persona":                persona,
+                    "work_type":              work_type,
+                    "kb_context":             kb_context,
+                    "kb_entries":             kb_entries,
+                    "previous_attempt_notes": ticket.notes,
                 });
                 if let Some(m) = model {
                     payload["model"] = json!(m);
+                }
+                if let Some(branch) = checkpoint_branch {
+                    payload["checkpoint_branch"] = json!(branch);
+                    if let Some(committed_at) = checkpoint_committed_at {
+                        payload["checkpoint_committed_at"] = json!(committed_at);
+                    }
                 }
                 let payload = payload.to_string();
 
@@ -649,10 +727,23 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                                     spawner.delete_branch(&branch);
                                     {
                                         let guard = db.lock().unwrap();
+                                        let existing_notes = guard
+                                            .get_ticket(&ticket_id)?
+                                            .map(|t| t.notes)
+                                            .unwrap_or_default();
+                                        let failure_note = format!(
+                                            "**[Attempt failed - merge conflict]** Worker: `{}`, Branch: `{}`, Reason: merge conflict when merging into main",
+                                            msg.sender, branch
+                                        );
+                                        let new_notes = if existing_notes.is_empty() {
+                                            failure_note
+                                        } else {
+                                            format!("{}\n\n---\n{}", existing_notes, failure_note)
+                                        };
                                         guard.update_ticket(
                                             &ticket_id,
                                             "pending",
-                                            Some(&format!("Merge conflict on branch {}", branch)),
+                                            Some(&new_notes),
                                             None,
                                             Some(None),
                                         )?;
@@ -702,12 +793,33 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                     }
                 } else {
                     // Tests failed — do not merge; re-queue.
+                    // Capture branch before cleanup so we can include it in the failure note.
+                    let failed_branch = spawner.find_branch_for_ticket(&ticket_id).ok().flatten();
                     {
                         let guard = db.lock().unwrap();
+                        let existing_notes = guard
+                            .get_ticket(&ticket_id)?
+                            .map(|t| t.notes)
+                            .unwrap_or_default();
+                        let failure_note = match &failed_branch {
+                            Some(b) => format!(
+                                "**[Attempt failed - tests]** Worker: `{}`, Branch: `{}`, Reason: `cargo test` failed via {}",
+                                msg.sender, b, via
+                            ),
+                            None => format!(
+                                "**[Attempt failed - tests]** Worker: `{}`, Reason: `cargo test` failed via {}",
+                                msg.sender, via
+                            ),
+                        };
+                        let new_notes = if existing_notes.is_empty() {
+                            failure_note
+                        } else {
+                            format!("{}\n\n---\n{}", existing_notes, failure_note)
+                        };
                         guard.update_ticket(
                             &ticket_id,
                             "pending",
-                            Some("cargo test failed in worker worktree"),
+                            Some(&new_notes),
                             None,
                             Some(None),
                         )?;
@@ -726,8 +838,8 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                     completions += 1;
 
                     // Best-effort cleanup: delete the local branch so the next worker has a clean slate.
-                    if let Ok(Some(branch)) = spawner.find_branch_for_ticket(&ticket_id) {
-                        spawner.delete_branch(&branch);
+                    if let Some(b) = failed_branch {
+                        spawner.delete_branch(&b);
                     }
                 }
             }
@@ -1018,6 +1130,106 @@ mod tests {
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
         assert_eq!(ticket.status, "pending");
+    }
+
+    #[test]
+    fn process_completions_requeues_ticket_appends_failure_notes_on_test_fail() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            let tid = g.create_ticket("Task A", "Do A", "general", 1).unwrap();
+            g.update_ticket(&tid, "in_progress", None, None, None)
+                .unwrap();
+
+            g.push_inbox(
+                "mgr",
+                "ticket_completed",
+                r#"{"ticket_id":"t-001","tests_passed":false,"work_type":"claude","model":"sonnet"}"#,
+                "w-1",
+            )
+            .unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let ticket = g.get_ticket("t-001").unwrap().unwrap();
+        assert_eq!(ticket.status, "pending");
+        assert!(
+            ticket.notes.contains("Attempt failed - tests"),
+            "notes should contain failure marker, got: {:?}",
+            ticket.notes
+        );
+        assert!(
+            ticket.notes.contains("w-1"),
+            "notes should mention the worker id, got: {:?}",
+            ticket.notes
+        );
+    }
+
+    #[test]
+    fn process_completions_appends_to_existing_notes_on_repeated_failure() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            let tid = g.create_ticket("Task A", "Do A", "general", 1).unwrap();
+            g.update_ticket(
+                &tid,
+                "in_progress",
+                Some("Previous failure context"),
+                None,
+                None,
+            )
+            .unwrap();
+
+            g.push_inbox(
+                "mgr",
+                "ticket_completed",
+                r#"{"ticket_id":"t-001","tests_passed":false}"#,
+                "w-2",
+            )
+            .unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let ticket = g.get_ticket("t-001").unwrap().unwrap();
+        assert_eq!(ticket.status, "pending");
+        assert!(
+            ticket.notes.contains("Previous failure context"),
+            "should preserve existing notes, got: {:?}",
+            ticket.notes
+        );
+        assert!(
+            ticket.notes.contains("Attempt failed - tests"),
+            "should append new failure info, got: {:?}",
+            ticket.notes
+        );
+    }
+
+    #[test]
+    fn assignment_payload_includes_previous_attempt_notes() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            let tid = g.create_ticket("Task A", "Do A", "general", 1).unwrap();
+            g.update_ticket(&tid, "pending", Some("Prior attempt failed"), None, None)
+                .unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let msg = g.pop_inbox("w-1").unwrap().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
+        let notes = payload["previous_attempt_notes"].as_str().unwrap_or("");
+        assert!(
+            notes.contains("Prior attempt failed"),
+            "assignment payload should include ticket notes as previous_attempt_notes, got: {:?}",
+            notes
+        );
     }
 
     #[test]
@@ -1475,14 +1687,15 @@ mod tests {
         let ticket = g.get_ticket(&ticket_id).unwrap().unwrap();
         assert_eq!(ticket.domain, CI_REGRESSION_TICKET_DOMAIN);
         assert_eq!(ticket.priority, CI_REGRESSION_TICKET_PRIORITY_P1);
-        assert_eq!(ticket.description.len(), CI_REGRESSION_FAILURE_SUMMARY_MAX_CHARS);
+        assert_eq!(
+            ticket.description.len(),
+            CI_REGRESSION_FAILURE_SUMMARY_MAX_CHARS
+        );
         assert!(ticket.title.contains(branch));
         assert!(ticket.title.contains(&ticket.description));
 
         let events = g.recent_events(10).unwrap();
-        let regression_event = events
-            .iter()
-            .find(|e| e.event_type == "ci_regression");
+        let regression_event = events.iter().find(|e| e.event_type == "ci_regression");
         assert!(
             regression_event.is_some(),
             "should log a ci_regression event"
@@ -1729,7 +1942,10 @@ mod tests {
             ctx.contains("backend/stack"),
             "should synthesize backend/stack from general/stack"
         );
-        assert!(ctx.contains("Rust, Axum"), "should reuse general/stack value");
+        assert!(
+            ctx.contains("Rust, Axum"),
+            "should reuse general/stack value"
+        );
         assert!(
             !ctx.contains("general/stack"),
             "should not include general/stack label directly"
@@ -1812,6 +2028,99 @@ mod tests {
         assert!(
             kb_entries.is_empty(),
             "kb_entries should be empty when KB has no entries"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // find_checkpoint_info: reads checkpoint from KB or falls back to git
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_checkpoint_info_returns_none_when_no_checkpoint() {
+        let (db, _config) = setup();
+        let (branch, committed_at) =
+            find_checkpoint_info(&db, std::path::Path::new("/tmp/test"), "t-no-chk");
+        assert!(branch.is_none());
+        assert!(committed_at.is_none());
+    }
+
+    #[test]
+    fn find_checkpoint_info_reads_from_kb_entry() {
+        let (db, _config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.write_knowledge(
+                "core",
+                "checkpoint-t-chktest",
+                r#"{"branch":"acs/t-chktest-1234","worker_id":"w-1","checkpointed_at":"2026-01-01T10:00:00Z"}"#,
+            )
+            .unwrap();
+        }
+
+        let (branch, committed_at) =
+            find_checkpoint_info(&db, std::path::Path::new("/tmp/test"), "t-chktest");
+        assert_eq!(branch.as_deref(), Some("acs/t-chktest-1234"));
+        assert_eq!(committed_at.as_deref(), Some("2026-01-01T10:00:00Z"));
+    }
+
+    #[test]
+    fn assignment_payload_includes_checkpoint_branch_when_kb_entry_exists() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            g.create_ticket("Task A", "Do A", "general", 1).unwrap();
+            // Simulate a prior checkpoint KB entry for this ticket.
+            g.write_knowledge(
+                "core",
+                "checkpoint-t-001",
+                r#"{"branch":"acs/t-001-abcd","worker_id":"w-0","checkpointed_at":"2026-01-01T09:00:00Z"}"#,
+            )
+            .unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let msg = g
+            .pop_inbox("w-1")
+            .unwrap()
+            .expect("worker should have received an assignment");
+        let payload: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
+        assert_eq!(
+            payload["checkpoint_branch"].as_str(),
+            Some("acs/t-001-abcd"),
+            "payload should include checkpoint_branch from KB entry"
+        );
+        assert_eq!(
+            payload["checkpoint_committed_at"].as_str(),
+            Some("2026-01-01T09:00:00Z"),
+            "payload should include checkpoint_committed_at from KB entry"
+        );
+    }
+
+    #[test]
+    fn assignment_payload_has_no_checkpoint_field_when_no_prior_checkpoint() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            g.create_ticket("Task A", "Do A", "general", 1).unwrap();
+            // No checkpoint KB entry and no git branch.
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let msg = g
+            .pop_inbox("w-1")
+            .unwrap()
+            .expect("worker should have received an assignment");
+        let payload: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
+        assert!(
+            payload.get("checkpoint_branch").is_none()
+                || payload["checkpoint_branch"].is_null(),
+            "payload should not include checkpoint_branch when no prior checkpoint exists"
         );
     }
 }
