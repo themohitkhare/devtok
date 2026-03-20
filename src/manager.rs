@@ -2698,7 +2698,7 @@ mod tests {
             };
             assert_eq!(strikes, current_strikes + 1);
 
-            run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+            run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
             {
                 let g = db.lock().unwrap();
                 let t = g.get_ticket("t-001").unwrap().unwrap();
