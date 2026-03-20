@@ -1,5 +1,5 @@
 // src/config.rs — MARKER_T017
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -183,6 +183,35 @@ impl<'de> serde::Deserialize<'de> for BackendsConfig {
     }
 }
 
+/// Named run profile that overrides worker count, models, and timeouts.
+///
+/// Example `config.toml`:
+/// ```toml
+/// [profile.dev]
+/// default_workers = 2
+/// claude_models = ['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-sonnet-4-6']
+/// worker_timeout_seconds = 3600
+///
+/// [profile.ci]
+/// default_workers = 4
+/// claude_models = ['claude-sonnet-4-6', 'claude-sonnet-4-6', 'claude-opus-4-6']
+/// worker_timeout_seconds = 1800
+/// auto_approve_milestones = true
+///
+/// [profile.prod]
+/// default_workers = 8
+/// claude_models = ['claude-sonnet-4-6', 'claude-opus-4-6', 'claude-opus-4-6']
+/// worker_timeout_seconds = 7200
+/// ```
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ProfileConfig {
+    pub default_workers: Option<usize>,
+    pub claude_models: Option<Vec<String>>,
+    pub worker_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub auto_approve_milestones: bool,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub project: ProjectConfig,
@@ -199,6 +228,9 @@ pub struct Config {
     /// Code-quality / review settings (`[quality]` section).
     #[serde(default)]
     pub quality: QualityConfig,
+    /// Named run profiles (`[profile.dev]`, `[profile.ci]`, `[profile.prod]`, …).
+    #[serde(default)]
+    pub profile: HashMap<String, ProfileConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -216,6 +248,10 @@ pub struct ManagerConfig {
     pub worker_timeout_seconds: u64,
     #[serde(default = "default_poll")]
     pub worker_poll_seconds: u64,
+    /// When `true`, milestones are automatically approved without waiting for
+    /// CEO review (useful for CI runs).
+    #[serde(default)]
+    pub auto_approve_milestones: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -284,7 +320,12 @@ fn default_persona_mapping() -> HashMap<String, String> {
 
 impl Default for ManagerConfig {
     fn default() -> Self {
-        Self { cycle_seconds: default_cycle(), worker_timeout_seconds: default_timeout(), worker_poll_seconds: default_poll() }
+        Self {
+            cycle_seconds: default_cycle(),
+            worker_timeout_seconds: default_timeout(),
+            worker_poll_seconds: default_poll(),
+            auto_approve_milestones: false,
+        }
     }
 }
 
@@ -323,6 +364,60 @@ impl Config {
             agents: AgentConfig::default(),
             backends: BackendsConfig::default(),
             quality: QualityConfig::default(),
+            profile: HashMap::new(),
+        }
+    }
+
+    /// Apply a named profile, overriding worker count, models, and timeout.
+    ///
+    /// Returns an error listing available profiles when the name is unknown.
+    pub fn apply_profile(&mut self, profile_name: &str) -> Result<()> {
+        let p = match self.profile.get(profile_name).cloned() {
+            Some(p) => p,
+            None => {
+                let mut available: Vec<&str> =
+                    self.profile.keys().map(|s| s.as_str()).collect();
+                available.sort();
+                if available.is_empty() {
+                    bail!(
+                        "Unknown profile '{}'. No profiles are defined in config.toml. \
+                         Add [profile.<name>] sections to define profiles.",
+                        profile_name
+                    );
+                } else {
+                    bail!(
+                        "Unknown profile '{}'. Available profiles: {}",
+                        profile_name,
+                        available.join(", ")
+                    );
+                }
+            }
+        };
+
+        if let Some(w) = p.default_workers {
+            self.project.default_workers = w;
+        }
+        if let Some(models) = p.claude_models {
+            self.agents.claude_models = models;
+        }
+        if let Some(timeout) = p.worker_timeout_seconds {
+            self.manager.worker_timeout_seconds = timeout;
+        }
+        if p.auto_approve_milestones {
+            self.manager.auto_approve_milestones = true;
+        }
+
+        Ok(())
+    }
+
+    /// If `ANTHROPIC_MODEL` env var is set, override all claude model tiers
+    /// with the single specified model.
+    pub fn apply_anthropic_model_env(&mut self) {
+        if let Ok(model) = std::env::var("ANTHROPIC_MODEL") {
+            if !model.is_empty() {
+                let n = self.agents.claude_models.len().max(3);
+                self.agents.claude_models = vec![model; n];
+            }
         }
     }
 
@@ -771,6 +866,143 @@ code_review = true
 
         let cfg = Config::load(tmp.path()).expect("should load without quality section");
         assert!(!cfg.quality.code_review);
+    }
+
+    // ── Profile tests ────────────────────────────────────────────────
+
+    #[test]
+    fn config_load_parses_profile_sections() {
+        let toml_content = r#"
+[project]
+name = "profile-test"
+
+[profile.dev]
+default_workers = 2
+claude_models = ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-sonnet-4-6"]
+worker_timeout_seconds = 3600
+
+[profile.ci]
+default_workers = 4
+claude_models = ["claude-sonnet-4-6", "claude-sonnet-4-6", "claude-opus-4-6"]
+worker_timeout_seconds = 1800
+auto_approve_milestones = true
+
+[profile.prod]
+default_workers = 8
+claude_models = ["claude-sonnet-4-6", "claude-opus-4-6", "claude-opus-4-6"]
+worker_timeout_seconds = 7200
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "{}", toml_content).unwrap();
+        let cfg = Config::load(tmp.path()).expect("should parse profiles");
+
+        assert_eq!(cfg.profile.len(), 3);
+
+        let dev = &cfg.profile["dev"];
+        assert_eq!(dev.default_workers, Some(2));
+        assert_eq!(dev.worker_timeout_seconds, Some(3600));
+        assert!(!dev.auto_approve_milestones);
+
+        let ci = &cfg.profile["ci"];
+        assert_eq!(ci.default_workers, Some(4));
+        assert_eq!(ci.worker_timeout_seconds, Some(1800));
+        assert!(ci.auto_approve_milestones);
+
+        let prod = &cfg.profile["prod"];
+        assert_eq!(prod.default_workers, Some(8));
+        assert_eq!(prod.worker_timeout_seconds, Some(7200));
+    }
+
+    #[test]
+    fn apply_profile_overrides_config_fields() {
+        let toml_content = r#"
+[project]
+name = "apply-test"
+default_workers = 1
+
+[manager]
+worker_timeout_seconds = 300
+
+[profile.ci]
+default_workers = 4
+claude_models = ["claude-sonnet-4-6", "claude-sonnet-4-6", "claude-opus-4-6"]
+worker_timeout_seconds = 1800
+auto_approve_milestones = true
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "{}", toml_content).unwrap();
+        let mut cfg = Config::load(tmp.path()).expect("should load");
+
+        cfg.apply_profile("ci").expect("ci profile should apply");
+
+        assert_eq!(cfg.project.default_workers, 4);
+        assert_eq!(cfg.manager.worker_timeout_seconds, 1800);
+        assert!(cfg.manager.auto_approve_milestones);
+        assert_eq!(
+            cfg.agents.claude_models,
+            vec!["claude-sonnet-4-6", "claude-sonnet-4-6", "claude-opus-4-6"]
+        );
+    }
+
+    #[test]
+    fn apply_profile_unknown_returns_error_with_available_list() {
+        let mut cfg = Config::default_for("test");
+        cfg.profile
+            .insert("dev".to_string(), ProfileConfig { default_workers: Some(2), ..Default::default() });
+        cfg.profile
+            .insert("prod".to_string(), ProfileConfig { default_workers: Some(8), ..Default::default() });
+
+        let err = cfg.apply_profile("nonexistent").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("nonexistent"), "error should mention the unknown profile name");
+        assert!(
+            msg.contains("dev") || msg.contains("prod"),
+            "error should list available profiles: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn apply_profile_no_profiles_defined_gives_helpful_error() {
+        let mut cfg = Config::default_for("test");
+        let err = cfg.apply_profile("ci").unwrap_err();
+        assert!(
+            err.to_string().contains("No profiles are defined"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn apply_profile_dev_default_applies_workers_and_timeout() {
+        let mut cfg = Config::default_for("test");
+        cfg.profile.insert(
+            "dev".to_string(),
+            ProfileConfig {
+                default_workers: Some(3),
+                worker_timeout_seconds: Some(999),
+                ..Default::default()
+            },
+        );
+        cfg.apply_profile("dev").expect("dev profile should apply");
+        assert_eq!(cfg.project.default_workers, 3);
+        assert_eq!(cfg.manager.worker_timeout_seconds, 999);
+    }
+
+    #[test]
+    fn apply_anthropic_model_env_overrides_all_tiers() {
+        let mut cfg = Config::default_for("test");
+        cfg.agents.claude_models = vec![
+            "claude-haiku-4-5".to_string(),
+            "claude-sonnet-4-6".to_string(),
+            "claude-opus-4-6".to_string(),
+        ];
+        std::env::set_var("ANTHROPIC_MODEL", "claude-opus-4-6");
+        cfg.apply_anthropic_model_env();
+        std::env::remove_var("ANTHROPIC_MODEL");
+
+        assert_eq!(cfg.agents.claude_models.len(), 3);
+        assert!(cfg.agents.claude_models.iter().all(|m| m == "claude-opus-4-6"));
     }
 
     #[test]

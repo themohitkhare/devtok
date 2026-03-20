@@ -12,11 +12,20 @@ use crate::db::Db;
 use crate::manager;
 use crate::worker;
 
+/// Resolve the active profile name from the CLI flag or `ACS_PROFILE` env var.
+/// Returns `None` if neither is set.
+pub fn resolve_profile_name(cli_profile: Option<&str>) -> Option<String> {
+    cli_profile
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("ACS_PROFILE").ok().filter(|s| !s.is_empty()))
+}
+
 pub fn execute(
-    workers: usize,
+    workers: Option<usize>,
     backend: Option<String>,
     autoscale: bool,
     min_workers: usize,
+    profile: Option<String>,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let acs_dir = crate::cli::acs_dir::resolve_acs_dir(&cwd)?;
@@ -25,7 +34,20 @@ pub fn execute(
         .context("Expected `.acs/` to be inside a project directory")?
         .to_path_buf();
 
-    let config = Config::load(&acs_dir.join("config.toml"))?;
+    let mut config = Config::load(&acs_dir.join("config.toml"))?;
+
+    // Apply named profile: --profile flag > ACS_PROFILE env > default "dev" (if defined).
+    if let Some(name) = resolve_profile_name(profile.as_deref()) {
+        config.apply_profile(&name)?;
+    } else if config.profile.contains_key("dev") {
+        config.apply_profile("dev").ok();
+    }
+
+    // ANTHROPIC_MODEL env var overrides all claude model tiers.
+    config.apply_anthropic_model_env();
+
+    // --workers overrides the profile/config default.
+    let workers = workers.unwrap_or(config.project.default_workers);
     let db = Arc::new(Mutex::new(Db::open(&acs_dir.join("project.db"))?));
     write_run_pid(&acs_dir)?;
 
@@ -431,5 +453,37 @@ mod tests {
     #[test]
     fn desired_workers_matches_queue_in_range() {
         assert_eq!(desired_workers_from_queue(4, 1, 8), 4);
+    }
+
+    // ── Profile resolution tests ────────────────────────────────────
+
+    #[test]
+    fn resolve_profile_name_uses_cli_flag_over_env() {
+        std::env::set_var("ACS_PROFILE", "ci");
+        let result = resolve_profile_name(Some("prod"));
+        std::env::remove_var("ACS_PROFILE");
+        assert_eq!(result, Some("prod".to_string()));
+    }
+
+    #[test]
+    fn resolve_profile_name_falls_back_to_env_when_no_flag() {
+        std::env::set_var("ACS_PROFILE", "ci");
+        let result = resolve_profile_name(None);
+        std::env::remove_var("ACS_PROFILE");
+        assert_eq!(result, Some("ci".to_string()));
+    }
+
+    #[test]
+    fn resolve_profile_name_returns_none_when_neither_set() {
+        std::env::remove_var("ACS_PROFILE");
+        assert_eq!(resolve_profile_name(None), None);
+    }
+
+    #[test]
+    fn resolve_profile_name_ignores_empty_env() {
+        std::env::set_var("ACS_PROFILE", "");
+        let result = resolve_profile_name(None);
+        std::env::remove_var("ACS_PROFILE");
+        assert_eq!(result, None);
     }
 }

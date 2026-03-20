@@ -923,7 +923,20 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
             let ticket_ids = ms.tickets.clone();
             let milestone_name = ms.name.clone();
 
-            {
+            if config.manager.auto_approve_milestones {
+                // CI/fast mode: skip CEO gate and approve immediately.
+                let guard = db.lock().unwrap();
+                guard.update_milestone_status(ms.id, "approved")?;
+                guard.log_event(
+                    Some("mgr"),
+                    "milestone_approved",
+                    &format!(
+                        "milestone {} '{}' auto-approved (auto_approve_milestones=true); tickets={:?}",
+                        ms.id, milestone_name, ticket_ids
+                    ),
+                    None,
+                )?;
+            } else {
                 let guard = db.lock().unwrap();
                 guard.update_milestone_status(ms.id, "awaiting_approval")?;
                 guard.log_event(
@@ -949,8 +962,9 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
 
             milestones_ready += 1;
             eprintln!(
-                "[manager] milestone {} transitioned active → awaiting_approval",
-                ms.id
+                "[manager] milestone {} transitioned active → {}",
+                ms.id,
+                if config.manager.auto_approve_milestones { "approved (auto)" } else { "awaiting_approval" }
             );
         }
     }
