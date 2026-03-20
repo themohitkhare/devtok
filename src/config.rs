@@ -140,11 +140,23 @@ pub struct BackendsConfig {
     pub default: String,
     /// Named backend definitions. Keys match the `--backend` flag value.
     pub definitions: HashMap<String, BackendTemplate>,
+    /// Provider failover order (t-090). Workers try providers in this order,
+    /// skipping BLACKLISTED ones. Configurable via `[backends] failover_order`.
+    pub failover_order: Vec<String>,
+    /// Provider-specific quota error strings (t-090). Used to detect hard
+    /// quota/spend limits and blacklist the provider instead of rate-limiting.
+    /// Configured via `[backends.quota_errors]` table.
+    pub quota_errors: HashMap<String, Vec<String>>,
 }
 
 impl Default for BackendsConfig {
     fn default() -> Self {
-        Self { default: "claude".into(), definitions: HashMap::new() }
+        Self {
+            default: "claude".into(),
+            definitions: HashMap::new(),
+            failover_order: Vec::new(),
+            quota_errors: HashMap::new(),
+        }
     }
 }
 
@@ -157,7 +169,8 @@ impl<'de> serde::Deserialize<'de> for BackendsConfig {
 
         // Deserialise as a raw TOML value map so we can handle the mixed
         // structure: a scalar "default" key alongside sub-tables for each
-        // backend definition.
+        // backend definition, plus the new failover_order array and
+        // quota_errors sub-table.
         let raw: HashMap<String, toml::Value> = HashMap::deserialize(deserializer)?;
 
         let default = raw
@@ -166,9 +179,47 @@ impl<'de> serde::Deserialize<'de> for BackendsConfig {
             .unwrap_or("claude")
             .to_string();
 
+        // t-090: parse failover_order array (optional)
+        let failover_order: Vec<String> = raw
+            .get("failover_order")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // t-090: parse quota_errors table (optional)
+        // Structure: quota_errors.provider = ["err string 1", "err string 2"]
+        let quota_errors: HashMap<String, Vec<String>> = raw
+            .get("quota_errors")
+            .and_then(|v| v.as_table())
+            .map(|table| {
+                table
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        let errs = v
+                            .as_array()?
+                            .iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>();
+                        Some((k.clone(), errs))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Non-scalar keys that are NOT backend definitions — skip them
+        let reserved: std::collections::HashSet<&str> =
+            ["default", "failover_order", "quota_errors", "routing"]
+                .iter()
+                .copied()
+                .collect();
+
         let mut definitions = HashMap::new();
         for (k, v) in &raw {
-            if k == "default" {
+            if reserved.contains(k.as_str()) {
                 continue;
             }
             // Each backend value must be a TOML table
@@ -179,7 +230,7 @@ impl<'de> serde::Deserialize<'de> for BackendsConfig {
             definitions.insert(k.clone(), bt);
         }
 
-        Ok(BackendsConfig { default, definitions })
+        Ok(BackendsConfig { default, definitions, failover_order, quota_errors })
     }
 }
 
@@ -790,5 +841,89 @@ code_review = true
         // And it should round-trip
         let reparsed: Config = toml::from_str(&toml_str).expect("should re-parse");
         assert!(reparsed.quality.code_review);
+    }
+
+    // ── Provider failover / quota config (t-090) ─────────────────────
+
+    #[test]
+    fn backends_failover_order_parsed_from_toml() {
+        let toml_content = r#"
+[project]
+name = "failover-test"
+
+[backends]
+failover_order = ["claude", "cursor", "codex"]
+"#;
+        let cfg: Config = toml::from_str(toml_content).expect("should parse");
+        assert_eq!(
+            cfg.backends.failover_order,
+            vec!["claude", "cursor", "codex"]
+        );
+    }
+
+    #[test]
+    fn backends_quota_errors_parsed_from_toml() {
+        let toml_content = r#"
+[project]
+name = "quota-test"
+
+[backends.quota_errors]
+claude = ["usage limit for Opus", "usage limit for Claude", "Spend Limit"]
+cursor = ["usage limit", "model unavailable", "quota exceeded"]
+"#;
+        let cfg: Config = toml::from_str(toml_content).expect("should parse");
+        assert_eq!(
+            cfg.backends.quota_errors.get("claude"),
+            Some(&vec![
+                "usage limit for Opus".to_string(),
+                "usage limit for Claude".to_string(),
+                "Spend Limit".to_string()
+            ])
+        );
+        assert_eq!(
+            cfg.backends.quota_errors.get("cursor"),
+            Some(&vec![
+                "usage limit".to_string(),
+                "model unavailable".to_string(),
+                "quota exceeded".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn backends_failover_and_quota_do_not_pollute_definitions() {
+        let toml_content = r#"
+[project]
+name = "clean-test"
+
+[backends]
+failover_order = ["claude", "cursor"]
+
+[backends.quota_errors]
+claude = ["Spend Limit"]
+
+[backends.claude]
+command = "claude"
+args = ["-p", "{prompt}"]
+"#;
+        let cfg: Config = toml::from_str(toml_content).expect("should parse");
+        // Only the actual backend definition should be in definitions
+        assert!(cfg.backends.definitions.contains_key("claude"));
+        assert!(!cfg.backends.definitions.contains_key("quota_errors"));
+        assert!(!cfg.backends.definitions.contains_key("failover_order"));
+        // And the new fields should be populated
+        assert_eq!(cfg.backends.failover_order, vec!["claude", "cursor"]);
+        assert!(cfg.backends.quota_errors.contains_key("claude"));
+    }
+
+    #[test]
+    fn backends_failover_order_defaults_to_empty() {
+        let toml_content = r#"
+[project]
+name = "default-test"
+"#;
+        let cfg: Config = toml::from_str(toml_content).expect("should parse");
+        assert!(cfg.backends.failover_order.is_empty());
+        assert!(cfg.backends.quota_errors.is_empty());
     }
 }

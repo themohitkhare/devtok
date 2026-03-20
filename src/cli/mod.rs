@@ -13,6 +13,7 @@ pub mod kb;
 pub mod log;
 pub mod milestone;
 pub mod plan;
+pub mod provider;
 pub mod quality;
 pub mod reject;
 pub mod report;
@@ -180,4 +181,7 @@ pub enum Commands {
         #[arg(long)]
         fix: bool,
     },
+    /// Manage provider backends (list, enable, blacklist)
+    #[command(subcommand)]
+    Provider(provider::ProviderCommands),
 }
