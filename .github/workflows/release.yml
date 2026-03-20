@@ -1,0 +1,91 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tag matches Cargo version
+        run: |
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$cargo_version" = "$tag_version"
+      - name: Run tests
+        run: cargo test
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target_name: macos-arm64
+            binary_path: target/release/acs
+          - os: macos-15-intel
+            target_name: macos-x64
+            binary_path: target/release/acs
+          - os: ubuntu-24.04
+            target_name: linux-x64
+            binary_path: target/release/acs
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install UPX (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: brew install upx
+      - name: Install UPX (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && (sudo apt-get install -y upx-ucl || sudo apt-get install -y upx)
+      - name: Build release binary
+        run: cargo build --release
+      - name: Package release archive
+        env:
+          ACS_REQUIRE_UPX: "1"
+        run: scripts/package-release.sh "${{ matrix.target_name }}" "${{ matrix.binary_path }}" dist "${GITHUB_REF_NAME#v}"
+      - name: Upload packaged archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target_name }}
+          path: dist/*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download packaged archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Flatten artifact layout
+        run: |
+          mkdir -p release-assets
+          find dist -name '*.tar.gz' -exec mv {} release-assets/ \;
+      - name: Generate Homebrew formula
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          version="${VERSION#v}"
+          sha_arm64="$(shasum -a 256 release-assets/acs-${version}-macos-arm64.tar.gz | awk '{print $1}')"
+          sha_x64="$(shasum -a 256 release-assets/acs-${version}-macos-x64.tar.gz | awk '{print $1}')"
+          sha_linux="$(shasum -a 256 release-assets/acs-${version}-linux-x64.tar.gz | awk '{print $1}')"
+          scripts/generate-homebrew-formula.sh "$version" "${GITHUB_REPOSITORY}" "$sha_arm64" "$sha_x64" "$sha_linux" > release-assets/acs.rb
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/*.tar.gz
+            release-assets/acs.rb
