@@ -429,7 +429,7 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
                     let _ = spawner.remove_worktree(worker_id);
                 }
 
-                // --- (5) Non-zero exit (crash or rate-limit) ---
+                // --- (5) Non-zero exit (crash, quota-limit, or rate-limit) ---
                 Ok(status) => {
                     let code = status.code().unwrap_or(-1);
                     tracing_log(
@@ -438,7 +438,42 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
                     );
 
                     let log_path = spawner.log_path(worker_id);
-                    if detect_rate_limit_in_log(&log_path) {
+
+                    // Check quota exhaustion BEFORE rate-limit — they require different
+                    // handling: quota → blacklist provider, rate-limit → exponential backoff.
+                    if detect_quota_limit_in_log(&log_path, &provider, &config.backends.quota_errors) {
+                        // Hard quota hit — notify manager to blacklist this provider and
+                        // re-queue the ticket as pending (NOT a rate-limit strike).
+                        let quota_payload = serde_json::json!({
+                            "provider": provider,
+                            "ticket_id": ticket_id,
+                            "worker_id": worker_id,
+                        })
+                        .to_string();
+                        {
+                            let db = db.lock().unwrap();
+                            db.update_ticket(&ticket_id, "pending", None, None, Some(None))?;
+                            db.update_agent(worker_id, "idle", None, None)?;
+                            db.push_inbox("mgr", "provider_quota", &quota_payload, worker_id)?;
+                            db.log_event(
+                                Some(worker_id),
+                                "provider_quota_hit",
+                                &format!(
+                                    "ticket {} hit quota on provider '{}'; notified manager to blacklist",
+                                    ticket_id, provider
+                                ),
+                                None,
+                            )?;
+                        }
+                        tracing_log(
+                            worker_id,
+                            &format!(
+                                "ticket {} quota exhausted on '{}'; re-queued, manager notified",
+                                ticket_id, provider
+                            ),
+                        );
+                        let _ = spawner.remove_worktree(worker_id);
+                    } else if detect_rate_limit_in_log(&log_path) {
                         // Rate-limit detected — re-queue with exponential backoff
                         let strikes = {
                             let db = db.lock().unwrap();
@@ -467,6 +502,7 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
                                 strikes + 1
                             ),
                         );
+                        let _ = spawner.remove_worktree(worker_id);
                     } else {
                         let db = db.lock().unwrap();
                         // Re-enqueue: set back to pending and clear assignee
@@ -478,23 +514,8 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
                             &format!("ticket {} exited with code {}, re-queued", ticket_id, code),
                             None,
                         )?;
-                        // Persist a failure learning so the next retry knows what was tried.
-                        let learning_key = format!("t-{}-failure", ticket_id.trim_start_matches("t-"));
-                        let learning_value = serde_json::json!({
-                            "ticket_id": ticket_id,
-                            "domain": domain,
-                            "outcome": "failure",
-                            "approach": format!(
-                                "Ticket {} exited with code {} — re-queued for retry",
-                                ticket_id, code
-                            ),
-                            "timestamp": Utc::now().to_rfc3339()
-                        })
-                        .to_string();
-                        let _ = db.write_knowledge("learning", &learning_key, &learning_value);
+                        let _ = spawner.remove_worktree(worker_id);
                     }
-
-                    let _ = spawner.remove_worktree(worker_id);
                 }
 
                 // wait() itself returned an IO error
@@ -678,6 +699,34 @@ fn tracing_log(worker_id: &str, msg: &str) {
     eprintln!("[worker:{}] {}", worker_id, msg);
 }
 
+/// Scan the worker log file for quota-exhaustion signals for the given provider.
+///
+/// Checks provider-specific quota error strings from config first, then falls
+/// back to well-known generic quota phrases ("usage limit", "Spend Limit").
+///
+/// Returns `true` if a quota error is detected. Quota errors are distinct from
+/// rate-limit errors (429): they indicate a hard spending/usage cap has been hit
+/// and the provider should be blacklisted rather than retried with backoff.
+pub fn detect_quota_limit_in_log(
+    log_path: &std::path::Path,
+    provider: &str,
+    quota_errors: &std::collections::HashMap<String, Vec<String>>,
+) -> bool {
+    let Ok(contents) = std::fs::read_to_string(log_path) else {
+        return false;
+    };
+    // Provider-specific strings from config take priority
+    if let Some(errors) = quota_errors.get(provider) {
+        for err in errors {
+            if contents.contains(err.as_str()) {
+                return true;
+            }
+        }
+    }
+    // Generic fallback phrases that indicate quota/spend limit exhaustion
+    contents.contains("usage limit") || contents.contains("Spend Limit")
+}
+
 /// Scan the worker log file for rate-limit signals.
 ///
 /// Returns `true` if any line contains the string `"rate_limit"` or `"429"`.
@@ -752,6 +801,8 @@ mod tests {
         Hang,
         /// Exits non-zero; log contains a rate-limit signal.
         RateLimited,
+        /// Exits non-zero; log contains a quota exhaustion signal.
+        QuotaExhausted,
     }
 
     struct MockSpawner {
@@ -797,6 +848,15 @@ mod tests {
                     let log = self.dir.path().join(format!("{}.log", worker_id));
                     std::fs::write(&log, "Error: 429 Too Many Requests rate_limit exceeded\n")
                         .unwrap();
+                    Command::new("false").spawn()?
+                }
+                MockBehavior::QuotaExhausted => {
+                    // Write quota exhaustion signal to the log file
+                    let log = self.dir.path().join(format!("{}.log", worker_id));
+                    std::fs::write(
+                        &log,
+                        "Error: You've hit your usage limit for Opus. You'll be able to send more messages after your limit resets.\n"
+                    ).unwrap();
                     Command::new("false").spawn()?
                 }
             };
@@ -1080,6 +1140,122 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let log = dir.path().join("no-such.log");
         assert!(!detect_rate_limit_in_log(&log));
+    }
+
+    // ── Quota detection ──────────────────────────────────────────────
+
+    #[test]
+    fn quota_detected_from_provider_specific_string() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("w-q.log");
+        std::fs::write(&log, "Error: You've hit your usage limit for Opus\n").unwrap();
+        let mut errors = std::collections::HashMap::new();
+        errors.insert(
+            "claude".to_string(),
+            vec!["usage limit for Opus".to_string(), "Spend Limit".to_string()],
+        );
+        assert!(detect_quota_limit_in_log(&log, "claude", &errors));
+    }
+
+    #[test]
+    fn quota_detected_from_generic_fallback() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("w-q.log");
+        std::fs::write(&log, "Error: You've hit your usage limit\n").unwrap();
+        let errors = std::collections::HashMap::new(); // no provider-specific config
+        assert!(detect_quota_limit_in_log(&log, "claude", &errors));
+    }
+
+    #[test]
+    fn quota_detected_spend_limit_fallback() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("w-q.log");
+        std::fs::write(&log, "Error: Spend Limit reached for this billing period\n").unwrap();
+        let errors = std::collections::HashMap::new();
+        assert!(detect_quota_limit_in_log(&log, "cursor", &errors));
+    }
+
+    #[test]
+    fn quota_not_detected_from_unrelated_log() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("w-q.log");
+        std::fs::write(&log, "Ticket completed successfully. Tests passed.\n").unwrap();
+        let errors = std::collections::HashMap::new();
+        assert!(!detect_quota_limit_in_log(&log, "claude", &errors));
+    }
+
+    #[test]
+    fn quota_not_detected_when_log_absent() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("no-such.log");
+        let errors = std::collections::HashMap::new();
+        assert!(!detect_quota_limit_in_log(&log, "claude", &errors));
+    }
+
+    #[test]
+    fn quota_not_detected_for_wrong_provider() {
+        // String matches "cursor" config but we're asking about "claude"
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("w-q.log");
+        std::fs::write(&log, "quota exceeded for cursor\n").unwrap();
+        let mut errors = std::collections::HashMap::new();
+        errors.insert("cursor".to_string(), vec!["quota exceeded".to_string()]);
+        // claude has no specific errors and log doesn't contain generic phrases
+        assert!(!detect_quota_limit_in_log(&log, "claude", &errors));
+    }
+
+    // ── Quota re-queue flow ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn quota_exhausted_exit_requeues_ticket_and_notifies_manager() {
+        let db = make_db();
+        {
+            let db = db.lock().unwrap();
+            db.create_ticket_with_id("t-quota", "Quota Test", "desc", "general", 1)
+                .unwrap();
+        }
+        let mut config = make_config(30);
+        // Configure quota errors so our generic log message matches
+        config.backends.quota_errors.insert(
+            "claude".to_string(),
+            vec!["usage limit for Opus".to_string()],
+        );
+        let spawner = MockSpawner::new(MockBehavior::QuotaExhausted);
+        let (_tx, shutdown_rx) = watch::channel(false);
+        let mut shutdown_rx = shutdown_rx;
+
+        let result = handle_ticket_with_spawner(
+            &spawner,
+            "w-test",
+            &ticket_payload("t-quota"),
+            &db,
+            &config,
+            &mut shutdown_rx,
+            Some("claude".to_string()),
+        )
+        .await;
+
+        assert!(result.is_ok(), "handler should not crash on quota: {:?}", result);
+
+        // Ticket should be re-queued as pending (not rate-limited)
+        let ticket = db.lock().unwrap().get_ticket("t-quota").unwrap().unwrap();
+        assert_eq!(ticket.status, "pending");
+        let strikes = db.lock().unwrap().get_ticket_rate_limit_strikes("t-quota").unwrap();
+        assert_eq!(strikes, 0, "quota hit must not add rate-limit strikes");
+
+        // Manager should have received a provider_quota message
+        let msg = db.lock().unwrap().pop_inbox("mgr").unwrap();
+        assert!(msg.is_some(), "mgr inbox should have a provider_quota message");
+        let msg = msg.unwrap();
+        assert_eq!(msg.msg_type, "provider_quota");
+        let payload: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
+        assert_eq!(payload["provider"], "claude");
+        assert_eq!(payload["ticket_id"], "t-quota");
+
+        // Event log should contain provider_quota_hit
+        let events = db.lock().unwrap().recent_events(10).unwrap();
+        let quota_event = events.iter().find(|e| e.event_type == "provider_quota_hit");
+        assert!(quota_event.is_some(), "expected provider_quota_hit event");
     }
 
     // ── Rate-limit re-queue flow ──────────────────────────────────────

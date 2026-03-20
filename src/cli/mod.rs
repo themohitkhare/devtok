@@ -188,4 +188,7 @@ pub enum Commands {
         #[arg(long)]
         fix: bool,
     },
+    /// Manage provider backends (list, enable, blacklist)
+    #[command(subcommand)]
+    Provider(provider::ProviderCommands),
 }

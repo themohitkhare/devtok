@@ -9,6 +9,7 @@ use tokio::time::{sleep, Duration};
 use crate::config::Config;
 use crate::db::Db;
 use crate::models::*;
+use crate::provider_registry::ProviderRegistry;
 use crate::quality::{
     compute_score, detect_changes_from_scoring_ref, notes_contain_ac_verification,
     resolve_scoring_ref, score_ticket_from_branch,
@@ -1254,6 +1255,51 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                     if let Some(b) = failed_branch {
                         spawner.delete_branch(&b);
                     }
+                }
+            }
+            // t-090: Provider quota exhaustion — blacklist provider, ticket already re-queued by worker
+            Some(msg) if msg.msg_type == "provider_quota" => {
+                let provider = serde_json::from_str::<serde_json::Value>(&msg.payload)
+                    .ok()
+                    .and_then(|v| v.get("provider").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                let acs_dir = project_dir.join(".acs");
+                let mut registry = ProviderRegistry::load(&acs_dir);
+                registry.blacklist(&provider);
+                if let Err(e) = registry.save(&acs_dir) {
+                    eprintln!("[manager] warning: could not persist provider_state.json: {}", e);
+                }
+
+                eprintln!(
+                    "[manager] provider '{}' BLACKLISTED (quota exceeded) — affected tickets re-queued",
+                    provider
+                );
+
+                {
+                    let guard = db.lock().unwrap();
+                    guard.log_event(
+                        Some("mgr"),
+                        "provider_blacklisted",
+                        &format!(
+                            "provider '{}' BLACKLISTED (quota exceeded) — signalled by {}",
+                            provider, msg.sender
+                        ),
+                        None,
+                    )?;
+                }
+
+                // Check if any ACTIVE providers remain in the failover order
+                let failover_order = &config.backends.failover_order;
+                if !failover_order.is_empty() && registry.next_active(failover_order).is_none() {
+                    let msg_text = format!(
+                        "FATAL: all providers in failover_order are BLACKLISTED ({}) — pausing evolve. \
+                         Run `acs provider enable <name>` to re-enable a provider.",
+                        failover_order.join(", ")
+                    );
+                    eprintln!("[manager] {}", msg_text);
+                    let guard = db.lock().unwrap();
+                    guard.log_event(Some("mgr"), "all_providers_blacklisted", &msg_text, None)?;
                 }
             }
             Some(_) => {
@@ -2757,6 +2803,116 @@ mod tests {
             retry_after >= lower && retry_after <= upper,
             "backoff should be capped at 240s for strike 5+, got {:?}",
             retry_after
+        );
+    }
+
+    // ── Provider quota / failover (t-090) ────────────────────────────
+
+    #[test]
+    fn provider_quota_message_blacklists_provider_and_logs_event() {
+        use tempfile::TempDir;
+        let project_tmp = TempDir::new().unwrap();
+        let acs_dir = project_tmp.path().join(".acs");
+        std::fs::create_dir_all(&acs_dir).unwrap();
+
+        let db = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+        db.lock().unwrap().register_agent("w-1", "worker", "general").unwrap();
+        let config = Config::default_for("test");
+
+        // Push a provider_quota message as if sent by a worker
+        db.lock()
+            .unwrap()
+            .push_inbox(
+                "mgr",
+                "provider_quota",
+                r#"{"provider":"claude","ticket_id":"t-001","worker_id":"w-1"}"#,
+                "w-1",
+            )
+            .unwrap();
+
+        run_cycle(&db, &config, project_tmp.path()).unwrap();
+
+        // Registry should have claude blacklisted
+        let registry = ProviderRegistry::load(&acs_dir);
+        assert!(
+            !registry.is_active("claude"),
+            "claude should be BLACKLISTED after quota message"
+        );
+
+        // Event log should contain provider_blacklisted
+        let events = db.lock().unwrap().recent_events(10).unwrap();
+        let evt = events.iter().find(|e| e.event_type == "provider_blacklisted");
+        assert!(evt.is_some(), "expected provider_blacklisted event");
+    }
+
+    #[test]
+    fn provider_quota_message_logs_fatal_when_all_providers_blacklisted() {
+        use tempfile::TempDir;
+        let project_tmp = TempDir::new().unwrap();
+        let acs_dir = project_tmp.path().join(".acs");
+        std::fs::create_dir_all(&acs_dir).unwrap();
+
+        let db = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+        db.lock().unwrap().register_agent("w-1", "worker", "general").unwrap();
+        let mut config = Config::default_for("test");
+        // Set failover_order with only one provider
+        config.backends.failover_order = vec!["claude".to_string()];
+
+        // Pre-blacklist the only provider via registry
+        let mut registry = ProviderRegistry::load(&acs_dir);
+        registry.blacklist("claude");
+        registry.save(&acs_dir).unwrap();
+
+        // Push provider_quota for the last provider
+        db.lock()
+            .unwrap()
+            .push_inbox(
+                "mgr",
+                "provider_quota",
+                r#"{"provider":"claude","ticket_id":"t-001","worker_id":"w-1"}"#,
+                "w-1",
+            )
+            .unwrap();
+
+        // Should succeed (not crash) even when all providers are blacklisted
+        let result = run_cycle(&db, &config, project_tmp.path());
+        assert!(result.is_ok(), "run_cycle should not crash when all providers blacklisted");
+
+        // Should log all_providers_blacklisted event
+        let events = db.lock().unwrap().recent_events(20).unwrap();
+        let evt = events.iter().find(|e| e.event_type == "all_providers_blacklisted");
+        assert!(evt.is_some(), "expected all_providers_blacklisted event");
+    }
+
+    #[test]
+    fn provider_quota_blacklist_persists_across_run_cycles() {
+        use tempfile::TempDir;
+        let project_tmp = TempDir::new().unwrap();
+        let acs_dir = project_tmp.path().join(".acs");
+        std::fs::create_dir_all(&acs_dir).unwrap();
+
+        let db = Arc::new(Mutex::new(Db::open_memory().unwrap()));
+        db.lock().unwrap().register_agent("w-1", "worker", "general").unwrap();
+        let config = Config::default_for("test");
+
+        // Push provider_quota for claude
+        db.lock()
+            .unwrap()
+            .push_inbox(
+                "mgr",
+                "provider_quota",
+                r#"{"provider":"claude","ticket_id":"t-001","worker_id":"w-1"}"#,
+                "w-1",
+            )
+            .unwrap();
+
+        run_cycle(&db, &config, project_tmp.path()).unwrap();
+
+        // Load registry fresh (simulating an acs restart)
+        let registry = ProviderRegistry::load(&acs_dir);
+        assert!(
+            !registry.is_active("claude"),
+            "blacklist must persist to provider_state.json"
         );
     }
 }
