@@ -291,6 +291,7 @@ pub fn worker_prompt(
     persona: &str,
     tool_path: &str,
     kb_context: &str,
+    previous_attempt_notes: &str,
 ) -> String {
     let role = persona_display_name(persona);
     let persona_guidance = persona_specific_guidance(persona);
@@ -301,6 +302,15 @@ pub fn worker_prompt(
         format!(
             "\n## Pre-loaded Knowledge Base Context\n\nThe following KB entries were fetched at assignment time. You MUST still re-read the KB before coding (newer entries may exist), but use this as a starting point:\n\n{}\n",
             kb_context
+        )
+    };
+
+    let previous_attempt_section = if previous_attempt_notes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n## Previous Attempt Notes\n\n**IMPORTANT: Read these notes before starting.** A previous worker attempted this ticket and failed. Learn from these notes to avoid repeating the same mistakes:\n\n{}\n",
+            previous_attempt_notes
         )
     };
 
@@ -317,7 +327,7 @@ You have been assigned a ticket to complete. Work methodically, run tests, commi
 
 **Description:**
 {description}
-{kb_section}
+{previous_attempt_section}{kb_section}
 ## How to Use the CLI
 
 Use the Bash tool to run these commands:
@@ -413,6 +423,7 @@ Follow these steps in order:
         title = title,
         domain = domain,
         description = description,
+        previous_attempt_section = previous_attempt_section,
         kb_section = kb_section,
         tool_path = tool_path,
         persona_guidance = persona_guidance,
@@ -638,19 +649,46 @@ mod tests {
 
     #[test]
     fn test_worker_prompt_contains_role_backend_dev() {
-        let prompt = worker_prompt("t-001", "Build auth", "Add login", "backend", "backend-dev", "acs", "");
+        let prompt = worker_prompt(
+            "t-001",
+            "Build auth",
+            "Add login",
+            "backend",
+            "backend-dev",
+            "acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("You are a Backend Dev for ACS"));
     }
 
     #[test]
     fn test_worker_prompt_contains_role_qa() {
-        let prompt = worker_prompt("t-002", "Write tests", "Test login", "qa", "qa", "acs", "");
+        let prompt = worker_prompt(
+            "t-002",
+            "Write tests",
+            "Test login",
+            "qa",
+            "qa",
+            "acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("You are a QA Engineer for ACS"));
     }
 
     #[test]
     fn test_worker_prompt_contains_ticket_details() {
-        let prompt = worker_prompt("t-001", "Build auth", "Add OAuth login flow", "backend", "backend-dev", "acs", "");
+        let prompt = worker_prompt(
+            "t-001",
+            "Build auth",
+            "Add OAuth login flow",
+            "backend",
+            "backend-dev",
+            "acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("t-001"));
         assert!(prompt.contains("Build auth"));
         assert!(prompt.contains("Add OAuth login flow"));
@@ -659,7 +697,16 @@ mod tests {
 
     #[test]
     fn test_worker_prompt_contains_tool_path() {
-        let prompt = worker_prompt("t-001", "Test", "Desc", "backend", "backend-dev", "/usr/local/bin/acs", "");
+        let prompt = worker_prompt(
+            "t-001",
+            "Test",
+            "Desc",
+            "backend",
+            "backend-dev",
+            "/usr/local/bin/acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("/usr/local/bin/acs ticket update"));
         assert!(prompt.contains("/usr/local/bin/acs kb read"));
         assert!(prompt.contains("/usr/local/bin/acs inbox push"));
@@ -667,40 +714,76 @@ mod tests {
 
     #[test]
     fn test_worker_prompt_persona_guidance_frontend() {
-        let prompt = worker_prompt("t-001", "Build UI", "Add nav", "frontend", "frontend-dev", "acs", "");
+        let prompt = worker_prompt(
+            "t-001",
+            "Build UI",
+            "Add nav",
+            "frontend",
+            "frontend-dev",
+            "acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("Frontend Dev Guidance"));
     }
 
     #[test]
     fn test_worker_prompt_persona_guidance_devops() {
-        let prompt = worker_prompt("t-001", "Add CI", "Setup pipeline", "devops", "devops", "acs", "");
+        let prompt = worker_prompt(
+            "t-001",
+            "Add CI",
+            "Setup pipeline",
+            "devops",
+            "devops",
+            "acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("DevOps Engineer Guidance"));
     }
 
     #[test]
     fn test_worker_prompt_kb_context_section_shown_when_provided() {
         let kb = "**core/stack:** Rust, Tokio\n**general/architecture:** Single-binary CLI";
-        let prompt = worker_prompt("t-001", "Test", "Desc", "core", "tech-lead", "acs", kb);
+        let prompt = worker_prompt("t-001", "Test", "Desc", "core", "tech-lead", "acs", kb, "");
         assert!(prompt.contains("Pre-loaded Knowledge Base Context"));
         assert!(prompt.contains("Rust, Tokio"));
     }
 
     #[test]
     fn test_worker_prompt_kb_context_section_absent_when_empty() {
-        let prompt = worker_prompt("t-001", "Test", "Desc", "core", "tech-lead", "acs", "");
+        let prompt = worker_prompt("t-001", "Test", "Desc", "core", "tech-lead", "acs", "", "");
         assert!(!prompt.contains("Pre-loaded Knowledge Base Context"));
     }
 
     #[test]
     fn test_worker_prompt_requires_kb_read_before_coding() {
-        let prompt = worker_prompt("t-001", "Test", "Desc", "backend", "backend-dev", "acs", "");
+        let prompt = worker_prompt(
+            "t-001",
+            "Test",
+            "Desc",
+            "backend",
+            "backend-dev",
+            "acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("REQUIRED before"));
         assert!(prompt.contains("api-contracts"));
     }
 
     #[test]
     fn test_worker_prompt_requires_kb_write_after_work() {
-        let prompt = worker_prompt("t-001", "Test", "Desc", "backend", "backend-dev", "acs", "");
+        let prompt = worker_prompt(
+            "t-001",
+            "Test",
+            "Desc",
+            "backend",
+            "backend-dev",
+            "acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("REQUIRED after completing work"));
         assert!(prompt.contains("kb write"));
     }
@@ -709,13 +792,31 @@ mod tests {
 
     #[test]
     fn test_worker_prompt_pm_display_name() {
-        let prompt = worker_prompt("t-010", "Write status report", "Track milestones", "pm", "pm", "acs", "");
+        let prompt = worker_prompt(
+            "t-010",
+            "Write status report",
+            "Track milestones",
+            "pm",
+            "pm",
+            "acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("You are a Project Manager for ACS"));
     }
 
     #[test]
     fn test_worker_prompt_pm_guidance() {
-        let prompt = worker_prompt("t-010", "Write status report", "Track milestones", "pm", "pm", "acs", "");
+        let prompt = worker_prompt(
+            "t-010",
+            "Write status report",
+            "Track milestones",
+            "pm",
+            "pm",
+            "acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("Project Manager Guidance"));
         assert!(prompt.contains("escalation"));
         assert!(prompt.contains("status report"));
@@ -723,13 +824,31 @@ mod tests {
 
     #[test]
     fn test_worker_prompt_senior_manager_display_name() {
-        let prompt = worker_prompt("t-011", "Review arch", "Oversee workers", "management", "senior-manager", "acs", "");
+        let prompt = worker_prompt(
+            "t-011",
+            "Review arch",
+            "Oversee workers",
+            "management",
+            "senior-manager",
+            "acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("You are a Senior Manager for ACS"));
     }
 
     #[test]
     fn test_worker_prompt_senior_manager_guidance() {
-        let prompt = worker_prompt("t-011", "Review arch", "Oversee workers", "management", "senior-manager", "acs", "");
+        let prompt = worker_prompt(
+            "t-011",
+            "Review arch",
+            "Oversee workers",
+            "management",
+            "senior-manager",
+            "acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("Senior Manager Guidance"));
         assert!(prompt.contains("architecture"));
         assert!(prompt.contains("oversight"));
@@ -737,13 +856,31 @@ mod tests {
 
     #[test]
     fn test_worker_prompt_qa_lead_display_name() {
-        let prompt = worker_prompt("t-012", "Verify criteria", "Check tests", "qa-lead", "qa-lead", "acs", "");
+        let prompt = worker_prompt(
+            "t-012",
+            "Verify criteria",
+            "Check tests",
+            "qa-lead",
+            "qa-lead",
+            "acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("You are a QA Lead for ACS"));
     }
 
     #[test]
     fn test_worker_prompt_qa_lead_guidance() {
-        let prompt = worker_prompt("t-012", "Verify criteria", "Check tests", "qa-lead", "qa-lead", "acs", "");
+        let prompt = worker_prompt(
+            "t-012",
+            "Verify criteria",
+            "Check tests",
+            "qa-lead",
+            "qa-lead",
+            "acs",
+            "",
+            "",
+        );
         assert!(prompt.contains("QA Lead Guidance"));
         assert!(prompt.contains("acceptance criteria verification"));
     }
@@ -767,5 +904,38 @@ mod tests {
         let prompt = architect_prompt("/repo", "acs");
         assert!(prompt.contains("Senior Manager"));
         assert!(prompt.contains("--domain management"));
+    }
+
+    #[test]
+    fn test_worker_prompt_previous_attempt_notes_shown_when_provided() {
+        let notes = "Tests failed: assertion failed in auth module\nBranch: acs/t-001-abcd";
+        let prompt = worker_prompt(
+            "t-001",
+            "Fix auth",
+            "Implement auth",
+            "backend",
+            "backend-dev",
+            "acs",
+            "",
+            notes,
+        );
+        assert!(prompt.contains("Previous Attempt Notes"));
+        assert!(prompt.contains("assertion failed in auth module"));
+        assert!(prompt.contains("IMPORTANT: Read these notes before starting"));
+    }
+
+    #[test]
+    fn test_worker_prompt_previous_attempt_notes_absent_when_empty() {
+        let prompt = worker_prompt(
+            "t-001",
+            "Fix auth",
+            "Implement auth",
+            "backend",
+            "backend-dev",
+            "acs",
+            "",
+            "",
+        );
+        assert!(!prompt.contains("Previous Attempt Notes"));
     }
 }

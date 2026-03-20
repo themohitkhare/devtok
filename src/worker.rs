@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Utc;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::config::Config;
 use crate::db::Db;
@@ -138,6 +138,10 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
         .unwrap_or_else(|| config.persona_for_domain(&domain))
         .to_string();
     let kb_context = val["kb_context"].as_str().unwrap_or("").to_string();
+    let previous_attempt_notes = val["previous_attempt_notes"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
 
     // Provider selection: forced_provider (from --backend flag) > payload override > config-based selection
     let provider = forced_provider.unwrap_or_else(|| {
@@ -150,6 +154,16 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
 
     let model = val
         .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Resume-from-checkpoint: if a prior branch was checkpointed, inject into the prompt.
+    let checkpoint_branch = val
+        .get("checkpoint_branch")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let checkpoint_committed_at = val
+        .get("checkpoint_committed_at")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
@@ -182,14 +196,27 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
         &persona,
         &config.agents.tool_path,
         &kb_context,
+        &previous_attempt_notes,
     );
 
     // --- (f) Build task prompt ---
+    let resume_section = match checkpoint_branch.as_deref() {
+        Some(branch) => {
+            let committed_at = checkpoint_committed_at.as_deref().unwrap_or("unknown time");
+            format!(
+                "\n\n## Resuming from checkpoint: branch {} was last committed at {}. Checkout that branch and continue from where the previous worker left off.",
+                branch, committed_at
+            )
+        }
+        None => String::new(),
+    };
+
     let task_prompt = format!(
-        "You are assigned ticket {ticket_id}: {title}\n\nDescription:\n{description}\n\nExecute this ticket. Use Bash to call acs commands.",
+        "You are assigned ticket {ticket_id}: {title}\n\nDescription:\n{description}{resume_section}\n\nExecute this ticket. Use Bash to call acs commands.",
         ticket_id = ticket_id,
         title = title,
         description = description,
+        resume_section = resume_section,
     );
 
     // --- (g) Spawn provider ---
@@ -215,6 +242,17 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
         let db = db.lock().unwrap();
         db.update_agent(worker_id, "working", Some(&ticket_id), Some(pid))?;
     }
+
+    // --- (h.pre) Spawn checkpoint background task ---
+    // `_checkpoint_cancel_tx` is held until function exit: dropping it signals the loop to stop.
+    let (_checkpoint_cancel_tx, checkpoint_cancel_rx) = oneshot::channel::<()>();
+    let _checkpoint_task = tokio::spawn(checkpoint_loop(
+        worktree.clone(),
+        worker_id.to_string(),
+        ticket_id.clone(),
+        db.clone(),
+        checkpoint_cancel_rx,
+    ));
 
     // --- (h) Wait for completion with timeout ---
     let timeout = Duration::from_secs(config.manager.worker_timeout_seconds);
@@ -494,6 +532,117 @@ fn parse_token_usage_from_log(log_path: &std::path::Path) -> Option<(i64, i64)> 
     }
 
     last
+}
+
+/// Commits any staged or unstaged changes in the worktree as a checkpoint.
+/// Writes a KB entry `checkpoint-<ticket_id>` with the branch name and timestamp.
+fn commit_checkpoint(worktree: &Path, worker_id: &str, ticket_id: &str, db: &Arc<Mutex<Db>>) {
+    // Check for any uncommitted changes (staged or unstaged).
+    let status_out = match Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(worktree)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[worker:{}] checkpoint: git status error: {}", worker_id, e);
+            return;
+        }
+    };
+
+    if String::from_utf8_lossy(&status_out.stdout)
+        .trim()
+        .is_empty()
+    {
+        tracing_log(
+            worker_id,
+            &format!("checkpoint: no changes for {}", ticket_id),
+        );
+        return;
+    }
+
+    // Stage everything.
+    if let Err(e) = Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(worktree)
+        .status()
+    {
+        eprintln!("[worker:{}] checkpoint: git add error: {}", worker_id, e);
+        return;
+    }
+
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let commit_msg = format!("chore: checkpoint {} {}", worker_id, timestamp);
+
+    let commit_out = Command::new("git")
+        .args(["commit", "-m", &commit_msg])
+        .current_dir(worktree)
+        .output();
+
+    match commit_out {
+        Ok(o) if o.status.success() => {
+            tracing_log(
+                worker_id,
+                &format!("checkpoint committed for {} at {}", ticket_id, timestamp),
+            );
+
+            // Retrieve current branch name to record in KB.
+            let branch_out = Command::new("git")
+                .args(["branch", "--show-current"])
+                .current_dir(worktree)
+                .output();
+
+            if let Ok(bo) = branch_out {
+                let branch = String::from_utf8_lossy(&bo.stdout).trim().to_string();
+                if !branch.is_empty() {
+                    let kb_value = serde_json::json!({
+                        "branch": branch,
+                        "worker_id": worker_id,
+                        "checkpointed_at": Utc::now().to_rfc3339(),
+                    })
+                    .to_string();
+                    let kb_key = format!("checkpoint-{}", ticket_id);
+                    let guard = db.lock().unwrap();
+                    let _ = guard.write_knowledge("core", &kb_key, &kb_value);
+                }
+            }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            tracing_log(
+                worker_id,
+                &format!(
+                    "checkpoint commit failed for {}: {}",
+                    ticket_id,
+                    stderr.trim()
+                ),
+            );
+        }
+        Err(e) => {
+            eprintln!("[worker:{}] checkpoint: git commit error: {}", worker_id, e);
+        }
+    }
+}
+
+/// Background task: commits checkpoints every 20 minutes until `cancel` fires.
+async fn checkpoint_loop(
+    worktree: PathBuf,
+    worker_id: String,
+    ticket_id: String,
+    db: Arc<Mutex<Db>>,
+    mut cancel: oneshot::Receiver<()>,
+) {
+    let interval = Duration::from_secs(20 * 60);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {
+                commit_checkpoint(&worktree, &worker_id, &ticket_id, &db);
+            }
+            _ = &mut cancel => {
+                return;
+            }
+        }
+    }
 }
 
 /// Lightweight structured logging to stderr.
@@ -912,7 +1061,8 @@ mod tests {
         let db = make_db();
         {
             let db = db.lock().unwrap();
-            db.create_ticket_with_id("t-rl", "RL Test", "desc", "general", 1).unwrap();
+            db.create_ticket_with_id("t-rl", "RL Test", "desc", "general", 1)
+                .unwrap();
         }
         let config = make_config(30);
         let spawner = MockSpawner::new(MockBehavior::RateLimited);
@@ -940,7 +1090,9 @@ mod tests {
         );
 
         let events = db.lock().unwrap().recent_events(10).unwrap();
-        let rl_event = events.iter().find(|e| e.event_type == "claude_rate_limited");
+        let rl_event = events
+            .iter()
+            .find(|e| e.event_type == "claude_rate_limited");
         assert!(rl_event.is_some(), "expected claude_rate_limited event");
 
         let agents = db.lock().unwrap().list_agents().unwrap();
@@ -956,7 +1108,8 @@ mod tests {
         let db = make_db();
         {
             let db = db.lock().unwrap();
-            db.create_ticket_with_id("t-backoff", "Backoff Test", "desc", "general", 1).unwrap();
+            db.create_ticket_with_id("t-backoff", "Backoff Test", "desc", "general", 1)
+                .unwrap();
         }
         let config = make_config(30);
 
@@ -977,21 +1130,41 @@ mod tests {
             .await
             .unwrap();
 
-            let strikes_in_db = db.lock().unwrap().get_ticket_rate_limit_strikes("t-backoff").unwrap();
-            assert_eq!(strikes_in_db, strike as i32, "strikes should be {} after {} failures", strike, strike);
+            let strikes_in_db = db
+                .lock()
+                .unwrap()
+                .get_ticket_rate_limit_strikes("t-backoff")
+                .unwrap();
+            assert_eq!(
+                strikes_in_db, strike as i32,
+                "strikes should be {} after {} failures",
+                strike, strike
+            );
 
-            let retry_after = db.lock().unwrap().get_ticket_rate_limit_retry_after("t-backoff").unwrap();
-            assert!(retry_after.is_some(), "retry_after should be set after strike {}", strike);
+            let retry_after = db
+                .lock()
+                .unwrap()
+                .get_ticket_rate_limit_retry_after("t-backoff")
+                .unwrap();
+            assert!(
+                retry_after.is_some(),
+                "retry_after should be set after strike {}",
+                strike
+            );
             let retry_ts = retry_after.unwrap();
             if let Some(prev) = prev_retry {
-                assert!(retry_ts > prev, "retry_after should increase with each strike");
+                assert!(
+                    retry_ts > prev,
+                    "retry_after should increase with each strike"
+                );
             }
             prev_retry = Some(retry_ts);
 
             // Reset ticket status to pending so the next iteration can process it again
             {
                 let db = db.lock().unwrap();
-                db.update_ticket("t-backoff", "pending", None, None, Some(None)).unwrap();
+                db.update_ticket("t-backoff", "pending", None, None, Some(None))
+                    .unwrap();
             }
         }
     }
@@ -1001,7 +1174,8 @@ mod tests {
         let db = make_db();
         {
             let db = db.lock().unwrap();
-            db.create_ticket_with_id("t-skip", "Skip Test", "desc", "general", 1).unwrap();
+            db.create_ticket_with_id("t-skip", "Skip Test", "desc", "general", 1)
+                .unwrap();
             db.requeue_ticket_rate_limited("t-skip", 1).unwrap();
         }
 
@@ -1017,10 +1191,12 @@ mod tests {
         let db = make_db();
         {
             let db = db.lock().unwrap();
-            db.create_ticket_with_id("t-clear", "Clear Test", "desc", "general", 1).unwrap();
+            db.create_ticket_with_id("t-clear", "Clear Test", "desc", "general", 1)
+                .unwrap();
             db.requeue_ticket_rate_limited("t-clear", 2).unwrap();
             // Reset to pending so the worker can process it
-            db.update_ticket("t-clear", "pending", None, None, Some(None)).unwrap();
+            db.update_ticket("t-clear", "pending", None, None, Some(None))
+                .unwrap();
         }
 
         let config = make_config(30);
@@ -1040,10 +1216,125 @@ mod tests {
         .await
         .unwrap();
 
-        let strikes = db.lock().unwrap().get_ticket_rate_limit_strikes("t-clear").unwrap();
-        assert_eq!(strikes, 0, "rate_limit_strikes should be cleared after success");
+        let strikes = db
+            .lock()
+            .unwrap()
+            .get_ticket_rate_limit_strikes("t-clear")
+            .unwrap();
+        assert_eq!(
+            strikes, 0,
+            "rate_limit_strikes should be cleared after success"
+        );
 
-        let retry_after = db.lock().unwrap().get_ticket_rate_limit_retry_after("t-clear").unwrap();
-        assert!(retry_after.is_none(), "rate_limit_retry_after should be cleared after success");
+        let retry_after = db
+            .lock()
+            .unwrap()
+            .get_ticket_rate_limit_retry_after("t-clear")
+            .unwrap();
+        assert!(
+            retry_after.is_none(),
+            "rate_limit_retry_after should be cleared after success"
+        );
+    }
+
+    // ── Checkpoint: commit_checkpoint writes KB entry when git repo has changes ──
+
+    #[test]
+    fn commit_checkpoint_skips_when_no_changes() {
+        let dir = TempDir::new().unwrap();
+        let wt = dir.path();
+
+        // Initialise a real git repo so git commands work.
+        Command::new("git").args(["init"]).current_dir(wt).status().unwrap();
+        Command::new("git").args(["config", "user.email", "test@test"]).current_dir(wt).status().unwrap();
+        Command::new("git").args(["config", "user.name", "Test"]).current_dir(wt).status().unwrap();
+
+        let db = make_db();
+        // No files to commit → checkpoint should be a no-op (no KB entry written).
+        commit_checkpoint(wt, "w-test", "t-chk-none", &db);
+
+        let kb = db.lock().unwrap().read_knowledge("core", "checkpoint-t-chk-none").unwrap();
+        assert!(kb.is_none(), "no KB entry should be written when nothing to commit");
+    }
+
+    #[test]
+    fn commit_checkpoint_commits_and_writes_kb_entry() {
+        let dir = TempDir::new().unwrap();
+        let wt = dir.path();
+
+        // Initialise a real git repo.
+        Command::new("git").args(["init"]).current_dir(wt).status().unwrap();
+        Command::new("git").args(["config", "user.email", "test@test"]).current_dir(wt).status().unwrap();
+        Command::new("git").args(["config", "user.name", "Test"]).current_dir(wt).status().unwrap();
+
+        // Create an initial commit so HEAD exists (needed for `git branch --show-current`).
+        std::fs::write(wt.join("README.md"), "init").unwrap();
+        Command::new("git").args(["add", "-A"]).current_dir(wt).status().unwrap();
+        Command::new("git").args(["commit", "-m", "init"]).current_dir(wt).status().unwrap();
+
+        // Create a new file to give the checkpoint something to stage.
+        std::fs::write(wt.join("work.txt"), "progress").unwrap();
+
+        let db = make_db();
+        commit_checkpoint(wt, "w-test", "t-chk", &db);
+
+        let kb = db
+            .lock()
+            .unwrap()
+            .read_knowledge("core", "checkpoint-t-chk")
+            .unwrap();
+        assert!(kb.is_some(), "KB entry should be written after a checkpoint commit");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&kb.unwrap().value).expect("KB value should be valid JSON");
+        assert!(
+            value["branch"].as_str().is_some(),
+            "KB entry should contain branch name"
+        );
+        assert!(
+            value["checkpointed_at"].as_str().is_some(),
+            "KB entry should contain checkpointed_at timestamp"
+        );
+        assert_eq!(value["worker_id"].as_str(), Some("w-test"));
+    }
+
+    // ── Resume: task_prompt includes checkpoint section when payload has checkpoint_branch ──
+
+    #[tokio::test]
+    async fn task_prompt_includes_resume_section_when_checkpoint_branch_present() {
+        let db = make_db();
+        let config = make_config(30);
+        let spawner = MockSpawner::new(MockBehavior::Success);
+        let (_tx, shutdown_rx) = watch::channel(false);
+        let mut shutdown_rx = shutdown_rx;
+
+        let payload = serde_json::json!({
+            "ticket_id": "t-resume",
+            "title": "Resume Test",
+            "description": "Test description",
+            "domain": "general",
+            "checkpoint_branch": "acs/t-resume-abcd",
+            "checkpoint_committed_at": "2026-01-01T12:00:00Z",
+        })
+        .to_string();
+
+        // handle_ticket_with_spawner should succeed even with checkpoint fields present.
+        let result = handle_ticket_with_spawner(
+            &spawner,
+            "w-test",
+            &payload,
+            &db,
+            &config,
+            &mut shutdown_rx,
+            Some("claude".to_string()),
+        )
+        .await;
+
+        assert!(result.is_ok(), "handler should succeed with checkpoint fields: {:?}", result);
+
+        // Agent should reach idle state after successful completion.
+        let agents = db.lock().unwrap().list_agents().unwrap();
+        let agent = agents.iter().find(|a| a.id == "w-test").unwrap();
+        assert_eq!(agent.status, "idle");
     }
 }
