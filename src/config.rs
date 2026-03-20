@@ -291,6 +291,7 @@ pub struct ProfileConfig {
     pub default_workers: Option<usize>,
     pub claude_models: Option<Vec<String>>,
     pub worker_timeout_seconds: Option<u64>,
+    pub worker_idle_seconds: Option<u64>,
     #[serde(default)]
     pub auto_approve_milestones: bool,
 }
@@ -330,14 +331,29 @@ pub struct ProjectConfig {
 pub struct ManagerConfig {
     #[serde(default = "default_cycle")]
     pub cycle_seconds: u64,
+    /// Legacy wall-clock timeout (kept for backwards compatibility).
+    /// Prefer `worker_idle_seconds` for new configurations.
     #[serde(default = "default_timeout")]
     pub worker_timeout_seconds: u64,
+    /// Log-file inactivity threshold in seconds. If a worker's log file has not
+    /// been modified for this many seconds, the worker is considered stuck and
+    /// the ticket is re-queued. Defaults to 900 s (15 min).
+    /// When set, this takes precedence over `worker_timeout_seconds`.
+    pub worker_idle_seconds: Option<u64>,
     #[serde(default = "default_poll")]
     pub worker_poll_seconds: u64,
     /// When `true`, milestones are automatically approved without waiting for
     /// CEO review (useful for CI runs).
     #[serde(default)]
     pub auto_approve_milestones: bool,
+}
+
+impl ManagerConfig {
+    /// Returns the effective idle threshold, preferring `worker_idle_seconds`
+    /// when set, falling back to `worker_timeout_seconds` for backwards compat.
+    pub fn idle_seconds(&self) -> u64 {
+        self.worker_idle_seconds.unwrap_or(self.worker_timeout_seconds)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -410,6 +426,7 @@ impl Default for ManagerConfig {
         Self {
             cycle_seconds: default_cycle(),
             worker_timeout_seconds: default_timeout(),
+            worker_idle_seconds: None,
             worker_poll_seconds: default_poll(),
             auto_approve_milestones: false,
         }
@@ -489,6 +506,9 @@ impl Config {
         }
         if let Some(timeout) = p.worker_timeout_seconds {
             self.manager.worker_timeout_seconds = timeout;
+        }
+        if let Some(idle) = p.worker_idle_seconds {
+            self.manager.worker_idle_seconds = Some(idle);
         }
         if p.auto_approve_milestones {
             self.manager.auto_approve_milestones = true;

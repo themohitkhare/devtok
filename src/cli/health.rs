@@ -189,7 +189,7 @@ fn check_stuck_workers(
     config: &Config,
     db_path: &Path,
 ) -> CheckReport {
-    let timeout_seconds = config.manager.worker_timeout_seconds;
+    let timeout_seconds = config.manager.idle_seconds();
     let db = match Db::open(db_path) {
         Ok(db) => db,
         Err(e) => {

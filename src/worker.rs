@@ -254,9 +254,7 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
         checkpoint_cancel_rx,
     ));
 
-    // --- (h) Wait for completion with timeout ---
-    let timeout = Duration::from_secs(config.manager.worker_timeout_seconds);
-
+    // --- (h) Wait for natural exit (staleness detection is handled by the manager loop) ---
     let wait_handle = tokio::task::spawn_blocking(move || child.wait());
 
     let result = tokio::select! {
@@ -280,48 +278,12 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
             let _ = spawner.remove_worktree(worker_id);
             return Ok(());
         }
-        res = tokio::time::timeout(timeout, wait_handle) => res,
+        res = wait_handle => res,
     };
 
     match result {
-        // Timed out
-        Err(_elapsed) => {
-            tracing_log(
-                worker_id,
-                &format!("ticket {} timed out, killing process", ticket_id),
-            );
-
-            // --- (4a) Kill process ---
-            let _ = Spawner::kill_process(pid);
-
-            // --- (4b) Update DB ---
-            {
-                let db = db.lock().unwrap();
-                db.update_ticket(
-                    &ticket_id,
-                    "blocked",
-                    Some("Worker timed out"),
-                    None,
-                    Some(None),
-                )?;
-                db.update_agent(worker_id, "idle", None, None)?;
-                db.log_event(
-                    Some(worker_id),
-                    "ticket_timeout",
-                    &format!(
-                        "ticket {} timed out after {} s",
-                        ticket_id, config.manager.worker_timeout_seconds
-                    ),
-                    None,
-                )?;
-            }
-
-            // --- (4c) Remove worktree ---
-            let _ = spawner.remove_worktree(worker_id);
-        }
-
         // spawn_blocking itself panicked — treat as crash
-        Ok(Err(join_err)) => {
+        Err(join_err) => {
             tracing_log(
                 worker_id,
                 &format!(
@@ -347,7 +309,7 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
         }
 
         // Process finished
-        Ok(Ok(wait_result)) => {
+        Ok(wait_result) => {
             match wait_result {
                 // --- (3) Normal exit (code 0) ---
                 Ok(status) if status.success() => {
@@ -1006,47 +968,6 @@ mod tests {
         // No ticket_completed message should have been pushed to mgr
         let msg = db.lock().unwrap().pop_inbox("mgr").unwrap();
         assert!(msg.is_none(), "mgr inbox should be empty after crash");
-    }
-
-    // ── Test 4: timeout kills process and sets ticket to blocked ──────
-
-    #[tokio::test]
-    async fn timeout_kills_process_and_sets_ticket_blocked() {
-        let db = make_db();
-        // 1 second timeout so the test doesn't wait long
-        let config = make_config(1);
-        let spawner = MockSpawner::new(MockBehavior::Hang);
-        let (_tx, shutdown_rx) = watch::channel(false);
-        let mut shutdown_rx = shutdown_rx;
-
-        handle_ticket_with_spawner(
-            &spawner,
-            "w-test",
-            &ticket_payload("t-timeout"),
-            &db,
-            &config,
-            &mut shutdown_rx,
-            Some("claude".to_string()),
-        )
-        .await
-        .unwrap();
-
-        // A ticket_timeout event should have been logged
-        let events = db.lock().unwrap().recent_events(10).unwrap();
-        let timeout_event = events.iter().find(|e| e.event_type == "ticket_timeout");
-        assert!(
-            timeout_event.is_some(),
-            "expected ticket_timeout event in log"
-        );
-
-        // Agent should be idle after timeout cleanup
-        let agents = db.lock().unwrap().list_agents().unwrap();
-        let agent = agents.iter().find(|a| a.id == "w-test").unwrap();
-        assert_eq!(agent.status, "idle");
-
-        // No ticket_completed pushed to mgr
-        let msg = db.lock().unwrap().pop_inbox("mgr").unwrap();
-        assert!(msg.is_none(), "mgr inbox should be empty after timeout");
     }
 
     // ── Rate-limit detection ──────────────────────────────────────────

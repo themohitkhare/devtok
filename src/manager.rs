@@ -538,6 +538,25 @@ fn select_model_for_provider(
     }
 }
 
+/// Returns true if the log file for the given worker has not been modified
+/// within the idle threshold, indicating the worker may be stuck.
+fn is_log_stale(project_dir: &std::path::Path, worker_id: &str, idle_seconds: u64) -> bool {
+    let log_path = project_dir
+        .join(".acs")
+        .join("logs")
+        .join(format!("{}.log", worker_id));
+    match std::fs::metadata(&log_path) {
+        Ok(meta) => match meta.modified() {
+            Ok(mtime) => match mtime.elapsed() {
+                Ok(elapsed) => elapsed.as_secs() >= idle_seconds,
+                Err(_) => false, // clock skew — don't kill
+            },
+            Err(_) => false,
+        },
+        Err(_) => false, // log not yet created — don't kill
+    }
+}
+
 fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path, auto_merge: bool) -> Result<()> {
     let mut assignments = 0usize;
     let mut completions = 0usize;
@@ -581,7 +600,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 let spawner = Spawner::new_with_agent_config(project_dir, &config.agents);
                 match spawner.find_branch_for_ticket(&ticket.id) {
                     Ok(Some(branch)) => {
-                        match spawner.merge_branch(&branch) {
+                        match spawner.merge_branch(&branch, &config.project.base_branch) {
                             Ok(true) => {
                                 // Merge succeeded — clean up branch, mark completed, rebuild.
                                 spawner.delete_branch(&branch);
@@ -769,7 +788,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
             (agents, tickets)
         };
 
-        let timeout_seconds = config.manager.worker_timeout_seconds;
+        let timeout_seconds = config.manager.idle_seconds();
         let now = Utc::now();
 
         for ticket in in_progress_tickets {
@@ -829,6 +848,72 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 )?;
                 eprintln!("[manager] re-queued stale ticket {} -> pending", ticket.id);
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 0c. Kill stale workers: if the log file hasn't been modified for
+    //     worker_idle_seconds, the subprocess is stuck — kill it and re-queue.
+    // -----------------------------------------------------------------------
+    {
+        let (agents, in_progress_tickets) = {
+            let guard = db.lock().unwrap();
+            let agents = guard.list_agents()?;
+            let tickets = guard.list_tickets(Some("in_progress"))?;
+            (agents, tickets)
+        };
+
+        let idle_threshold = config.manager.idle_seconds();
+
+        for ticket in &in_progress_tickets {
+            let assignee_id = match ticket.assignee.as_deref() {
+                Some(a) if !a.is_empty() => a,
+                _ => continue,
+            };
+
+            // Only consider workers that are actually assigned to this ticket.
+            let agent = match agents.iter().find(|a| a.id == assignee_id) {
+                Some(a) if a.current_ticket.as_deref() == Some(ticket.id.as_str()) => a,
+                _ => continue,
+            };
+
+            if !is_log_stale(project_dir, assignee_id, idle_threshold) {
+                continue;
+            }
+
+            eprintln!(
+                "[manager] worker {} log stale for {}s — killing and re-queuing ticket {}",
+                assignee_id, idle_threshold, ticket.id
+            );
+
+            // Kill the subprocess if we have its PID.
+            if let Some(pid) = agent.pid {
+                let _ = crate::spawner::Spawner::kill_process(pid);
+            }
+
+            let failure_note = format!(
+                "**[Attempt failed - worker_stale]** Last assignee: `{}`, Reason: log file idle for ≥{}s",
+                assignee_id, idle_threshold
+            );
+            let new_notes = if ticket.notes.is_empty() {
+                failure_note
+            } else {
+                format!("{}\n\n---\n{}", ticket.notes, failure_note)
+            };
+
+            let guard = db.lock().unwrap();
+            guard.update_ticket(&ticket.id, "pending", Some(&new_notes), None, Some(None))?;
+            guard.update_agent(assignee_id, "idle", None, None)?;
+            guard.log_event(
+                Some(assignee_id),
+                "worker_stale",
+                &format!(
+                    "ticket {} re-queued; worker log idle for ≥{}s",
+                    ticket.id, idle_threshold
+                ),
+                None,
+            )?;
+            eprintln!("[manager] re-queued stale-log ticket {} -> pending", ticket.id);
         }
     }
 
@@ -1990,6 +2075,105 @@ mod tests {
         assert_eq!(tt1.status, "in_progress");
         assert_eq!(tt2.status, "in_progress");
         assert_eq!(tt2.assignee.as_deref(), Some("w-0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_log_stale: unit tests for log-file mtime staleness detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn log_stale_returns_false_when_log_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // No log file created — should not be considered stale.
+        assert!(!is_log_stale(dir.path(), "w-nonexistent", 0));
+    }
+
+    #[test]
+    fn log_stale_returns_true_when_threshold_is_zero() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let logs = dir.path().join(".acs").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("w-0.log"), "some output\n").unwrap();
+        // Any elapsed time >= 0 means the file is immediately stale.
+        assert!(is_log_stale(dir.path(), "w-0", 0));
+    }
+
+    #[test]
+    fn log_stale_returns_false_when_threshold_is_large() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let logs = dir.path().join(".acs").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("w-0.log"), "fresh output\n").unwrap();
+        // A very large threshold means the file is never stale.
+        assert!(!is_log_stale(dir.path(), "w-0", u64::MAX));
+    }
+
+    // -----------------------------------------------------------------------
+    // run_cycle: stale-log worker re-queue (section 0c)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stale_log_requeues_ticket_and_logs_worker_stale_event() {
+        let (db, mut config) = setup();
+        // Set idle threshold to 0 so any log file is immediately stale.
+        config.manager.worker_idle_seconds = Some(0);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let logs = dir.path().join(".acs").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("w-0.log"), "stale output\n").unwrap();
+
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-0", "worker", "backend-dev").unwrap();
+            // Agent is working on t-001 (same ticket — not caught by 0b check).
+            g.update_agent("w-0", "working", Some("t-001"), None).unwrap();
+            g.create_ticket("T1", "Do", "general", 1).unwrap();
+            g.update_ticket("t-001", "in_progress", None, None, Some(Some("w-0"))).unwrap();
+        }
+
+        run_cycle(&db, &config, dir.path(), false).unwrap();
+
+        let g = db.lock().unwrap();
+        // The cycle re-queues the stale ticket AND then re-assigns it to the
+        // now-idle worker in the same pass. The worker_stale event proves the
+        // re-queue happened; the ticket notes record the failure reason.
+        let events = g.recent_events(20).unwrap();
+        let stale_event = events.iter().find(|e| e.event_type == "worker_stale");
+        assert!(stale_event.is_some(), "expected worker_stale event");
+
+        let t1 = g.get_ticket("t-001").unwrap().unwrap();
+        assert!(
+            t1.notes.contains("worker_stale"),
+            "ticket notes should record worker_stale failure; got: {:?}",
+            t1.notes
+        );
+    }
+
+    #[test]
+    fn fresh_log_does_not_requeue_ticket() {
+        let (db, mut config) = setup();
+        // Large idle threshold — file is never stale.
+        config.manager.worker_idle_seconds = Some(u64::MAX);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let logs = dir.path().join(".acs").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("w-0.log"), "active output\n").unwrap();
+
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-0", "worker", "backend-dev").unwrap();
+            g.update_agent("w-0", "working", Some("t-001"), None).unwrap();
+            g.create_ticket("T1", "Do", "general", 1).unwrap();
+            g.update_ticket("t-001", "in_progress", None, None, Some(Some("w-0"))).unwrap();
+        }
+
+        run_cycle(&db, &config, dir.path(), false).unwrap();
+
+        let g = db.lock().unwrap();
+        let t1 = g.get_ticket("t-001").unwrap().unwrap();
+        assert_eq!(t1.status, "in_progress", "fresh-log ticket should stay in_progress");
     }
 
     // -----------------------------------------------------------------------

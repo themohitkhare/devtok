@@ -13,7 +13,7 @@ pub struct Db {
 }
 
 impl Db {
-    const CURRENT_SCHEMA_VERSION: i64 = 4;
+    const CURRENT_SCHEMA_VERSION: i64 = 5;
 
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -75,7 +75,8 @@ impl Db {
                 status TEXT NOT NULL DEFAULT 'idle',
                 current_ticket TEXT,
                 pid INTEGER,
-                last_heartbeat TEXT
+                last_heartbeat TEXT,
+                backend TEXT NOT NULL DEFAULT 'claude'
             );
             CREATE TABLE IF NOT EXISTS inbox (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -172,6 +173,13 @@ impl Db {
             // skipped due to file overlap. Used for force-assign liveness guarantee (v4).
             let _ = self.conn.execute_batch(
                 "ALTER TABLE tickets ADD COLUMN defer_count INTEGER NOT NULL DEFAULT 0;",
+            );
+        }
+
+        if current_version < 5 {
+            // Backend label for agents: tracks which AI provider handles each worker (v5).
+            let _ = self.conn.execute_batch(
+                "ALTER TABLE agents ADD COLUMN backend TEXT NOT NULL DEFAULT 'claude';",
             );
         }
 
@@ -1370,9 +1378,9 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_v4() {
+    fn schema_version_is_v5() {
         let db = Db::open_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 5);
     }
 
     #[test]
