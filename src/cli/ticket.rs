@@ -11,7 +11,7 @@ pub enum TicketCommands {
     List {
         #[arg(long)]
         status: Option<String>,
-        /// Show only tickets stuck in conflict-deferral loop (defer_count > 0)
+        /// List only tickets stuck in conflict deferral (defer_count >= threshold)
         #[arg(long, default_value = "false")]
         stuck: bool,
     },
@@ -126,7 +126,7 @@ pub fn execute(cmd: TicketCommands) -> Result<()> {
         }
         TicketCommands::List { status, stuck } => {
             let tickets = if stuck {
-                db.list_tickets_with_defer_count_gt(0)?
+                db.list_stuck_tickets(crate::manager::CONFLICT_DEFER_WARN_THRESHOLD)?
             } else {
                 db.list_tickets(status.as_deref())?
             };
