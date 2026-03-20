@@ -258,13 +258,17 @@ async fn run_bounded_workers(
         }
     }
 
+    // Shared Opus model limit flag: workers set it, manager reads it to downgrade models.
+    let opus_limit_hit = Arc::new(AtomicBool::new(false));
+
     // Spawn manager task.
     let mgr_db = db.clone();
     let mgr_config = config.clone();
     let mgr_shutdown = shutdown_rx.clone();
     let mgr_dir = project_dir.clone();
+    let mgr_opus = opus_limit_hit.clone();
     let mgr_handle = tokio::spawn(async move {
-        manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown, auto_merge, Arc::new(AtomicBool::new(false))).await
+        manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown, auto_merge, mgr_opus).await
     });
 
     // Spawn worker tasks.

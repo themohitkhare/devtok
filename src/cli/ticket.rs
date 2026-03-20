@@ -11,6 +11,9 @@ pub enum TicketCommands {
     List {
         #[arg(long)]
         status: Option<String>,
+        /// List only tickets stuck in conflict deferral (defer_count >= threshold)
+        #[arg(long, default_value = "false")]
+        stuck: bool,
     },
     /// Create a ticket
     Create {
@@ -121,8 +124,12 @@ pub fn execute(cmd: TicketCommands) -> Result<()> {
             let out = serde_json::json!({ "status": "created", "id": id });
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
-        TicketCommands::List { status } => {
-            let tickets = db.list_tickets(status.as_deref())?;
+        TicketCommands::List { status, stuck } => {
+            let tickets = if stuck {
+                db.list_stuck_tickets(crate::manager::CONFLICT_DEFER_WARN_THRESHOLD)?
+            } else {
+                db.list_tickets(status.as_deref())?
+            };
             println!("{}", serde_json::to_string_pretty(&tickets)?);
         }
         TicketCommands::Update { id, status, notes, blocked_by } => {

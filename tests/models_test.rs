@@ -14,6 +14,8 @@ fn test_ticket_serialize_deserialize_roundtrip() {
         notes: "".into(),
         created_at: "2025-01-01T00:00:00Z".into(),
         updated_at: "2025-01-01T00:00:00Z".into(),
+        defer_count: 0,
+        files_hint: None,
     };
     let json = serde_json::to_string(&ticket).unwrap();
     let deserialized: Ticket = serde_json::from_str(&json).unwrap();

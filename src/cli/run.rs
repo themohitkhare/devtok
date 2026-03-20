@@ -77,15 +77,19 @@ fn execute_with_dir(
     let run_result = rt.block_on(async {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+        // Shared Opus model limit flag: workers set it, manager reads it to downgrade models.
+        let opus_limit_hit = Arc::new(AtomicBool::new(false));
+
         // Spawn manager task
         let mgr_db = db.clone();
         let mgr_config = config.clone();
         let mgr_shutdown = shutdown_rx.clone();
         let mgr_dir = project_dir.clone();
         let skip_loop_mgr = skip_loop;
+        let mgr_opus = opus_limit_hit.clone();
         let mgr_handle = tokio::spawn(async move {
             if !skip_loop_mgr {
-                let _ = manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown, false, Arc::new(AtomicBool::new(false))).await;
+                let _ = manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown, false, mgr_opus).await;
             }
         });
 
@@ -340,6 +344,7 @@ async fn do_autoscale_adjust(
     min_active: usize,
     max_workers: usize,
     backend: Option<&str>,
+    opus_limit_hit: Arc<AtomicBool>,
 ) -> Result<()> {
     let queue_depth = {
         let db = db.lock().unwrap();
@@ -569,6 +574,7 @@ pub fn provider_for_backend(backend: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
     /// Create a minimal `.acs/` project directory for tests.
@@ -679,6 +685,7 @@ mod tests {
             1,
             2,
             None,
+            Arc::new(AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -721,6 +728,7 @@ mod tests {
             1,
             2,
             None,
+            Arc::new(AtomicBool::new(false)),
         )
         .await
         .unwrap();
@@ -757,6 +765,7 @@ mod tests {
             1,
             2,
             None,
+            Arc::new(AtomicBool::new(false)),
         )
         .await
         .unwrap();

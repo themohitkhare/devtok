@@ -28,18 +28,20 @@ pub struct HealthReport {
     pub orphaned_worktrees: CheckReport,
     pub git_merge_safety: CheckReport,
     pub blocked_vs_stale: CheckReport,
+    pub model_availability: CheckReport,
 }
 
 impl HealthReport {
     pub fn short_summary(&self) -> String {
         format!(
-            "overall={} db={} stuck_workers={} orphaned_worktrees={} git_merge_safety={} blocked_vs_stale={}",
+            "overall={} db={} stuck_workers={} orphaned_worktrees={} git_merge_safety={} blocked_vs_stale={} model_availability={}",
             self.overall,
             self.db.status,
             self.stuck_workers.status,
             self.orphaned_worktrees.status,
             self.git_merge_safety.status,
-            self.blocked_vs_stale.status
+            self.blocked_vs_stale.status,
+            self.model_availability.status
         )
     }
 }
@@ -89,6 +91,17 @@ pub fn run_health_checks(project_dir: &Path, acs_dir: &Path, config: &Config) ->
             })),
         }
     };
+    let model_availability_report = if db_report.status == STATUS_OK {
+        check_model_availability(&db_path)
+    } else {
+        CheckReport {
+            status: STATUS_WARN.to_string(),
+            details: Some(json!({
+                "reason": "db_unavailable_or_locked",
+                "db_check_status": db_report.status,
+            })),
+        }
+    };
 
     let overall = worst_overall_status(&[
         &db_report,
@@ -96,6 +109,7 @@ pub fn run_health_checks(project_dir: &Path, acs_dir: &Path, config: &Config) ->
         &orphaned_worktrees_report,
         &git_merge_safety_report,
         &blocked_vs_stale_report,
+        &model_availability_report,
     ]);
 
     HealthReport {
@@ -105,6 +119,7 @@ pub fn run_health_checks(project_dir: &Path, acs_dir: &Path, config: &Config) ->
         orphaned_worktrees: orphaned_worktrees_report,
         git_merge_safety: git_merge_safety_report,
         blocked_vs_stale: blocked_vs_stale_report,
+        model_availability: model_availability_report,
     }
 }
 
@@ -541,6 +556,42 @@ fn check_blocked_vs_stale(_project_dir: &Path, _acs_dir: &Path, db_path: &Path) 
             "truly_blocked_sample": truly_blocked.into_iter().take(25).collect::<Vec<_>>(),
             "stale_sample": stale.into_iter().take(25).collect::<Vec<_>>(),
         })),
+    }
+}
+
+/// Check whether Opus model limit events have been recorded in the DB.
+///
+/// If any `opus_model_limit` events exist in recent history, the Opus billing
+/// tier is exhausted for this session and all work is being done on Sonnet.
+/// This surfaces as a `warn` so operators know the model tier has degraded.
+fn check_model_availability(db_path: &Path) -> CheckReport {
+    let db = match Db::open(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            return CheckReport {
+                status: STATUS_WARN.to_string(),
+                details: Some(json!({ "error": e.to_string() })),
+            };
+        }
+    };
+
+    match db.list_recent_events_of_type("opus_model_limit", 5) {
+        Ok(events) if events.is_empty() => CheckReport {
+            status: STATUS_OK.to_string(),
+            details: Some(json!({ "opus_limit_events": 0 })),
+        },
+        Ok(events) => CheckReport {
+            status: STATUS_WARN.to_string(),
+            details: Some(json!({
+                "opus_limit_events": events.len(),
+                "note": "Opus billing limit hit; workers downgraded to Sonnet",
+                "most_recent": events.first().map(|e| &e.timestamp),
+            })),
+        },
+        Err(e) => CheckReport {
+            status: STATUS_WARN.to_string(),
+            details: Some(json!({ "error": e.to_string() })),
+        },
     }
 }
 
