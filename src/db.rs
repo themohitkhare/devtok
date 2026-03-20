@@ -452,19 +452,6 @@ impl Db {
         ).optional().map_err(Into::into)
     }
 
-    /// Increment the defer_count for a ticket (called when conflict-deferred).
-    /// Returns the new defer_count.
-    pub fn increment_defer_count(&self, ticket_id: &str) -> Result<i32> {
-        let now = Utc::now().to_rfc3339();
-        self.conn.query_row(
-            "UPDATE tickets SET defer_count = COALESCE(defer_count, 0) + 1, updated_at = ?2
-             WHERE id = ?1
-             RETURNING COALESCE(defer_count, 0)",
-            params![ticket_id, now],
-            |row| row.get(0),
-        ).map_err(Into::into)
-    }
-
     /// Set the files_hint for a ticket (comma-separated file paths).
     pub fn set_files_hint(&self, ticket_id: &str, hint: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
