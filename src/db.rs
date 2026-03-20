@@ -13,7 +13,7 @@ pub struct Db {
 }
 
 impl Db {
-    const CURRENT_SCHEMA_VERSION: i64 = 2;
+    const CURRENT_SCHEMA_VERSION: i64 = 3;
 
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -39,7 +39,7 @@ impl Db {
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 schema_version INTEGER NOT NULL,
                 updated_at TEXT NOT NULL
-            );"
+            );",
         )?;
         self.conn.execute(
             "INSERT OR IGNORE INTO schema_meta (id, schema_version, updated_at) VALUES (1, 1, ?1)",
@@ -160,6 +160,11 @@ impl Db {
                 "ALTER TABLE tickets ADD COLUMN rate_limit_strikes INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE tickets ADD COLUMN rate_limit_retry_after TEXT;",
             );
+
+            // File conflict prevention: optional comma-separated file paths hint (v3).
+            let _ = self.conn.execute_batch(
+                "ALTER TABLE tickets ADD COLUMN files_hint TEXT;",
+            );
         }
 
         self.conn.execute(
@@ -275,7 +280,8 @@ impl Db {
         let new_strikes = current_strikes + 1;
         // Backoff: 30 * 2^(strikes-1), capped at 240 s
         let backoff_secs: u64 = (30u64 * (1u64 << (new_strikes - 1).min(3))).min(240);
-        let retry_after = (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
+        let retry_after =
+            (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
         let notes = format!("rate_limited:{}", retry_after);
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
@@ -297,11 +303,13 @@ impl Db {
 
     /// Returns the current rate-limit strike count for a ticket.
     pub fn get_ticket_rate_limit_strikes(&self, id: &str) -> Result<i32> {
-        self.conn.query_row(
-            "SELECT COALESCE(rate_limit_strikes, 0) FROM tickets WHERE id = ?1",
-            params![id],
-            |row| row.get(0),
-        ).map_err(Into::into)
+        self.conn
+            .query_row(
+                "SELECT COALESCE(rate_limit_strikes, 0) FROM tickets WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     /// Returns the rate_limit_retry_after timestamp for a ticket, if set.
@@ -309,11 +317,15 @@ impl Db {
         &self,
         id: &str,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-        let ts: Option<String> = self.conn.query_row(
-            "SELECT rate_limit_retry_after FROM tickets WHERE id = ?1",
-            params![id],
-            |row| row.get(0),
-        ).optional()?.flatten();
+        let ts: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT rate_limit_retry_after FROM tickets WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
         match ts {
             None => Ok(None),
             Some(s) => {
@@ -323,6 +335,57 @@ impl Db {
                 Ok(Some(dt))
             }
         }
+    }
+
+    /// Store computed file-path hints for a ticket (comma-separated).
+    /// Used by the manager's conflict-prevention check.
+    pub fn set_ticket_files_hint(&self, id: &str, hints: &[String]) -> Result<()> {
+        let hint_str = hints.join(",");
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE tickets SET files_hint = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, hint_str, now],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve stored file-path hints for a ticket, if any.
+    pub fn get_ticket_files_hint(&self, id: &str) -> Result<Option<Vec<String>>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT files_hint FROM tickets WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(raw.map(|s| {
+            if s.is_empty() {
+                vec![]
+            } else {
+                s.split(',').map(str::to_string).collect()
+            }
+        }))
+    }
+
+    /// Atomically claim a specific pending ticket by ID for an agent.
+    ///
+    /// Returns `None` if the ticket is not claimable (already taken, not pending,
+    /// or still within its rate-limit window).
+    pub fn claim_ticket_by_id(&self, ticket_id: &str, agent_id: &str) -> Result<Option<Ticket>> {
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+        let ticket: Option<Ticket> = tx.query_row(
+            "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2, rate_limit_retry_after = NULL
+             WHERE id = ?3 AND status = 'pending' AND assignee IS NULL
+               AND (rate_limit_retry_after IS NULL OR rate_limit_retry_after <= ?2)
+             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at",
+            params![agent_id, now, ticket_id],
+            Self::row_to_ticket,
+        ).optional()?;
+        tx.commit()?;
+        Ok(ticket)
     }
 
     /// Create a ticket with an explicit ID (used in tests).
@@ -1095,6 +1158,43 @@ impl Db {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    pub fn throughput_metrics(&self) -> Result<crate::models::ThroughputMetrics> {
+        let one_hour_ago = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let tickets_per_hour: f64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'ticket_completed' AND timestamp >= ?1",
+            params![one_hour_ago],
+            |row| row.get::<_, i64>(0),
+        ).unwrap_or(0) as f64;
+        let (total_tokens, completed_count): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(tokens_used), 0), COUNT(*) FROM events WHERE event_type = 'ticket_completed'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap_or((0, 0));
+        let avg_tokens_per_ticket = if completed_count > 0 {
+            total_tokens as f64 / completed_count as f64
+        } else { 0.0 };
+        let completions_hour = tickets_per_hour.max(1.0);
+        let conflicts: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_conflict_requeued' AND timestamp >= ?1",
+            params![one_hour_ago], |row| row.get(0),
+        ).unwrap_or(0);
+        let timeouts: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'ticket_requeued_stale_in_progress' AND timestamp >= ?1",
+            params![one_hour_ago], |row| row.get(0),
+        ).unwrap_or(0);
+        let pending_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tickets WHERE status = 'pending'",
+            [], |row| row.get(0),
+        ).unwrap_or(0);
+        Ok(crate::models::ThroughputMetrics {
+            tickets_per_hour,
+            avg_tokens_per_ticket,
+            merge_conflict_rate: conflicts as f64 / completions_hour,
+            timeout_rate: timeouts as f64 / completions_hour,
+            pending_count,
+        })
     }
 }
 

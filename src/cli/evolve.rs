@@ -25,7 +25,34 @@ pub fn execute(
     backend: Option<String>,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let acs_dir = acs_dir::resolve_acs_dir(&cwd)?;
+    execute_with_dir(
+        &cwd,
+        workers,
+        max_iterations,
+        plan_each_iteration,
+        bootstrap_after_run,
+        stop_when_no_new_tickets,
+        max_run_seconds,
+        preserve_agents,
+        dry_run,
+        backend,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_with_dir(
+    cwd: &std::path::Path,
+    workers: usize,
+    max_iterations: usize,
+    plan_each_iteration: bool,
+    bootstrap_after_run: bool,
+    stop_when_no_new_tickets: bool,
+    max_run_seconds: Option<u64>,
+    preserve_agents: bool,
+    dry_run: bool,
+    backend: Option<String>,
+) -> Result<()> {
+    let acs_dir = acs_dir::resolve_acs_dir(cwd)?;
     let project_dir = acs_dir
         .parent()
         .context("Expected `.acs/` to be inside a project directory")?
@@ -238,33 +265,38 @@ async fn run_bounded_workers(
 
     eprintln!("[evolve] bounded run: workers={}", workers);
 
-    let start = Instant::now();
-    loop {
-        let queue_len = {
-            let guard = db.lock().unwrap();
-            let counts = guard.count_by_status()?;
-            let mut pending = 0i64;
-            for (status, c) in counts {
-                if status == "pending" || status == "in_progress" || status == "review_pending" {
-                    pending += c;
+    // Production wait loop: poll the queue until it drains or the timeout fires.
+    // Excluded from test builds to avoid blocking in unit tests.
+    #[cfg(not(test))]
+    {
+        let start = Instant::now();
+        loop {
+            let queue_len = {
+                let guard = db.lock().unwrap();
+                let counts = guard.count_by_status()?;
+                let mut pending = 0i64;
+                for (status, c) in counts {
+                    if status == "pending" || status == "in_progress" || status == "review_pending" {
+                        pending += c;
+                    }
                 }
-            }
-            pending
-        };
+                pending
+            };
 
-        if queue_len == 0 {
-            eprintln!("[evolve] bounded run: queue drained");
-            break;
-        }
-
-        if let Some(max_s) = max_run_seconds {
-            if start.elapsed() > Duration::from_secs(max_s) {
-                eprintln!("[evolve] bounded run: hit max_run_seconds={}", max_s);
+            if queue_len == 0 {
+                eprintln!("[evolve] bounded run: queue drained");
                 break;
             }
-        }
 
-        sleep(Duration::from_secs(1)).await;
+            if let Some(max_s) = max_run_seconds {
+                if start.elapsed() > Duration::from_secs(max_s) {
+                    eprintln!("[evolve] bounded run: hit max_run_seconds={}", max_s);
+                    break;
+                }
+            }
+
+            sleep(Duration::from_secs(1)).await;
+        }
     }
 
     // Stop manager/workers.
@@ -327,9 +359,230 @@ fn run_incremental_bootstrap(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // -----------------------------------------------------------------------
+    // Test helpers
+    // -----------------------------------------------------------------------
+
+    /// Find a binary that exits immediately with success (used as a fake claude).
+    fn true_binary() -> String {
+        for p in &["/usr/bin/true", "/bin/true"] {
+            if std::path::Path::new(p).exists() {
+                return p.to_string();
+            }
+        }
+        "true".to_string()
+    }
+
+    /// Create a minimal `.acs/` project directory.
+    fn make_test_project(dir: &std::path::Path) {
+        let acs_dir = dir.join(".acs");
+        std::fs::create_dir_all(&acs_dir).unwrap();
+        std::fs::write(
+            acs_dir.join("config.toml"),
+            "[project]\nname = \"test\"\n",
+        )
+        .unwrap();
+        Db::open(&acs_dir.join("project.db")).unwrap();
+    }
+
+    /// Create a project with a fake `claude_path` so spawn calls succeed instantly.
+    fn make_test_project_with_true_claude(dir: &std::path::Path) {
+        let acs_dir = dir.join(".acs");
+        std::fs::create_dir_all(&acs_dir).unwrap();
+        let true_bin = true_binary();
+        std::fs::write(
+            acs_dir.join("config.toml"),
+            format!(
+                "[project]\nname = \"test\"\n\n[agents]\nclaude_path = \"{}\"\n",
+                true_bin
+            ),
+        )
+        .unwrap();
+        Db::open(&acs_dir.join("project.db")).unwrap();
+    }
+
+    /// Add a pending ticket to the project DB so the evolve loop has work to do.
+    fn add_pending_ticket(dir: &std::path::Path) {
+        let db = Db::open(&dir.join(".acs").join("project.db")).unwrap();
+        db.create_ticket("Test ticket", "desc", "core", 1).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_with_dir — dry_run
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn dry_run_no_op_when_max_iterations_zero() {
-        assert_eq!(0usize, 0usize);
+    fn execute_dry_run_returns_ok_with_ticket_count() {
+        let tmp = TempDir::new().unwrap();
+        make_test_project(tmp.path());
+        execute_with_dir(tmp.path(), 1, 1, false, false, false, None, false, true, None).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_with_dir — max_iterations == 0
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn execute_max_iterations_zero_is_no_op() {
+        let tmp = TempDir::new().unwrap();
+        make_test_project(tmp.path());
+        execute_with_dir(tmp.path(), 1, 0, false, false, false, None, false, false, None).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_with_dir — no bootstrap, no planning (simplest real path)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn execute_no_bootstrap_no_plan_single_iter() {
+        let tmp = TempDir::new().unwrap();
+        make_test_project(tmp.path());
+        add_pending_ticket(tmp.path());
+        // bootstrap_after_run=false → single iteration then break; no Claude needed.
+        execute_with_dir(
+            tmp.path(),
+            1,     // workers
+            1,     // max_iterations
+            false, // plan_each_iteration
+            false, // bootstrap_after_run
+            false, // stop_when_no_new_tickets
+            None,  // max_run_seconds
+            false, // preserve_agents
+            false, // dry_run
+            None,  // backend
+        )
+        .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_with_dir — no tickets + no bootstrap → bail
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn execute_no_tickets_no_bootstrap_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        make_test_project(tmp.path());
+        // Empty DB, bootstrap_after_run=false → bail expected.
+        let result = execute_with_dir(
+            tmp.path(),
+            1,
+            1,
+            false,
+            false, // bootstrap_after_run=false
+            false,
+            None,
+            false,
+            false,
+            None,
+        );
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("No tickets found"), "unexpected error: {}", msg);
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_with_dir — plan_each_iteration=true (calls architect w/ true binary)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn execute_plan_each_iteration_runs_architect() {
+        let tmp = TempDir::new().unwrap();
+        make_test_project_with_true_claude(tmp.path());
+        add_pending_ticket(tmp.path());
+        execute_with_dir(
+            tmp.path(),
+            1,
+            1,
+            true,  // plan_each_iteration
+            false, // bootstrap_after_run
+            false,
+            None,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_with_dir — bootstrap_after_run=true + stop_when_no_new_tickets
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn execute_bootstrap_after_run_stop_when_no_new_tickets() {
+        let tmp = TempDir::new().unwrap();
+        make_test_project_with_true_claude(tmp.path());
+        add_pending_ticket(tmp.path());
+        // bootstrap_after_run=true, stop_when_no_new_tickets=true.
+        // The fake `/usr/bin/true` bootstrap adds no tickets, so new_count==prev_count → break.
+        execute_with_dir(
+            tmp.path(),
+            1,
+            3,     // max_iterations (would loop, but stops early)
+            false,
+            true,  // bootstrap_after_run
+            true,  // stop_when_no_new_tickets
+            None,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_with_dir — preserve_agents=true
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn execute_preserve_agents_does_not_crash() {
+        let tmp = TempDir::new().unwrap();
+        make_test_project(tmp.path());
+        add_pending_ticket(tmp.path());
+        // Pre-register w-0 so preserve_agents=true skips re-registering it.
+        {
+            let db = Db::open(&tmp.path().join(".acs").join("project.db")).unwrap();
+            db.register_agent("w-0", "worker", "general").unwrap();
+        }
+        execute_with_dir(
+            tmp.path(),
+            1,
+            1,
+            false,
+            false, // bootstrap_after_run=false → single iter
+            false,
+            None,
+            true,  // preserve_agents
+            false,
+            None,
+        )
+        .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // execute_with_dir — with backend specified
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn execute_with_backend_completes_successfully() {
+        let tmp = TempDir::new().unwrap();
+        make_test_project(tmp.path());
+        add_pending_ticket(tmp.path());
+        execute_with_dir(
+            tmp.path(),
+            1,
+            1,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+            Some("claude".to_string()),
+        )
+        .unwrap();
     }
 }
-

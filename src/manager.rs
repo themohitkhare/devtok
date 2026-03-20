@@ -293,6 +293,82 @@ fn build_kb_context(db: &Db, domain: &str) -> String {
     format_kb_context(&entries)
 }
 
+// ---------------------------------------------------------------------------
+// File conflict prevention helpers
+// ---------------------------------------------------------------------------
+
+/// Maps a single lowercase keyword to a known source file path.
+fn keyword_to_file_path(keyword: &str) -> Option<&'static str> {
+    match keyword.trim() {
+        // Top-level modules
+        "manager" => Some("src/manager.rs"),
+        "spawner" => Some("src/spawner.rs"),
+        "db" => Some("src/db.rs"),
+        "models" => Some("src/models.rs"),
+        "worker" => Some("src/worker.rs"),
+        "config" => Some("src/config.rs"),
+        "quality" => Some("src/quality.rs"),
+        "prompts" => Some("src/prompts.rs"),
+        "lib" => Some("src/lib.rs"),
+        "main" => Some("src/main.rs"),
+        // CLI sub-commands
+        "evolve" => Some("src/cli/evolve.rs"),
+        "inbox" => Some("src/cli/inbox.rs"),
+        "ticket" => Some("src/cli/ticket.rs"),
+        "milestone" => Some("src/cli/milestone.rs"),
+        "status" => Some("src/cli/status.rs"),
+        "kb" => Some("src/cli/kb.rs"),
+        "run" => Some("src/cli/run.rs"),
+        "log" => Some("src/cli/log.rs"),
+        "health" => Some("src/cli/health.rs"),
+        "check" => Some("src/cli/check.rs"),
+        "approve" => Some("src/cli/approve.rs"),
+        "reject" => Some("src/cli/reject.rs"),
+        "restart" => Some("src/cli/restart.rs"),
+        "cleanup" => Some("src/cli/cleanup.rs"),
+        "export" => Some("src/cli/export.rs"),
+        "cost" => Some("src/cli/cost.rs"),
+        "plan" => Some("src/cli/plan.rs"),
+        "report" => Some("src/cli/report.rs"),
+        "stop" => Some("src/cli/stop.rs"),
+        _ => None,
+    }
+}
+
+/// Extracts likely source file paths from ticket title + description using keyword matching.
+///
+/// Recognises both bare module names (e.g. `manager` → `src/manager.rs`) and explicit
+/// `.rs` suffixes (e.g. `evolve.rs` → `src/cli/evolve.rs`).  Returns a sorted,
+/// deduplicated list of paths.
+pub fn extract_file_hints(title: &str, description: &str) -> Vec<String> {
+    let text = format!("{} {}", title, description).to_lowercase();
+    let mut hints = std::collections::HashSet::new();
+
+    for token in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        // Strip a trailing `.rs` suffix if present, then look up the stem.
+        let stem = token.strip_suffix(".rs").unwrap_or(token);
+        if let Some(path) = keyword_to_file_path(stem) {
+            hints.insert(path.to_string());
+        }
+    }
+
+    let mut result: Vec<String> = hints.into_iter().collect();
+    result.sort();
+    result
+}
+
+/// Returns the fraction of `candidate` files that appear in `in_progress`.
+///
+/// Returns `0.0` when `candidate` is empty (no basis for comparison).
+pub fn files_overlap_ratio(candidate: &[String], in_progress: &[String]) -> f64 {
+    if candidate.is_empty() {
+        return 0.0;
+    }
+    let ip_set: std::collections::HashSet<&String> = in_progress.iter().collect();
+    let overlap = candidate.iter().filter(|f| ip_set.contains(f)).count();
+    overlap as f64 / candidate.len() as f64
+}
+
 pub async fn run_loop(
     db: Arc<Mutex<Db>>,
     config: &Config,
@@ -541,12 +617,75 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
         let idle_workers: Vec<Agent> = agents.into_iter().filter(|a| a.status == "idle").collect();
 
         for worker in idle_workers {
-            let ticket_opt = {
+            // Build the union of file hints for all currently in_progress tickets.
+            // Re-queried per worker so tickets assigned earlier in this cycle are included.
+            let in_progress_files: Vec<String> = {
                 let guard = db.lock().unwrap();
-                guard.claim_next_ticket(&worker.id)?
+                guard
+                    .list_tickets(Some("in_progress"))?
+                    .into_iter()
+                    .flat_map(|t| extract_file_hints(&t.title, &t.description))
+                    .collect()
             };
 
+            // Iterate pending candidates in priority order; skip conflicting tickets.
+            let candidates: Vec<Ticket> = {
+                let guard = db.lock().unwrap();
+                guard
+                    .list_tickets(Some("pending"))?
+                    .into_iter()
+                    .filter(|t| t.assignee.is_none())
+                    .collect()
+            };
+
+            let mut ticket_opt: Option<Ticket> = None;
+            for candidate in &candidates {
+                let candidate_files = extract_file_hints(&candidate.title, &candidate.description);
+                let ratio = files_overlap_ratio(&candidate_files, &in_progress_files);
+
+                // Defer if >50% of the candidate's hinted files are already in progress.
+                if ratio > 0.5 {
+                    let guard = db.lock().unwrap();
+                    guard.log_event(
+                        Some("mgr"),
+                        "conflict_deferred",
+                        &format!(
+                            "ticket {} deferred: {:.0}% file overlap with in-progress tickets (files: {})",
+                            candidate.id,
+                            ratio * 100.0,
+                            candidate_files.join(", ")
+                        ),
+                        None,
+                    )?;
+                    eprintln!(
+                        "[manager] deferred ticket {} — {:.0}% file overlap",
+                        candidate.id,
+                        ratio * 100.0
+                    );
+                    continue;
+                }
+
+                // Attempt an atomic claim of this specific ticket.
+                let claimed = {
+                    let guard = db.lock().unwrap();
+                    guard.claim_ticket_by_id(&candidate.id, &worker.id)?
+                };
+
+                if claimed.is_some() {
+                    ticket_opt = claimed;
+                    break;
+                }
+                // Ticket was already claimed by another agent (race); try next candidate.
+            }
+
             if let Some(ticket) = ticket_opt {
+                // Persist file hints so future cycles can read them from the column.
+                let file_hints = extract_file_hints(&ticket.title, &ticket.description);
+                if !file_hints.is_empty() {
+                    let guard = db.lock().unwrap();
+                    let _ = guard.set_ticket_files_hint(&ticket.id, &file_hints);
+                }
+
                 let persona = config.persona_for_domain(&ticket.domain).to_string();
                 let work_type = select_provider_for_ticket(&config.agents, &worker.id, &ticket.id);
                 let model = select_model_for_provider(&work_type, &config.agents, ticket.priority);
@@ -2175,6 +2314,200 @@ mod tests {
             payload.get("checkpoint_branch").is_none()
                 || payload["checkpoint_branch"].is_null(),
             "payload should not include checkpoint_branch when no prior checkpoint exists"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_file_hints: keyword → file path mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_file_hints_recognises_module_keywords() {
+        let hints = extract_file_hints("Fix manager assign logic", "Update manager.rs loop");
+        assert!(hints.contains(&"src/manager.rs".to_string()));
+    }
+
+    #[test]
+    fn extract_file_hints_recognises_rs_suffix() {
+        let hints = extract_file_hints("Update evolve.rs command", "");
+        assert!(hints.contains(&"src/cli/evolve.rs".to_string()));
+    }
+
+    #[test]
+    fn extract_file_hints_returns_empty_for_unknown_keywords() {
+        let hints = extract_file_hints("Add documentation", "Write README guide");
+        assert!(hints.is_empty());
+    }
+
+    #[test]
+    fn extract_file_hints_deduplicates() {
+        let hints = extract_file_hints("manager manager manager", "manager changes");
+        assert_eq!(hints.iter().filter(|h| h.as_str() == "src/manager.rs").count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // files_overlap_ratio: overlap computation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn files_overlap_ratio_zero_for_empty_candidate() {
+        let ratio = files_overlap_ratio(&[], &["src/manager.rs".to_string()]);
+        assert_eq!(ratio, 0.0);
+    }
+
+    #[test]
+    fn files_overlap_ratio_full_overlap() {
+        let files = vec!["src/manager.rs".to_string()];
+        let ratio = files_overlap_ratio(&files, &files);
+        assert_eq!(ratio, 1.0);
+    }
+
+    #[test]
+    fn files_overlap_ratio_partial_overlap() {
+        let candidate = vec!["src/manager.rs".to_string(), "src/db.rs".to_string()];
+        let in_progress = vec!["src/manager.rs".to_string()];
+        let ratio = files_overlap_ratio(&candidate, &in_progress);
+        assert!((ratio - 0.5).abs() < 1e-9);
+    }
+
+    // -----------------------------------------------------------------------
+    // conflict_deferred: manager defers assignment when file overlap >50%
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conflict_deferred_when_file_overlap_exceeds_threshold() {
+        let (db, mut config) = setup();
+        // Disable stale-requeue time gate so t-001 stays in_progress safely.
+        config.manager.worker_timeout_seconds = 3600;
+        {
+            let g = db.lock().unwrap();
+            // w-0 is actively working on t-001 (prevents stale requeue).
+            g.register_agent("w-0", "worker", "backend-dev").unwrap();
+            g.update_agent("w-0", "working", Some("t-001"), None).unwrap();
+
+            // t-001: in_progress, mentions "manager" → hint: src/manager.rs
+            g.create_ticket(
+                "Update manager assign logic",
+                "Fix the manager loop handling",
+                "core",
+                1,
+            )
+            .unwrap();
+            g.update_ticket("t-001", "in_progress", None, None, Some(Some("w-0")))
+                .unwrap();
+
+            // t-002: pending, also mentions "manager" → same hint → should be deferred
+            g.create_ticket(
+                "Refactor manager cycle",
+                "Change the manager.rs run_cycle function",
+                "core",
+                1,
+            )
+            .unwrap();
+
+            // w-1 is idle and will try to pick up t-002
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let t2 = g.get_ticket("t-002").unwrap().unwrap();
+        assert_eq!(
+            t2.status, "pending",
+            "t-002 should remain pending when file overlap >50% with in-progress ticket"
+        );
+        assert!(t2.assignee.is_none(), "deferred ticket should have no assignee");
+
+        let events = g.recent_events(20).unwrap();
+        let defer_evt = events.iter().find(|e| e.event_type == "conflict_deferred");
+        assert!(defer_evt.is_some(), "should log a conflict_deferred event");
+        assert!(
+            defer_evt.unwrap().detail.contains("t-002"),
+            "conflict_deferred event should mention the deferred ticket"
+        );
+    }
+
+    #[test]
+    fn no_conflict_when_files_do_not_overlap() {
+        let (db, mut config) = setup();
+        config.manager.worker_timeout_seconds = 3600;
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-0", "worker", "backend-dev").unwrap();
+            g.update_agent("w-0", "working", Some("t-001"), None).unwrap();
+
+            // t-001: in_progress, touches spawner
+            g.create_ticket(
+                "Fix spawner subprocess handling",
+                "Update spawner launch logic",
+                "core",
+                1,
+            )
+            .unwrap();
+            g.update_ticket("t-001", "in_progress", None, None, Some(Some("w-0")))
+                .unwrap();
+
+            // t-002: pending, touches db only — no overlap with spawner
+            g.create_ticket(
+                "Add db migration for new column",
+                "Update db schema via migration",
+                "core",
+                1,
+            )
+            .unwrap();
+
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let t2 = g.get_ticket("t-002").unwrap().unwrap();
+        assert_eq!(
+            t2.status, "in_progress",
+            "t-002 should be assigned when files do not overlap"
+        );
+    }
+
+    #[test]
+    fn no_conflict_when_candidate_has_no_file_hints() {
+        let (db, mut config) = setup();
+        config.manager.worker_timeout_seconds = 3600;
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-0", "worker", "backend-dev").unwrap();
+            g.update_agent("w-0", "working", Some("t-001"), None).unwrap();
+
+            g.create_ticket(
+                "Update manager loop",
+                "Fix the manager scheduling",
+                "core",
+                1,
+            )
+            .unwrap();
+            g.update_ticket("t-001", "in_progress", None, None, Some(Some("w-0")))
+                .unwrap();
+
+            // t-002: title/desc have no recognised source-file keywords → skip conflict check
+            g.create_ticket(
+                "Write documentation for the project",
+                "Add README with setup instructions",
+                "core",
+                1,
+            )
+            .unwrap();
+
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let t2 = g.get_ticket("t-002").unwrap().unwrap();
+        assert_eq!(
+            t2.status, "in_progress",
+            "ticket with no file hints should be assigned normally"
         );
     }
 }

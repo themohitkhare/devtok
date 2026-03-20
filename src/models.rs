@@ -92,6 +92,26 @@ pub struct QualityScore {
     pub computed_at: String,
 }
 
+/// Throughput and health metrics computed over a rolling time window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThroughputMetrics {
+    pub tickets_per_hour: f64,
+    pub avg_tokens_per_ticket: f64,
+    pub merge_conflict_rate: f64,
+    pub timeout_rate: f64,
+    pub pending_count: i64,
+}
+
+impl ThroughputMetrics {
+    pub fn eta_hours(&self) -> Option<f64> {
+        if self.tickets_per_hour > 0.0 {
+            Some(self.pending_count as f64 / self.tickets_per_hour)
+        } else {
+            None
+        }
+    }
+}
+
 /// Pricing constants per million tokens.
 pub mod pricing {
     pub const SONNET_INPUT_PER_M: f64 = 3.0;

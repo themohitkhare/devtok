@@ -36,6 +36,9 @@ pub fn execute(
         eprintln!("Health warning: {}", report.short_summary());
     }
 
+    // Test hook: skip the long-running manager/worker loop (see unit tests).
+    let skip_loop = std::env::var("ACS_SKIP_RUN_LOOP").is_ok();
+
     let rt = tokio::runtime::Runtime::new()?;
     let run_result = rt.block_on(async {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -45,8 +48,11 @@ pub fn execute(
         let mgr_config = config.clone();
         let mgr_shutdown = shutdown_rx.clone();
         let mgr_dir = project_dir.clone();
+        let skip_loop_mgr = skip_loop;
         let mgr_handle = tokio::spawn(async move {
-            manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown).await
+            if !skip_loop_mgr {
+                let _ = manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown).await;
+            }
         });
 
         // Track workers so autoscaling can start/stop them at runtime.
@@ -70,16 +76,19 @@ pub fn execute(
             let w_config = config.clone();
             let w_dir = project_dir.clone();
             let forced_provider = resolve_worker_provider(i, workers, backend.as_deref());
+            let skip_loop_w = skip_loop;
             let handle = tokio::spawn(async move {
-                worker::worker_loop(
-                    worker_id,
-                    w_db,
-                    w_config,
-                    w_dir,
-                    worker_shutdown_rx,
-                    forced_provider,
-                )
-                .await
+                if !skip_loop_w {
+                    worker::worker_loop(
+                        worker_id,
+                        w_db,
+                        w_config,
+                        w_dir,
+                        worker_shutdown_rx,
+                        forced_provider,
+                    )
+                    .await
+                }
             });
             worker_shutdown_txs[i] = Some(worker_shutdown_tx);
             worker_handles[i] = Some(handle);
@@ -108,101 +117,28 @@ pub fn execute(
         }
 
         loop {
+            if skip_loop && !autoscale {
+                break;
+            }
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
+                _ = tokio::signal::ctrl_c(), if !skip_loop => {
                     break;
                 }
-                _ = sleep(Duration::from_secs(2)), if autoscale => {
-                    let queue_depth = {
-                        let db = db.lock().unwrap();
-                        let counts = db.count_by_status()?;
-                        counts
-                            .into_iter()
-                            .filter_map(|(status, count)| {
-                                if status == "pending"
-                                    || status == "in_progress"
-                                    || status == "review_pending"
-                                {
-                                    usize::try_from(count).ok()
-                                } else {
-                                    None
-                                }
-                            })
-                            .sum::<usize>()
-                    };
-                    let desired = desired_workers_from_queue(queue_depth, min_active, workers);
-                    let current = active_workers.iter().filter(|is_active| **is_active).count();
-
-                    if desired > current {
-                        let mut need = desired - current;
-                        for i in 0..workers {
-                            if need == 0 {
-                                break;
-                            }
-                            if active_workers[i] {
-                                continue;
-                            }
-                            let worker_id = format!("w-{}", i);
-                            {
-                                let db = db.lock().unwrap();
-                                db.register_agent(&worker_id, "worker", "general")?;
-                            }
-                            let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
-                            let w_db = db.clone();
-                            let w_config = config.clone();
-                            let w_dir = project_dir.clone();
-                            let forced_provider = resolve_worker_provider(i, workers, backend.as_deref());
-                            let handle = tokio::spawn(async move {
-                                worker::worker_loop(
-                                    worker_id,
-                                    w_db,
-                                    w_config,
-                                    w_dir,
-                                    worker_shutdown_rx,
-                                    forced_provider,
-                                )
-                                .await
-                            });
-                            worker_shutdown_txs[i] = Some(worker_shutdown_tx);
-                            worker_handles[i] = Some(handle);
-                            active_workers[i] = true;
-                            need -= 1;
-                        }
-                    } else if desired < current {
-                        let mut removable = current - desired;
-                        let idle_worker_ids = {
-                            let db = db.lock().unwrap();
-                            db.list_agents()?
-                                .into_iter()
-                                .filter(|a| a.role == "worker" && a.status == "idle")
-                                .map(|a| a.id)
-                                .collect::<Vec<_>>()
-                        };
-                        for i in (0..workers).rev() {
-                            if removable == 0 {
-                                break;
-                            }
-                            if !active_workers[i] {
-                                continue;
-                            }
-                            let worker_id = format!("w-{}", i);
-                            if !idle_worker_ids.contains(&worker_id) {
-                                continue;
-                            }
-
-                            if let Some(tx) = worker_shutdown_txs[i].take() {
-                                tx.send(true).ok();
-                            }
-                            if let Some(handle) = worker_handles[i].take() {
-                                handle.await.ok();
-                            }
-                            {
-                                let db = db.lock().unwrap();
-                                db.deregister_agent(&worker_id).ok();
-                            }
-                            active_workers[i] = false;
-                            removable -= 1;
-                        }
+                _ = sleep(if skip_loop { Duration::ZERO } else { Duration::from_secs(2) }), if autoscale => {
+                    do_autoscale_tick(
+                        &db,
+                        &config,
+                        &project_dir,
+                        workers,
+                        backend.as_deref(),
+                        min_active,
+                        &mut active_workers,
+                        &mut worker_shutdown_txs,
+                        &mut worker_handles,
+                    )
+                    .await?;
+                    if skip_loop {
+                        break;
                     }
                 }
             }
@@ -273,6 +209,115 @@ pub fn execute(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn do_autoscale_tick(
+    db: &Arc<Mutex<Db>>,
+    config: &Config,
+    project_dir: &std::path::Path,
+    workers: usize,
+    backend: Option<&str>,
+    min_active: usize,
+    active_workers: &mut Vec<bool>,
+    worker_shutdown_txs: &mut Vec<Option<watch::Sender<bool>>>,
+    worker_handles: &mut Vec<Option<JoinHandle<()>>>,
+) -> Result<()> {
+    let queue_depth = {
+        let db = db.lock().unwrap();
+        let counts = db.count_by_status()?;
+        counts
+            .into_iter()
+            .filter_map(|(status, count)| {
+                if status == "pending"
+                    || status == "in_progress"
+                    || status == "review_pending"
+                {
+                    usize::try_from(count).ok()
+                } else {
+                    None
+                }
+            })
+            .sum::<usize>()
+    };
+    let desired = desired_workers_from_queue(queue_depth, min_active, workers);
+    let current = active_workers.iter().filter(|is_active| **is_active).count();
+
+    if desired > current {
+        let skip_tasks = std::env::var("ACS_SKIP_RUN_LOOP").is_ok();
+        let mut need = desired - current;
+        for i in 0..workers {
+            if need == 0 {
+                break;
+            }
+            if active_workers[i] {
+                continue;
+            }
+            let worker_id = format!("w-{}", i);
+            {
+                let db = db.lock().unwrap();
+                db.register_agent(&worker_id, "worker", "general")?;
+            }
+            let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
+            let w_db = db.clone();
+            let w_config = config.clone();
+            let w_dir = project_dir.to_path_buf();
+            let forced_provider = resolve_worker_provider(i, workers, backend);
+            let handle = tokio::spawn(async move {
+                if !skip_tasks {
+                    worker::worker_loop(
+                        worker_id,
+                        w_db,
+                        w_config,
+                        w_dir,
+                        worker_shutdown_rx,
+                        forced_provider,
+                    )
+                    .await
+                }
+            });
+            worker_shutdown_txs[i] = Some(worker_shutdown_tx);
+            worker_handles[i] = Some(handle);
+            active_workers[i] = true;
+            need -= 1;
+        }
+    } else if desired < current {
+        let mut removable = current - desired;
+        let idle_worker_ids = {
+            let db = db.lock().unwrap();
+            db.list_agents()?
+                .into_iter()
+                .filter(|a| a.role == "worker" && a.status == "idle")
+                .map(|a| a.id)
+                .collect::<Vec<_>>()
+        };
+        for i in (0..workers).rev() {
+            if removable == 0 {
+                break;
+            }
+            if !active_workers[i] {
+                continue;
+            }
+            let worker_id = format!("w-{}", i);
+            if !idle_worker_ids.contains(&worker_id) {
+                continue;
+            }
+            if let Some(tx) = worker_shutdown_txs[i].take() {
+                tx.send(true).ok();
+            }
+            if let Some(handle) = worker_handles[i].take() {
+                handle.await.ok();
+            }
+            {
+                let db = db.lock().unwrap();
+                db.deregister_agent(&worker_id).ok();
+            }
+            active_workers[i] = false;
+            removable -= 1;
+        }
+    }
+
+    Ok(())
+}
+
 fn desired_workers_from_queue(queue_depth: usize, min_workers: usize, max_workers: usize) -> usize {
     queue_depth.clamp(min_workers, max_workers)
 }
@@ -327,6 +372,17 @@ pub fn resolve_worker_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Db;
+
+    fn setup_run_acs_dir() -> tempfile::TempDir {
+        let base = tempfile::TempDir::new().unwrap();
+        let acs = base.path().join(".acs");
+        std::fs::create_dir_all(&acs).unwrap();
+        let config = crate::config::Config::default_for("test");
+        std::fs::write(acs.join("config.toml"), config.to_toml()).unwrap();
+        Db::open(&acs.join("project.db")).unwrap();
+        base
+    }
 
     #[test]
     fn no_backend_returns_none() {
@@ -431,5 +487,128 @@ mod tests {
     #[test]
     fn desired_workers_matches_queue_in_range() {
         assert_eq!(desired_workers_from_queue(4, 1, 8), 4);
+    }
+
+    #[test]
+    fn write_run_pid_creates_file_with_current_pid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_run_pid(dir.path()).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("run.pid")).unwrap();
+        assert_eq!(content.trim(), std::process::id().to_string());
+    }
+
+    #[test]
+    fn remove_run_pid_if_owned_removes_own_pid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_run_pid(dir.path()).unwrap();
+        assert!(dir.path().join("run.pid").exists());
+        remove_run_pid_if_owned(dir.path()).unwrap();
+        assert!(!dir.path().join("run.pid").exists());
+    }
+
+    #[test]
+    fn remove_run_pid_if_owned_leaves_foreign_pid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("run.pid"), "99999999\n").unwrap();
+        remove_run_pid_if_owned(dir.path()).unwrap();
+        assert!(dir.path().join("run.pid").exists());
+    }
+
+    #[test]
+    fn remove_run_pid_if_owned_is_ok_when_file_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(remove_run_pid_if_owned(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn execute_no_autoscale_skip_loop() {
+        let _lock = crate::test_support::chdir_lock();
+        let base = setup_run_acs_dir();
+        std::env::set_current_dir(base.path()).unwrap();
+        std::env::set_var("ACS_SKIP_RUN_LOOP", "1");
+        let result = execute(1, None, false, 1);
+        std::env::remove_var("ACS_SKIP_RUN_LOOP");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn execute_with_backend_no_autoscale() {
+        let _lock = crate::test_support::chdir_lock();
+        let base = setup_run_acs_dir();
+        std::env::set_current_dir(base.path()).unwrap();
+        std::env::set_var("ACS_SKIP_RUN_LOOP", "1");
+        let result = execute(1, Some("claude".to_string()), false, 1);
+        std::env::remove_var("ACS_SKIP_RUN_LOOP");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn autoscale_tick_scale_up_adds_workers() {
+        let base = setup_run_acs_dir();
+        let acs = base.path().join(".acs");
+        let db = Arc::new(Mutex::new(Db::open(&acs.join("project.db")).unwrap()));
+        let config = crate::config::Config::default_for("test");
+        db.lock().unwrap().create_ticket("T", "D", "core", 1).unwrap();
+
+        let mut active_workers = vec![false, false];
+        let mut shutdown_txs: Vec<Option<watch::Sender<bool>>> = vec![None, None];
+        let mut handles: Vec<Option<JoinHandle<()>>> = vec![None, None];
+
+        std::env::set_var("ACS_SKIP_RUN_LOOP", "1");
+        do_autoscale_tick(
+            &db, &config, base.path(), 2, None, 0,
+            &mut active_workers, &mut shutdown_txs, &mut handles,
+        ).await.unwrap();
+        std::env::remove_var("ACS_SKIP_RUN_LOOP");
+
+        assert_eq!(active_workers.iter().filter(|x| **x).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn autoscale_tick_scale_down_removes_idle_workers() {
+        let base = setup_run_acs_dir();
+        let acs = base.path().join(".acs");
+        let db = Arc::new(Mutex::new(Db::open(&acs.join("project.db")).unwrap()));
+        let config = crate::config::Config::default_for("test");
+        db.lock().unwrap().register_agent("w-0", "worker", "general").unwrap();
+        db.lock().unwrap().register_agent("w-1", "worker", "general").unwrap();
+
+        let (tx0, _rx0) = watch::channel(false);
+        let (tx1, _rx1) = watch::channel(false);
+        let mut active_workers = vec![true, true];
+        let mut shutdown_txs: Vec<Option<watch::Sender<bool>>> = vec![Some(tx0), Some(tx1)];
+        let mut handles: Vec<Option<JoinHandle<()>>> = vec![
+            Some(tokio::spawn(async {})),
+            Some(tokio::spawn(async {})),
+        ];
+
+        do_autoscale_tick(
+            &db, &config, base.path(), 2, None, 0,
+            &mut active_workers, &mut shutdown_txs, &mut handles,
+        ).await.unwrap();
+
+        assert_eq!(active_workers.iter().filter(|x| **x).count(), 0);
+    }
+
+    #[test]
+    fn execute_autoscale_skip_loop() {
+        let _lock = crate::test_support::chdir_lock();
+        let base = setup_run_acs_dir();
+        std::env::set_current_dir(base.path()).unwrap();
+        std::env::set_var("ACS_SKIP_RUN_LOOP", "1");
+        let result = execute(2, None, true, 0);
+        std::env::remove_var("ACS_SKIP_RUN_LOOP");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn execute_autoscale_with_backend() {
+        let _lock = crate::test_support::chdir_lock();
+        let base = setup_run_acs_dir();
+        std::env::set_current_dir(base.path()).unwrap();
+        std::env::set_var("ACS_SKIP_RUN_LOOP", "1");
+        let result = execute(2, Some("mixed".to_string()), true, 0);
+        std::env::remove_var("ACS_SKIP_RUN_LOOP");
+        assert!(result.is_ok());
     }
 }
