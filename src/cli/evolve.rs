@@ -28,7 +28,7 @@ pub fn execute(
     let cwd = std::env::current_dir()?;
     execute_with_dir(
         &cwd,
-        workers,
+        workers.unwrap_or(0),
         max_iterations,
         plan_each_iteration,
         bootstrap_after_run,
@@ -64,7 +64,7 @@ fn execute_with_dir(
     let mut config = Config::load(&acs_dir.join("config.toml"))?;
 
     // Apply named profile: --profile flag > ACS_PROFILE env > default "dev" (if defined).
-    if let Some(name) = crate::cli::run::resolve_profile_name(profile.as_deref()) {
+    if let Some(name) = crate::cli::run::resolve_profile_name(std::env::var("ACS_PROFILE").ok().as_deref()) {
         config.apply_profile(&name)?;
     } else if config.profile.contains_key("dev") {
         config.apply_profile("dev").ok();
@@ -74,7 +74,7 @@ fn execute_with_dir(
     config.apply_anthropic_model_env();
 
     // --workers overrides the profile/config default.
-    let workers = workers.unwrap_or(config.project.default_workers);
+    let workers = if workers == 0 { config.project.default_workers } else { workers };
     let db = Arc::new(Mutex::new(Db::open(&acs_dir.join("project.db"))?));
 
     if dry_run {

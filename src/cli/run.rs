@@ -28,7 +28,7 @@ pub fn execute(
     profile: Option<String>,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    execute_with_dir(&cwd, workers, backend, autoscale, min_workers)
+    execute_with_dir(&cwd, workers.unwrap_or(0), backend, autoscale, min_workers, profile)
 }
 
 fn execute_with_dir(
@@ -37,6 +37,7 @@ fn execute_with_dir(
     backend: Option<String>,
     autoscale: bool,
     min_workers: usize,
+    profile: Option<String>,
 ) -> Result<()> {
     let acs_dir = crate::cli::acs_dir::resolve_acs_dir(cwd)?;
     let project_dir = acs_dir
@@ -57,7 +58,7 @@ fn execute_with_dir(
     config.apply_anthropic_model_env();
 
     // --workers overrides the profile/config default.
-    let workers = workers.unwrap_or(config.project.default_workers);
+    let workers = if workers == 0 { config.project.default_workers } else { workers };
     let db = Arc::new(Mutex::new(Db::open(&acs_dir.join("project.db"))?));
     write_run_pid(&acs_dir)?;
 
@@ -113,7 +114,7 @@ fn execute_with_dir(
             let w_dir = project_dir.clone();
             let forced_provider = Some(provider_for_backend(backend_name));
             let handle = tokio::spawn(async move {
-                if !skip_loop_w {
+                if !skip_loop {
                     worker::worker_loop(
                         worker_id,
                         w_db,

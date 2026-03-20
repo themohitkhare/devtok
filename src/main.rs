@@ -43,7 +43,7 @@ fn main() -> ExitCode {
             preserve_agents,
             dry_run,
             backend,
-            profile,
+            auto_merge,
         } => cli::evolve::execute(
             workers,
             max_iterations,
@@ -54,7 +54,7 @@ fn main() -> ExitCode {
             preserve_agents,
             dry_run,
             backend,
-            profile,
+            auto_merge,
         ),
         cli::Commands::Cleanup => cli::cleanup::execute(),
         cli::Commands::Restart {
@@ -81,6 +81,7 @@ fn main() -> ExitCode {
         cli::Commands::Standup { json, post_github } => {
             cli::standup::execute(json, post_github)
         }
+        cli::Commands::Doctor { fix } => cli::doctor::execute(fix),
     };
 
     match result {
