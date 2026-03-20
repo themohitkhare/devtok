@@ -1,6 +1,7 @@
 pub mod acs_dir;
 pub mod approve;
 pub mod check;
+pub mod doctor;
 pub mod cleanup;
 pub mod cost;
 pub mod evolve;
@@ -12,6 +13,7 @@ pub mod kb;
 pub mod log;
 pub mod milestone;
 pub mod plan;
+pub mod provider;
 pub mod quality;
 pub mod reject;
 pub mod report;
@@ -178,6 +180,9 @@ pub enum Commands {
     /// Quality scoring and North Star metrics
     #[command(subcommand)]
     Quality(quality::QualityCommands),
+    /// Manage provider registry (list, enable, blacklist)
+    #[command(subcommand)]
+    Provider(provider::ProviderCommands),
     /// Generate a daily standup summary (completed, in-progress, blocked, metrics)
     Standup {
         /// Output machine-readable JSON instead of human text
@@ -186,5 +191,11 @@ pub enum Commands {
         /// Post the standup as a GitHub issue comment (requires gh CLI)
         #[arg(long)]
         post_github: bool,
+    },
+    /// Validate the environment and auto-fix common issues
+    Doctor {
+        /// Apply automatic fixes (read-only by default)
+        #[arg(long)]
+        fix: bool,
     },
 }

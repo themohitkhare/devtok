@@ -624,7 +624,7 @@ mod tests {
     fn execute_no_autoscale_completes_successfully() {
         let tmp = TempDir::new().unwrap();
         make_test_project(tmp.path());
-        execute_with_dir(tmp.path(), 1, None, false, 1).unwrap();
+        execute_with_dir(tmp.path(), 1, None, false, 1, None).unwrap();
         // PID file should be cleaned up on exit.
         assert!(!tmp.path().join(".acs").join("run.pid").exists());
     }
@@ -633,21 +633,21 @@ mod tests {
     fn execute_autoscale_without_backend_completes_successfully() {
         let tmp = TempDir::new().unwrap();
         make_test_project(tmp.path());
-        execute_with_dir(tmp.path(), 2, None, true, 1).unwrap();
+        execute_with_dir(tmp.path(), 2, None, true, 1, None).unwrap();
     }
 
     #[test]
     fn execute_with_backend_no_autoscale_completes_successfully() {
         let tmp = TempDir::new().unwrap();
         make_test_project(tmp.path());
-        execute_with_dir(tmp.path(), 1, Some("claude".to_string()), false, 1).unwrap();
+        execute_with_dir(tmp.path(), 1, Some("claude".to_string()), false, 1, None).unwrap();
     }
 
     #[test]
     fn execute_autoscale_with_backend_completes_successfully() {
         let tmp = TempDir::new().unwrap();
         make_test_project(tmp.path());
-        execute_with_dir(tmp.path(), 2, Some("mixed".to_string()), true, 1).unwrap();
+        execute_with_dir(tmp.path(), 2, Some("mixed".to_string()), true, 1, None).unwrap();
     }
 
     // -----------------------------------------------------------------------

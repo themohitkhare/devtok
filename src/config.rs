@@ -178,7 +178,13 @@ impl BackendsConfig {
 
 impl Default for BackendsConfig {
     fn default() -> Self {
-        Self { default: "claude".into(), definitions: HashMap::new(), routing: HashMap::new(), failover_order: vec!["claude".into(), "cursor".into(), "codex".into()] }
+        Self {
+            default: "claude".into(),
+            definitions: HashMap::new(),
+            routing: HashMap::new(),
+            failover_order: vec![],
+            quota_errors: HashMap::new(),
+        }
     }
 }
 
@@ -211,9 +217,41 @@ impl<'de> serde::Deserialize<'de> for BackendsConfig {
             })
             .unwrap_or_default();
 
+        // Extract provider failover order (t-090).
+        let failover_order: Vec<String> = raw
+            .get("failover_order")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Extract per-provider quota-error strings (t-090).
+        let quota_errors: HashMap<String, Vec<String>> = raw
+            .get("quota_errors")
+            .and_then(|v| v.as_table())
+            .map(|t| {
+                t.iter()
+                    .map(|(k, v)| {
+                        let errors = v
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (k.clone(), errors)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut definitions = HashMap::new();
         for (k, v) in &raw {
-            if k == "default" || k == "routing" {
+            if k == "default" || k == "routing" || k == "failover_order" || k == "quota_errors" {
                 continue;
             }
             // Each backend value must be a TOML table
@@ -224,7 +262,7 @@ impl<'de> serde::Deserialize<'de> for BackendsConfig {
             definitions.insert(k.clone(), bt);
         }
 
-        Ok(BackendsConfig { default, definitions, routing, failover_order: vec!["claude".into(), "cursor".into(), "codex".into()] })
+        Ok(BackendsConfig { default, definitions, routing, failover_order, quota_errors })
     }
 }
 

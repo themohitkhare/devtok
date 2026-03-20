@@ -2666,6 +2666,7 @@ mod tests {
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
+        let expected_backoffs: &[(i32, u64)] = &[(0, 30), (1, 60), (2, 120), (3, 240)];
         for &(current_strikes, expected_secs) in expected_backoffs {
             let before = chrono::Utc::now();
             {
