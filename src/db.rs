@@ -75,7 +75,8 @@ impl Db {
                 status TEXT NOT NULL DEFAULT 'idle',
                 current_ticket TEXT,
                 pid INTEGER,
-                last_heartbeat TEXT
+                last_heartbeat TEXT,
+                backend TEXT NOT NULL DEFAULT 'claude'
             );
             CREATE TABLE IF NOT EXISTS inbox (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -172,6 +173,11 @@ impl Db {
             // skipped due to file overlap. Used for force-assign liveness guarantee (v4).
             let _ = self.conn.execute_batch(
                 "ALTER TABLE tickets ADD COLUMN defer_count INTEGER NOT NULL DEFAULT 0;",
+            );
+            // v3: backend column for agents — restored after being dropped from migrations.
+            // INSERT OR IGNORE so existing rows keep their value; new rows get 'claude'.
+            let _ = self.conn.execute_batch(
+                "ALTER TABLE agents ADD COLUMN backend TEXT NOT NULL DEFAULT 'claude';",
             );
         }
 
@@ -411,7 +417,7 @@ impl Db {
         let tx = self.conn.unchecked_transaction()?;
         let ticket: Option<Ticket> = tx.query_row(
             "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2, rate_limit_retry_after = NULL, defer_count = 0
-             WHERE id = ?3 AND status = 'pending' AND assignee IS NULL
+             WHERE id = ?3 AND status = 'pending'
                AND (rate_limit_retry_after IS NULL OR rate_limit_retry_after <= ?2)
              RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at, COALESCE(defer_count, 0)",
             params![agent_id, now, ticket_id],
