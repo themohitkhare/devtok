@@ -69,7 +69,7 @@ fn test_merge_branch_success() {
     run_git(p, &["checkout", "main"]);
 
     let s = spawner(p);
-    let result = s.merge_branch("acs/t-002-1234").unwrap();
+    let result = s.merge_branch("acs/t-002-1234", "main").unwrap();
     assert!(result, "merge should succeed");
 
     // Verify the file exists on main now
@@ -94,7 +94,7 @@ fn test_merge_branch_conflict() {
     run_git(p, &["commit", "-m", "main change"]);
 
     let s = spawner(p);
-    let result = s.merge_branch("acs/t-003-5678").unwrap();
+    let result = s.merge_branch("acs/t-003-5678", "main").unwrap();
     assert!(!result, "merge should fail due to conflict");
 
     // Verify main is still clean (merge was aborted)

@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::manager;
 use crate::prompts;
-use crate::spawner::Spawner;
+use crate::spawner::{self, Spawner};
 use crate::worker;
 
 #[allow(clippy::too_many_arguments)]
@@ -97,6 +97,10 @@ fn execute_with_dir(
             eprintln!("[evolve] iteration {}/{}", iter + 1, max_iterations);
             let milestone_num = iter + 1;
 
+            // Ensure the main working directory is on the base branch before each iteration.
+            // Worker worktrees are under .acs/worktrees/ and must never affect cwd.
+            restore_base_branch(&project_dir, &config.project.base_branch);
+
             // Optional planning step.
             if plan_each_iteration {
                 run_architect_planning(&spawner, &project_dir, &tool_path)?;
@@ -124,6 +128,10 @@ fn execute_with_dir(
                 backend.clone(),
             )
             .await?;
+
+            // Restore base branch after each bounded run — cleanup/merge operations inside
+            // run_bounded_workers may leave the project dir on a worker branch.
+            restore_base_branch(&project_dir, &config.project.base_branch);
 
             // Generate milestone report after each bounded run.
             {
@@ -164,10 +172,36 @@ fn execute_with_dir(
         // Best-effort cleanup at the end of evolution run.
         let cleanup_db = db.lock().unwrap();
         let _ = crate::cli::cleanup::run_cleanup(&project_dir, &cleanup_db);
+
+        // Final restoration: ensure the user's cwd is left on the base branch.
+        restore_base_branch(&project_dir, &config.project.base_branch);
+
         Ok::<(), anyhow::Error>(())
     })?;
 
     Ok(())
+}
+
+/// Checks that `project_dir` is on `base_branch`, logs a warning if not, and
+/// runs `git checkout <base_branch>` to restore it.  Errors are non-fatal —
+/// logged as warnings so evolve can still continue.
+fn restore_base_branch(project_dir: &std::path::Path, base_branch: &str) {
+    // Check current branch and emit a warning if we have drifted.
+    if let Some(current) = spawner::current_branch(project_dir) {
+        if current != base_branch {
+            eprintln!(
+                "[evolve] warning: project dir is on branch '{}', expected '{}'; restoring base branch",
+                current, base_branch
+            );
+        }
+    }
+
+    if let Err(e) = spawner::checkout_base_branch(project_dir, base_branch) {
+        eprintln!(
+            "[evolve] warning: could not restore base branch '{}': {}",
+            base_branch, e
+        );
+    }
 }
 
 fn run_architect_planning(
