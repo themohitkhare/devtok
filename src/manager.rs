@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
+use std::process::Command;
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
 
@@ -66,6 +67,141 @@ fn parse_rfc3339_to_utc(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+const CI_CHECK_AFTER_MERGE_ENV: &str = "CI_CHECK_AFTER_MERGE";
+const CI_REGRESSION_TICKET_DOMAIN: &str = "core";
+const CI_REGRESSION_TICKET_PRIORITY_P1: i32 = 1;
+const CI_REGRESSION_FAILURE_SUMMARY_MAX_CHARS: usize = 500;
+
+struct CargoTestOutcome {
+    ok: bool,
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+fn make_ci_failure_summary(outcome: &CargoTestOutcome) -> String {
+    // Prefer stderr if present; CI logs often route failure info there.
+    let failure_body = if !outcome.stderr.trim().is_empty() {
+        outcome.stderr.as_str()
+    } else {
+        outcome.stdout.as_str()
+    };
+
+    // Keep the summary stable/deterministic: exit code prefix + single-line failure body.
+    let body_one_line = failure_body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let prefix = format!("cargo test failed (exit code {})", outcome.exit_code);
+    let combined = if body_one_line.is_empty() {
+        prefix
+    } else {
+        format!("{}: {}", prefix, body_one_line)
+    };
+
+    truncate_chars(&combined, CI_REGRESSION_FAILURE_SUMMARY_MAX_CHARS)
+}
+
+fn record_ci_regression(db: &Db, branch: &str, failure_summary: &str) -> Result<String> {
+    let failure_summary = truncate_chars(failure_summary, CI_REGRESSION_FAILURE_SUMMARY_MAX_CHARS);
+
+    let title = format!(
+        "Fix CI regression after merging {}: {}",
+        branch, failure_summary
+    );
+    let desc = failure_summary;
+
+    let ticket_id = db.create_ticket(
+        &title,
+        &desc,
+        CI_REGRESSION_TICKET_DOMAIN,
+        CI_REGRESSION_TICKET_PRIORITY_P1,
+    )?;
+
+    db.log_event(
+        Some("mgr"),
+        "ci_regression",
+        &format!(
+            "ci_regression: created {} for merge of branch {} (summary truncated to {} chars)",
+            ticket_id, branch, CI_REGRESSION_FAILURE_SUMMARY_MAX_CHARS
+        ),
+        None,
+    )?;
+
+    Ok(ticket_id)
+}
+
+fn run_cargo_test(project_dir: &std::path::Path) -> Result<CargoTestOutcome> {
+    let output = Command::new("cargo")
+        .args(["test"])
+        .current_dir(project_dir)
+        .output()?;
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    Ok(CargoTestOutcome {
+        ok: exit_code == 0,
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
+
+fn post_merge_ci_check(db: Arc<Mutex<Db>>, project_dir: std::path::PathBuf, branch: String) {
+    if std::env::var(CI_CHECK_AFTER_MERGE_ENV).ok().as_deref() != Some("1") {
+        return;
+    }
+
+    // Background task: CI feedback loop should not block merges.
+    tokio::spawn(async move {
+        let branch_for_error = branch.clone();
+
+        let cargo_outcome = tokio::task::spawn_blocking(move || run_cargo_test(&project_dir))
+            .await;
+
+        let cargo_outcome = match cargo_outcome {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(e)) => CargoTestOutcome {
+                ok: false,
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: e.to_string(),
+            },
+            Err(join_err) => CargoTestOutcome {
+                ok: false,
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: join_err.to_string(),
+            },
+        };
+
+        if cargo_outcome.ok {
+            return;
+        }
+
+        let failure_summary = make_ci_failure_summary(&cargo_outcome);
+
+        // Keep DB lock scope minimal: ticket + event are short transactions.
+        let ticket_res = {
+            let guard = db.lock().unwrap();
+            record_ci_regression(&guard, &branch_for_error, &failure_summary)
+        };
+
+        if let Err(e) = ticket_res {
+            eprintln!(
+                "[manager] post_merge_ci_check failed to record regression ticket: {}",
+                e
+            );
+        }
+    });
 }
 
 /// Builds a pre-loaded KB context string for tests.
@@ -494,6 +630,14 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                                             None,
                                         )?;
                                     }
+
+                                    // Best-effort self-healing CI loop for merge regressions.
+                                    // Runs in the background and is guarded by CI_CHECK_AFTER_MERGE=1.
+                                    post_merge_ci_check(
+                                        db.clone(),
+                                        project_dir.to_path_buf(),
+                                        branch.clone(),
+                                    );
                                     eprintln!(
                                         "[manager] merged branch {} for ticket {}",
                                         branch, ticket_id
@@ -1313,6 +1457,61 @@ mod tests {
         assert!(
             score.is_some(),
             "auto-review should persist a quality score for the completed ticket"
+        );
+    }
+
+    #[test]
+    fn ci_regression_records_p1_ticket_and_event_with_truncation() {
+        let (db, _config) = setup();
+        let branch = "acs/t-066-4hex";
+        let long_summary = "A".repeat(CI_REGRESSION_FAILURE_SUMMARY_MAX_CHARS + 200);
+
+        let ticket_id = {
+            let guard = db.lock().unwrap();
+            record_ci_regression(&guard, branch, &long_summary).unwrap()
+        };
+
+        let g = db.lock().unwrap();
+        let ticket = g.get_ticket(&ticket_id).unwrap().unwrap();
+        assert_eq!(ticket.domain, CI_REGRESSION_TICKET_DOMAIN);
+        assert_eq!(ticket.priority, CI_REGRESSION_TICKET_PRIORITY_P1);
+        assert_eq!(ticket.description.len(), CI_REGRESSION_FAILURE_SUMMARY_MAX_CHARS);
+        assert!(ticket.title.contains(branch));
+        assert!(ticket.title.contains(&ticket.description));
+
+        let events = g.recent_events(10).unwrap();
+        let regression_event = events
+            .iter()
+            .find(|e| e.event_type == "ci_regression");
+        assert!(
+            regression_event.is_some(),
+            "should log a ci_regression event"
+        );
+        assert!(
+            regression_event.unwrap().detail.contains(&ticket_id),
+            "ci_regression event should reference created ticket id"
+        );
+    }
+
+    #[test]
+    fn ci_failure_summary_is_single_line_and_mentions_exit_code() {
+        let outcome = CargoTestOutcome {
+            ok: false,
+            exit_code: 42,
+            stdout: "stdout line 1\nstdout\tline 2".to_string(),
+            stderr: "stderr line 1\nstderr\tline 2".to_string(),
+        };
+
+        let summary = make_ci_failure_summary(&outcome);
+        assert!(!summary.contains('\n'), "summary should collapse newlines");
+        assert!(!summary.contains('\t'), "summary should collapse tabs");
+        assert!(
+            summary.contains("exit code 42"),
+            "summary should include exit code context"
+        );
+        assert!(
+            summary.len() <= CI_REGRESSION_FAILURE_SUMMARY_MAX_CHARS,
+            "summary should be truncated to max chars"
         );
     }
 
