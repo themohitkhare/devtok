@@ -78,10 +78,7 @@ fn main() -> ExitCode {
         cli::Commands::Approve => cli::approve::execute(),
         cli::Commands::Reject { reason } => cli::reject::execute(reason),
         cli::Commands::Quality(cmd) => cli::quality::execute(cmd),
-        cli::Commands::Provider(cmd) => cli::provider::execute(cmd),
-        cli::Commands::Standup { json, post_github } => {
-            cli::standup::execute(json, post_github)
-        }
+        cli::Commands::Update(args) => cli::update::execute(args),
         cli::Commands::Doctor { fix } => cli::doctor::execute(fix),
     };
 

@@ -180,18 +180,8 @@ pub enum Commands {
     /// Quality scoring and North Star metrics
     #[command(subcommand)]
     Quality(quality::QualityCommands),
-    /// Manage provider registry (list, enable, blacklist)
-    #[command(subcommand)]
-    Provider(provider::ProviderCommands),
-    /// Generate a daily standup summary (completed, in-progress, blocked, metrics)
-    Standup {
-        /// Output machine-readable JSON instead of human text
-        #[arg(long)]
-        json: bool,
-        /// Post the standup as a GitHub issue comment (requires gh CLI)
-        #[arg(long)]
-        post_github: bool,
-    },
+    /// Check for and install the latest ACS release from GitHub Releases
+    Update(update::UpdateArgs),
     /// Validate the environment and auto-fix common issues
     Doctor {
         /// Apply automatic fixes (read-only by default)
