@@ -36,27 +36,48 @@ The existing "Recent Events" row is split horizontally 50/50:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+## Signature Changes
+
+`status_live::run` gains an `acs_dir: &Path` parameter (the `.acs/` directory):
+
+```rust
+pub fn run(db: &Db, acs_dir: &Path) -> Result<()>
+```
+
+`AppState` stores the path so `load` can derive the log directory:
+
+```rust
+struct AppState {
+    // existing fields ...
+    acs_dir: PathBuf,
+    agent_log_lines: Vec<(String, String)>, // (worker_id, line)
+}
+```
+
+The call site in `src/cli/status.rs` already resolves `acs_dir` — it simply passes it through to `run`. The existing smoke tests that construct `AppState` directly must populate `acs_dir` with a temp directory.
+
 ## Data Loading
 
 ### Log file location
 
 `.acs/logs/<worker_id>.log` — one file per worker, written by `Spawner::spawn_provider`.
 
+### Constants
+
+```rust
+const AGENT_LOG_TAIL_LINES: usize = 10; // separate from LOG_TAIL_LINES used for DB events
+```
+
+Both constants start at 10 but are independent and may diverge.
+
 ### Loading logic (in `AppState::load`)
 
 1. Filter `agents` to those with `status == "working"`.
 2. For each active worker, read the tail of its log file:
-   - Use `std::fs::read_to_string` and split on newlines.
-   - Take the last `tail_lines_per_worker` lines where `tail_lines_per_worker = max(1, PANEL_HEIGHT / active_worker_count)`.
-   - Skip silently if the file does not exist or cannot be read.
-3. Flatten into `Vec<(worker_id: String, line: String)>`, preserving per-worker order.
-4. Cap the total to `LOG_TAIL_LINES` (currently 10, may need increasing for this panel).
-
-### AppState field
-
-```rust
-agent_log_lines: Vec<(String, String)>, // (worker_id, line)
-```
+   - Use `std::fs::read` + `String::from_utf8_lossy` to handle any invalid UTF-8 bytes in subprocess output without silently dropping the file.
+   - Split on newlines and take the last `AGENT_LOG_TAIL_LINES / max(1, active_count)` lines (minimum 1), using a fixed constant — not a runtime panel height, which is unavailable at load time.
+   - Skip silently if the file does not exist or cannot be read (e.g. worker just started).
+3. Flatten into `Vec<(worker_id: String, line: String)>`, preserving per-worker order, and cap the total to `AGENT_LOG_TAIL_LINES`.
 
 ## Rendering
 
@@ -77,7 +98,7 @@ The `[w-N]` prefix is rendered in the worker's color; the log line content is pl
 
 ### Empty state
 
-When no workers are active, the panel shows:
+When no workers are active (or no log lines were read), the panel shows:
 
 ```
 No active workers
@@ -87,28 +108,32 @@ in `DarkGray`.
 
 ### Long lines
 
-Lines wider than the panel are truncated with no wrapping (consistent with the existing events panel behavior).
+Lines wider than the panel are truncated without wrapping, consistent with the existing events panel.
 
-## Code changes
+## Code Changes
 
-All changes are in `src/cli/status_live.rs`:
+All changes are in `src/cli/status_live.rs` and the single call site in `src/cli/status.rs`:
 
-| Change | Details |
+| Location | Change |
 |---|---|
-| `AppState` struct | Add `agent_log_lines: Vec<(String, String)>` |
-| `AppState::load` | Read log files for active workers, populate `agent_log_lines` |
-| `draw_body` | Split the events row into two columns (50/50); call `draw_log` on left and new `draw_agent_logs` on right |
-| `draw_agent_logs` (new fn) | Render `agent_log_lines` as a `List` with colored worker-ID prefixes |
-| Tests | Add smoke test with populated `agent_log_lines`; add unit test for the load logic with a temp log file |
+| `src/cli/status.rs` | Pass `&acs_dir` to `status_live::run` |
+| `AppState` struct | Add `acs_dir: PathBuf` and `agent_log_lines: Vec<(String, String)>` |
+| `AppState::load` | Accept `acs_dir: &Path`; read log files for active workers; populate `agent_log_lines` |
+| `draw_body` | Introduce a horizontal 50/50 split of `body[1]`; render existing `draw_log` (Recent Events) in `split[0]`; render new `draw_agent_logs` in `split[1]` |
+| `draw_agent_logs` (new fn) | Render `agent_log_lines` as a `List` with colored `[w-N]` prefixes and a `" Agent Logs "` block title |
+| Tests | Update existing smoke tests to supply `acs_dir`; add new unit tests described below |
 
 ## Testing
 
-- **Smoke test** (`status_live_draw_smoke_populated`): extend existing test to include `agent_log_lines` with sample data; assert the draw call completes without panic.
-- **Unit test** (`agent_log_lines_loads_from_file`): create a temp dir with a fake `.acs/logs/w-0.log`, register `w-0` as working, call `AppState::load`, assert `agent_log_lines` contains the expected lines prefixed with `"w-0"`.
-- **Empty state test**: no active workers → `agent_log_lines` is empty.
+- **Smoke test (empty state)** — extend `status_live_draw_smoke_empty_state` to pass a temp `acs_dir`; assert draw completes without panic.
+- **Smoke test (populated)** — extend `status_live_draw_smoke_populated` to write a fake `.acs/logs/w-0.log`, include it in `agent_log_lines`, and assert draw completes.
+- **Unit test: log loading** — create a `tempfile::TempDir` with `.acs/logs/w-0.log` containing known lines; register `w-0` as working; call `AppState::load(db, tmp.path().join(".acs"))` ; assert `agent_log_lines` contains the expected `("w-0", line)` pairs.
+- **Unit test: empty when no active workers** — no workers with `status == "working"`; assert `agent_log_lines` is empty.
+- **Unit test: missing log file is skipped** — worker is `working` but log file does not exist; assert `agent_log_lines` is empty, no panic.
 
-## Non-goals
+## Non-Goals
 
-- No scrolling/keyboard navigation within the log panel (static tail view only).
+- No scrolling or keyboard navigation within the log panel (static tail only).
 - No filtering by worker.
-- No log parsing or colorization of log content (raw lines only).
+- No parsing or syntax-highlighting of log content (raw lines only).
+- **Large log files:** the implementation reads the entire file into memory before taking the tail. For workers that have been running for hours, files may be large. This is acceptable for the initial implementation; a seek-from-end optimisation is a future improvement.
