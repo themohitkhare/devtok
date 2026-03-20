@@ -53,6 +53,7 @@ fn test_agent_serialize_deserialize_roundtrip() {
         current_ticket: None,
         pid: Some(12345),
         last_heartbeat: Some("2025-01-01T00:00:00Z".into()),
+        backend: "claude".into(),
     };
     let json = serde_json::to_string(&agent).unwrap();
     let deserialized: Agent = serde_json::from_str(&json).unwrap();

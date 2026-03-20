@@ -167,6 +167,13 @@ impl Db {
             );
         }
 
+        if current_version < 3 {
+            // v3: add backend column to agents (defaults to 'claude' for existing rows).
+            let _ = self.conn.execute_batch(
+                "ALTER TABLE agents ADD COLUMN backend TEXT NOT NULL DEFAULT 'claude';",
+            );
+        }
+
         self.conn.execute(
             "UPDATE schema_meta SET schema_version = ?1, updated_at = ?2 WHERE id = 1",
             params![Self::CURRENT_SCHEMA_VERSION, now],
@@ -669,8 +676,23 @@ impl Db {
 
     pub fn register_agent(&self, id: &str, role: &str, persona: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO agents (id, role, persona, status) VALUES (?1, ?2, ?3, 'idle')",
+            "INSERT OR REPLACE INTO agents (id, role, persona, status, backend) VALUES (?1, ?2, ?3, 'idle', 'claude')",
             params![id, role, persona],
+        )?;
+        Ok(())
+    }
+
+    /// Register an agent with an explicit backend label (e.g. "claude", "cursor", "codex").
+    pub fn register_agent_with_backend(
+        &self,
+        id: &str,
+        role: &str,
+        persona: &str,
+        backend: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO agents (id, role, persona, status, backend) VALUES (?1, ?2, ?3, 'idle', ?4)",
+            params![id, role, persona, backend],
         )?;
         Ok(())
     }
@@ -692,7 +714,7 @@ impl Db {
 
     pub fn list_agents(&self) -> Result<Vec<Agent>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, persona, status, current_ticket, pid, last_heartbeat FROM agents",
+            "SELECT id, role, persona, status, current_ticket, pid, last_heartbeat, backend FROM agents",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Agent {
@@ -703,6 +725,7 @@ impl Db {
                 current_ticket: row.get(4)?,
                 pid: row.get(5)?,
                 last_heartbeat: row.get(6)?,
+                backend: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "claude".to_string()),
             })
         })?;
         rows.map(|r| r.map_err(Into::into)).collect()
@@ -1230,5 +1253,41 @@ mod tests {
     fn schema_version_is_current() {
         let db = Db::open_memory().unwrap();
         assert_eq!(db.schema_version().unwrap(), Db::CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn register_agent_with_backend_stores_backend() {
+        let db = Db::open_memory().unwrap();
+        db.register_agent_with_backend("w-0", "worker", "general", "claude").unwrap();
+        let agents = db.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].backend, "claude");
+    }
+
+    #[test]
+    fn register_agent_with_backend_cursor_stores_cursor() {
+        let db = Db::open_memory().unwrap();
+        db.register_agent_with_backend("w-1", "worker", "general", "cursor").unwrap();
+        let agents = db.list_agents().unwrap();
+        assert_eq!(agents[0].backend, "cursor");
+    }
+
+    #[test]
+    fn register_agent_legacy_defaults_to_claude() {
+        let db = Db::open_memory().unwrap();
+        db.register_agent("w-0", "worker", "general").unwrap();
+        let agents = db.list_agents().unwrap();
+        assert_eq!(agents[0].backend, "claude");
+    }
+
+    #[test]
+    fn list_agents_returns_backend_per_agent() {
+        let db = Db::open_memory().unwrap();
+        db.register_agent_with_backend("w-0", "worker", "general", "claude").unwrap();
+        db.register_agent_with_backend("w-1", "worker", "general", "cursor").unwrap();
+        let agents = db.list_agents().unwrap();
+        let backends: Vec<&str> = agents.iter().map(|a| a.backend.as_str()).collect();
+        assert!(backends.contains(&"claude"));
+        assert!(backends.contains(&"cursor"));
     }
 }
