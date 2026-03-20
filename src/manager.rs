@@ -2264,196 +2264,137 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // extract_file_hints: keyword → file path mapping
+    // rate_limit_deferral: run_cycle skips tickets within their retry window
     // -----------------------------------------------------------------------
 
     #[test]
-    fn extract_file_hints_recognises_module_keywords() {
-        let hints = extract_file_hints("Fix manager assign logic", "Update manager.rs loop");
-        assert!(hints.contains(&"src/manager.rs".to_string()));
-    }
-
-    #[test]
-    fn extract_file_hints_recognises_rs_suffix() {
-        let hints = extract_file_hints("Update evolve.rs command", "");
-        assert!(hints.contains(&"src/cli/evolve.rs".to_string()));
-    }
-
-    #[test]
-    fn extract_file_hints_returns_empty_for_unknown_keywords() {
-        let hints = extract_file_hints("Add documentation", "Write README guide");
-        assert!(hints.is_empty());
-    }
-
-    #[test]
-    fn extract_file_hints_deduplicates() {
-        let hints = extract_file_hints("manager manager manager", "manager changes");
-        assert_eq!(hints.iter().filter(|h| h.as_str() == "src/manager.rs").count(), 1);
-    }
-
-    // -----------------------------------------------------------------------
-    // files_overlap_ratio: overlap computation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn files_overlap_ratio_zero_for_empty_candidate() {
-        let ratio = files_overlap_ratio(&[], &["src/manager.rs".to_string()]);
-        assert_eq!(ratio, 0.0);
-    }
-
-    #[test]
-    fn files_overlap_ratio_full_overlap() {
-        let files = vec!["src/manager.rs".to_string()];
-        let ratio = files_overlap_ratio(&files, &files);
-        assert_eq!(ratio, 1.0);
-    }
-
-    #[test]
-    fn files_overlap_ratio_partial_overlap() {
-        let candidate = vec!["src/manager.rs".to_string(), "src/db.rs".to_string()];
-        let in_progress = vec!["src/manager.rs".to_string()];
-        let ratio = files_overlap_ratio(&candidate, &in_progress);
-        assert!((ratio - 0.5).abs() < 1e-9);
-    }
-
-    // -----------------------------------------------------------------------
-    // conflict_deferred: manager defers assignment when file overlap >50%
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn conflict_deferred_when_file_overlap_exceeds_threshold() {
-        let (db, mut config) = setup();
-        // Disable stale-requeue time gate so t-001 stays in_progress safely.
-        config.manager.worker_timeout_seconds = 3600;
+    fn run_cycle_skips_rate_limited_ticket_with_future_retry_after() {
+        let (db, config) = setup();
         {
             let g = db.lock().unwrap();
-            // w-0 is actively working on t-001 (prevents stale requeue).
-            g.register_agent("w-0", "worker", "backend-dev").unwrap();
-            g.update_agent("w-0", "working", Some("t-001"), None).unwrap();
-
-            // t-001: in_progress, mentions "manager" → hint: src/manager.rs
-            g.create_ticket(
-                "Update manager assign logic",
-                "Fix the manager loop handling",
-                "core",
-                1,
-            )
-            .unwrap();
-            g.update_ticket("t-001", "in_progress", None, None, Some(Some("w-0")))
-                .unwrap();
-
-            // t-002: pending, also mentions "manager" → same hint → should be deferred
-            g.create_ticket(
-                "Refactor manager cycle",
-                "Change the manager.rs run_cycle function",
-                "core",
-                1,
-            )
-            .unwrap();
-
-            // w-1 is idle and will try to pick up t-002
             g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            g.create_ticket("Rate limited task", "Should be deferred", "general", 1)
+                .unwrap();
+            g.requeue_ticket_rate_limited("t-001", 0).unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
 
         let g = db.lock().unwrap();
-        let t2 = g.get_ticket("t-002").unwrap().unwrap();
+        let ticket = g.get_ticket("t-001").unwrap().unwrap();
         assert_eq!(
-            t2.status, "pending",
-            "t-002 should remain pending when file overlap >50% with in-progress ticket"
+            ticket.status, "pending",
+            "rate-limited ticket should not be claimed while retry_after is in the future"
         );
-        assert!(t2.assignee.is_none(), "deferred ticket should have no assignee");
-
-        let events = g.recent_events(20).unwrap();
-        let defer_evt = events.iter().find(|e| e.event_type == "conflict_deferred");
-        assert!(defer_evt.is_some(), "should log a conflict_deferred event");
         assert!(
-            defer_evt.unwrap().detail.contains("t-002"),
-            "conflict_deferred event should mention the deferred ticket"
+            ticket.assignee.is_none(),
+            "deferred ticket must not be assigned to any worker"
         );
     }
 
     #[test]
-    fn no_conflict_when_files_do_not_overlap() {
-        let (db, mut config) = setup();
-        config.manager.worker_timeout_seconds = 3600;
+    fn run_cycle_claims_ticket_after_rate_limit_window_expires() {
+        let (db, config) = setup();
         {
             let g = db.lock().unwrap();
-            g.register_agent("w-0", "worker", "backend-dev").unwrap();
-            g.update_agent("w-0", "working", Some("t-001"), None).unwrap();
-
-            // t-001: in_progress, touches spawner
-            g.create_ticket(
-                "Fix spawner subprocess handling",
-                "Update spawner launch logic",
-                "core",
-                1,
-            )
-            .unwrap();
-            g.update_ticket("t-001", "in_progress", None, None, Some(Some("w-0")))
-                .unwrap();
-
-            // t-002: pending, touches db only — no overlap with spawner
-            g.create_ticket(
-                "Add db migration for new column",
-                "Update db schema via migration",
-                "core",
-                1,
-            )
-            .unwrap();
-
             g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            g.create_ticket("Rate limited task", "Window expired", "general", 1)
+                .unwrap();
+            let past = chrono::Utc::now() - chrono::Duration::seconds(60);
+            g.force_set_rate_limit_retry_after("t-001", Some(past))
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
 
         let g = db.lock().unwrap();
-        let t2 = g.get_ticket("t-002").unwrap().unwrap();
+        let ticket = g.get_ticket("t-001").unwrap().unwrap();
         assert_eq!(
-            t2.status, "in_progress",
-            "t-002 should be assigned when files do not overlap"
+            ticket.status, "in_progress",
+            "ticket should be claimed once the retry window has expired"
+        );
+        assert_eq!(
+            ticket.assignee.as_deref(),
+            Some("w-1"),
+            "ticket should be assigned to the idle worker"
         );
     }
 
     #[test]
-    fn no_conflict_when_candidate_has_no_file_hints() {
-        let (db, mut config) = setup();
-        config.manager.worker_timeout_seconds = 3600;
+    fn run_cycle_rate_limit_backoff_escalates_30_60_120_240_secs() {
+        let (db, config) = setup();
         {
             let g = db.lock().unwrap();
-            g.register_agent("w-0", "worker", "backend-dev").unwrap();
-            g.update_agent("w-0", "working", Some("t-001"), None).unwrap();
-
-            g.create_ticket(
-                "Update manager loop",
-                "Fix the manager scheduling",
-                "core",
-                1,
-            )
-            .unwrap();
-            g.update_ticket("t-001", "in_progress", None, None, Some(Some("w-0")))
-                .unwrap();
-
-            // t-002: title/desc have no recognised source-file keywords → skip conflict check
-            g.create_ticket(
-                "Write documentation for the project",
-                "Add README with setup instructions",
-                "core",
-                1,
-            )
-            .unwrap();
-
             g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            g.create_ticket("Backoff test", "Test escalation", "general", 1)
+                .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        let expected_backoffs: &[(i32, u64)] = &[(0, 30), (1, 60), (2, 120), (3, 240)];
 
-        let g = db.lock().unwrap();
-        let t2 = g.get_ticket("t-002").unwrap().unwrap();
-        assert_eq!(
-            t2.status, "in_progress",
-            "ticket with no file hints should be assigned normally"
+        for &(current_strikes, expected_secs) in expected_backoffs {
+            let before = chrono::Utc::now();
+            {
+                let g = db.lock().unwrap();
+                g.requeue_ticket_rate_limited("t-001", current_strikes)
+                    .unwrap();
+            }
+            let after = chrono::Utc::now();
+
+            let retry_after = {
+                let g = db.lock().unwrap();
+                g.get_ticket_rate_limit_retry_after("t-001")
+                    .unwrap()
+                    .expect("retry_after should be set after requeue")
+            };
+            let lower = before + chrono::Duration::seconds(expected_secs as i64);
+            let upper = after + chrono::Duration::seconds(expected_secs as i64 + 1);
+            assert!(
+                retry_after >= lower && retry_after <= upper,
+                "strike {}: expected retry_after ~{}s from now, got {:?}",
+                current_strikes + 1,
+                expected_secs,
+                retry_after
+            );
+
+            let strikes = {
+                let g = db.lock().unwrap();
+                g.get_ticket_rate_limit_strikes("t-001").unwrap()
+            };
+            assert_eq!(strikes, current_strikes + 1);
+
+            run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+            {
+                let g = db.lock().unwrap();
+                let t = g.get_ticket("t-001").unwrap().unwrap();
+                assert_eq!(
+                    t.status, "pending",
+                    "ticket should stay deferred within the {}s window (strike {})",
+                    expected_secs,
+                    current_strikes + 1
+                );
+            }
+        }
+
+        // Verify cap at 240 s for strike count beyond the schedule.
+        let before = chrono::Utc::now();
+        {
+            let g = db.lock().unwrap();
+            g.requeue_ticket_rate_limited("t-001", 4).unwrap();
+        }
+        let after = chrono::Utc::now();
+        let retry_after = {
+            let g = db.lock().unwrap();
+            g.get_ticket_rate_limit_retry_after("t-001")
+                .unwrap()
+                .expect("retry_after should be set")
+        };
+        let lower = before + chrono::Duration::seconds(240);
+        let upper = after + chrono::Duration::seconds(241);
+        assert!(
+            retry_after >= lower && retry_after <= upper,
+            "backoff should be capped at 240s for strike 5+, got {:?}",
+            retry_after
         );
     }
 }

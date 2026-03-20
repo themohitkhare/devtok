@@ -95,14 +95,21 @@ pub struct QualityScore {
 /// Throughput and health metrics computed over a rolling time window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThroughputMetrics {
+    /// Completed tickets in the last 60 minutes.
     pub tickets_per_hour: f64,
+    /// Average total tokens per completed ticket (all-time).
     pub avg_tokens_per_ticket: f64,
+    /// Ratio of merge-conflict events to completions in the last hour.
     pub merge_conflict_rate: f64,
+    /// Ratio of stale/timeout requeue events to completions in the last hour.
     pub timeout_rate: f64,
+    /// Number of tickets currently pending (not yet started).
     pub pending_count: i64,
 }
 
 impl ThroughputMetrics {
+    /// Estimated hours to clear the pending queue at current throughput.
+    /// Returns None if tickets_per_hour is 0.
     pub fn eta_hours(&self) -> Option<f64> {
         if self.tickets_per_hour > 0.0 {
             Some(self.pending_count as f64 / self.tickets_per_hour)

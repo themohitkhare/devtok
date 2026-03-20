@@ -5,6 +5,7 @@ pub mod manager;
 pub mod models;
 pub mod prompts;
 pub mod quality;
+pub mod release;
 pub mod spawner;
 pub mod worker;
 

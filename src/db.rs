@@ -172,6 +172,12 @@ impl Db {
             params![Self::CURRENT_SCHEMA_VERSION, now],
         )?;
 
+        // Additive migrations: rate-limit deferral columns for tickets.
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE tickets ADD COLUMN rate_limit_retry_after TEXT;
+             ALTER TABLE tickets ADD COLUMN rate_limit_strikes INTEGER NOT NULL DEFAULT 0;",
+        );
+
         Ok(())
     }
 
@@ -424,6 +430,26 @@ impl Db {
         ).optional()?;
         tx.commit()?;
         Ok(ticket)
+    }
+
+    /// Force-set the `rate_limit_retry_after` timestamp for a ticket (used in tests).
+    ///
+    /// Pass `None` to clear the field, or `Some(dt)` to set it to any arbitrary
+    /// timestamp — including one in the past — so tests can simulate an expired
+    /// retry window without sleeping.
+    #[cfg(test)]
+    pub fn force_set_rate_limit_retry_after(
+        &self,
+        id: &str,
+        retry_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let ts = retry_after.map(|dt| dt.to_rfc3339());
+        self.conn.execute(
+            "UPDATE tickets SET rate_limit_retry_after = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, ts, now],
+        )?;
+        Ok(())
     }
 
     pub fn count_by_status(&self) -> Result<Vec<(String, i64)>> {
@@ -1144,13 +1170,18 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// Compute rolling throughput metrics over the last 60 minutes.
     pub fn throughput_metrics(&self) -> Result<crate::models::ThroughputMetrics> {
         let one_hour_ago = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+
+        // Tickets completed in the last hour
         let tickets_per_hour: f64 = self.conn.query_row(
             "SELECT COUNT(*) FROM events WHERE event_type = 'ticket_completed' AND timestamp >= ?1",
             params![one_hour_ago],
             |row| row.get::<_, i64>(0),
         ).unwrap_or(0) as f64;
+
+        // Average tokens per completed ticket (all-time)
         let (total_tokens, completed_count): (i64, i64) = self.conn.query_row(
             "SELECT COALESCE(SUM(tokens_used), 0), COUNT(*) FROM events WHERE event_type = 'ticket_completed'",
             [],
@@ -1158,20 +1189,29 @@ impl Db {
         ).unwrap_or((0, 0));
         let avg_tokens_per_ticket = if completed_count > 0 {
             total_tokens as f64 / completed_count as f64
-        } else { 0.0 };
-        let completions_hour = tickets_per_hour.max(1.0);
+        } else {
+            0.0
+        };
+
+        // Merge conflict rate and timeout rate (last hour)
+        let completions_hour: f64 = tickets_per_hour.max(1.0);
         let conflicts: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM events WHERE event_type = 'merge_conflict_requeued' AND timestamp >= ?1",
-            params![one_hour_ago], |row| row.get(0),
+            params![one_hour_ago],
+            |row| row.get(0),
         ).unwrap_or(0);
         let timeouts: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM events WHERE event_type = 'ticket_requeued_stale_in_progress' AND timestamp >= ?1",
-            params![one_hour_ago], |row| row.get(0),
+            params![one_hour_ago],
+            |row| row.get(0),
         ).unwrap_or(0);
+
         let pending_count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tickets WHERE status = 'pending'",
-            [], |row| row.get(0),
+            [],
+            |row| row.get(0),
         ).unwrap_or(0);
+
         Ok(crate::models::ThroughputMetrics {
             tickets_per_hour,
             avg_tokens_per_ticket,
