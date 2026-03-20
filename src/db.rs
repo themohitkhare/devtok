@@ -1143,6 +1143,43 @@ impl Db {
             )
             .map_err(Into::into)
     }
+
+    pub fn throughput_metrics(&self) -> Result<crate::models::ThroughputMetrics> {
+        let one_hour_ago = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let tickets_per_hour: f64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'ticket_completed' AND timestamp >= ?1",
+            params![one_hour_ago],
+            |row| row.get::<_, i64>(0),
+        ).unwrap_or(0) as f64;
+        let (total_tokens, completed_count): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(tokens_used), 0), COUNT(*) FROM events WHERE event_type = 'ticket_completed'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap_or((0, 0));
+        let avg_tokens_per_ticket = if completed_count > 0 {
+            total_tokens as f64 / completed_count as f64
+        } else { 0.0 };
+        let completions_hour = tickets_per_hour.max(1.0);
+        let conflicts: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_conflict_requeued' AND timestamp >= ?1",
+            params![one_hour_ago], |row| row.get(0),
+        ).unwrap_or(0);
+        let timeouts: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'ticket_requeued_stale_in_progress' AND timestamp >= ?1",
+            params![one_hour_ago], |row| row.get(0),
+        ).unwrap_or(0);
+        let pending_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tickets WHERE status = 'pending'",
+            [], |row| row.get(0),
+        ).unwrap_or(0);
+        Ok(crate::models::ThroughputMetrics {
+            tickets_per_hour,
+            avg_tokens_per_ticket,
+            merge_conflict_rate: conflicts as f64 / completions_hour,
+            timeout_rate: timeouts as f64 / completions_hour,
+            pending_count,
+        })
+    }
 }
 
 #[cfg(test)]
