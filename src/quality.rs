@@ -32,7 +32,11 @@ pub fn compute_score(
 ) -> QualityScore {
     let score = (if tests_added { WEIGHT_TESTS } else { 0 })
         + (if docs_updated { WEIGHT_DOCS } else { 0 })
-        + (if acceptance_criteria_met { WEIGHT_CRITERIA } else { 0 });
+        + (if acceptance_criteria_met {
+            WEIGHT_CRITERIA
+        } else {
+            0
+        });
 
     QualityScore {
         ticket_id: ticket_id.to_string(),
@@ -42,6 +46,87 @@ pub fn compute_score(
         score,
         computed_at: Utc::now().to_rfc3339(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scoring reference resolution
+// ---------------------------------------------------------------------------
+
+/// A resolved reference that can be used to detect file changes for scoring.
+pub enum ScoringRef {
+    /// A live (local or remote-tracking) branch — diff via `git diff main...<branch>`.
+    Branch(String),
+    /// A merge commit on main — diff via `git diff <commit>^1...<commit>^2`.
+    MergeCommit(String),
+}
+
+/// Resolve where to find the diff for a ticket, searching in order:
+/// 1. Local branch matching `acs/<ticket>-*`
+/// 2. Remote-tracking ref matching `refs/remotes/*/acs/<ticket>-*` (origin/ preferred)
+/// 3. Newest eligible merge commit on main whose subject contains `acs/<ticket>-`
+pub fn resolve_scoring_ref(project_dir: &Path, ticket_id: &str) -> Option<ScoringRef> {
+    use std::process::Command;
+
+    let pattern = format!("acs/{}-", ticket_id);
+
+    // 1. Local branches
+    let local = Command::new("git")
+        .args(["branch", "--list", &format!("acs/{}*", ticket_id)])
+        .current_dir(project_dir)
+        .output()
+        .ok()?;
+    let local_text = String::from_utf8_lossy(&local.stdout);
+    if let Some(branch) = local_text
+        .lines()
+        .map(|l| l.trim().trim_start_matches('*').trim().to_string())
+        .find(|l| !l.is_empty())
+    {
+        return Some(ScoringRef::Branch(branch));
+    }
+
+    // 2. Remote-tracking refs — prefer origin/
+    let remote = Command::new("git")
+        .args(["branch", "--remotes", "--list", &format!("*/acs/{}*", ticket_id)])
+        .current_dir(project_dir)
+        .output()
+        .ok()?;
+    let remote_text = String::from_utf8_lossy(&remote.stdout);
+    let mut remotes: Vec<String> = remote_text
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    // Sort so origin/ comes first
+    remotes.sort_by(|a, b| {
+        let a_origin = a.starts_with("origin/");
+        let b_origin = b.starts_with("origin/");
+        b_origin.cmp(&a_origin)
+    });
+    if let Some(remote_ref) = remotes.into_iter().next() {
+        return Some(ScoringRef::Branch(remote_ref));
+    }
+
+    // 3. Merge commit fallback on main
+    let log = Command::new("git")
+        .args([
+            "log",
+            "main",
+            "--merges",
+            "--format=%H %s",
+            "--max-count=200",
+        ])
+        .current_dir(project_dir)
+        .output()
+        .ok()?;
+    let log_text = String::from_utf8_lossy(&log.stdout);
+    for line in log_text.lines() {
+        let parts: Vec<&str> = line.splitn(2, ' ').collect();
+        if parts.len() == 2 && parts[1].contains(&pattern) {
+            return Some(ScoringRef::MergeCommit(parts[0].to_string()));
+        }
+    }
+
+    None
 }
 
 /// Infer quality signals from a ticket's git branch diff (if available) and
@@ -65,9 +150,49 @@ pub fn score_ticket_from_branch(
 
     let acceptance_criteria_met = notes_contain_ac_verification(ticket_notes);
 
-    let score = compute_score(ticket_id, tests_added, docs_updated, acceptance_criteria_met);
+    let score = compute_score(
+        ticket_id,
+        tests_added,
+        docs_updated,
+        acceptance_criteria_met,
+    );
     db.upsert_quality_score(&score)?;
     Ok(score)
+}
+
+/// Detect file changes using a `ScoringRef` (branch or merge commit).
+pub fn detect_changes_from_scoring_ref(
+    project_dir: &Path,
+    scoring_ref: &ScoringRef,
+) -> (bool, bool) {
+    match scoring_ref {
+        ScoringRef::Branch(branch) => detect_changes_in_branch(project_dir, branch),
+        ScoringRef::MergeCommit(commit) => {
+            detect_changes_in_merge_commit(project_dir, commit)
+        }
+    }
+}
+
+/// Check the diff of a merge commit (parent1 to parent2) for test/doc file changes.
+fn detect_changes_in_merge_commit(project_dir: &Path, commit: &str) -> (bool, bool) {
+    use std::process::Command;
+
+    let output = Command::new("git")
+        .args([
+            "diff",
+            "--name-only",
+            &format!("{}^1", commit),
+            &format!("{}^2", commit),
+        ])
+        .current_dir(project_dir)
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return (false, false),
+    };
+
+    classify_changed_files(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Check the diff of a branch against `main` for test/doc file changes.
@@ -85,20 +210,29 @@ fn detect_changes_in_branch(project_dir: &Path, branch: &str) -> (bool, bool) {
         _ => return (false, false),
     };
 
-    let files = String::from_utf8_lossy(&output.stdout);
+    classify_changed_files(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Classify a newline-separated list of file paths into `(tests_added, docs_updated)`.
+fn classify_changed_files(files: &str) -> (bool, bool) {
     let mut tests_added = false;
     let mut docs_updated = false;
 
     for file in files.lines() {
         let f = file.trim().to_lowercase();
         // Test files: anything in a tests/ dir, *_test.rs, test_*.rs, *.test.*, spec files
-        if f.contains("/test") || f.starts_with("test") || f.ends_with("_test.rs")
-            || f.contains("spec") || f.contains("/tests/")
+        if f.contains("/test")
+            || f.starts_with("test")
+            || f.ends_with("_test.rs")
+            || f.contains("spec")
+            || f.contains("/tests/")
         {
             tests_added = true;
         }
         // Doc files: README*, *.md, docs/**
-        if f.ends_with(".md") || f.starts_with("readme") || f.starts_with("docs/")
+        if f.ends_with(".md")
+            || f.starts_with("readme")
+            || f.starts_with("docs/")
             || f.contains("/docs/")
         {
             docs_updated = true;
@@ -155,9 +289,9 @@ pub fn check_north_star(db: &Db, project_dir: &std::path::Path) -> Result<NorthS
         .collect();
 
     let all_tickets_done = incomplete.is_empty();
-    let no_pending_work = tickets.iter().all(|t| {
-        matches!(t.status.as_str(), "completed" | "cancelled" | "wont_fix")
-    });
+    let no_pending_work = tickets
+        .iter()
+        .all(|t| matches!(t.status.as_str(), "completed" | "cancelled" | "wont_fix"));
 
     let readme_updated = check_readme(project_dir);
     let (no_todos, todo_locations) = check_no_todos(project_dir);
@@ -253,7 +387,10 @@ pub fn format_north_star_report(status: &NorthStarStatus) -> String {
             out.push_str(&format!("- `{}`\n", loc));
         }
         if status.todo_locations.len() > 20 {
-            out.push_str(&format!("- _...and {} more_\n", status.todo_locations.len() - 20));
+            out.push_str(&format!(
+                "- _...and {} more_\n",
+                status.todo_locations.len() - 20
+            ));
         }
         out.push('\n');
     }
@@ -269,7 +406,8 @@ pub fn format_north_star_report(status: &NorthStarStatus) -> String {
 
 pub fn format_quality_scores_table(scores: &[QualityScore]) -> String {
     if scores.is_empty() {
-        return "_No quality scores computed yet. Run `acs quality score --all` to compute._\n".to_string();
+        return "_No quality scores computed yet. Run `acs quality score --all` to compute._\n"
+            .to_string();
     }
 
     let mut out = String::new();
@@ -291,7 +429,11 @@ pub fn format_quality_scores_table(scores: &[QualityScore]) -> String {
     }
 
     let total = scores.len() as i32;
-    let avg = if total > 0 { scores.iter().map(|s| s.score).sum::<i32>() / total } else { 0 };
+    let avg = if total > 0 {
+        scores.iter().map(|s| s.score).sum::<i32>() / total
+    } else {
+        0
+    };
     out.push_str(&format!("\n**Average quality score:** {}%\n", avg));
     out
 }
@@ -335,9 +477,13 @@ mod tests {
 
     #[test]
     fn notes_ac_verification_positive_cases() {
-        assert!(notes_contain_ac_verification("AC verified — all tests pass"));
+        assert!(notes_contain_ac_verification(
+            "AC verified — all tests pass"
+        ));
         assert!(notes_contain_ac_verification("Acceptance criteria met"));
-        assert!(notes_contain_ac_verification("acceptance criteria verified"));
+        assert!(notes_contain_ac_verification(
+            "acceptance criteria verified"
+        ));
         assert!(notes_contain_ac_verification("Criteria verified OK"));
         assert!(notes_contain_ac_verification("AC: verified after review"));
         assert!(notes_contain_ac_verification("[x] AC checklist done"));
@@ -357,7 +503,8 @@ mod tests {
     fn north_star_all_complete() {
         let db = Db::open_memory().unwrap();
         let t1 = db.create_ticket("T1", "desc", "backend", 1).unwrap();
-        db.update_ticket(&t1, "completed", None, None, None).unwrap();
+        db.update_ticket(&t1, "completed", None, None, None)
+            .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         // Write a README
@@ -382,11 +529,17 @@ mod tests {
         // Leave t1 as pending
 
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("README.md"), "# Test readme with enough content to pass the 100 byte threshold\n").unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            "# Test readme with enough content to pass the 100 byte threshold\n",
+        )
+        .unwrap();
 
         let status = check_north_star(&db, dir.path()).unwrap();
         assert!(!status.all_tickets_done);
-        assert!(status.incomplete_tickets.contains(&format!("{} [pending]", t1)));
+        assert!(status
+            .incomplete_tickets
+            .contains(&format!("{} [pending]", t1)));
         assert!(!status.is_complete);
     }
 
@@ -476,6 +629,28 @@ mod tests {
         let report = format_north_star_report(&status);
         assert!(report.contains("COMPLETE"));
         assert!(report.contains("North Star Metrics"));
+    }
+
+    #[test]
+    fn resolve_scoring_ref_returns_none_for_unknown_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        // Minimal git repo so the function can run git commands
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .ok();
+        let result = resolve_scoring_ref(dir.path(), "t-nonexistent-zzz");
+        assert!(result.is_none(), "should return None when no branch or merge commit exists");
+    }
+
+    #[test]
+    fn resolve_scoring_ref_finds_local_branch() {
+        // Use the actual repo; if acs/* branches exist for any ticket we can detect them.
+        // We'll just confirm the function runs without panic.
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // This may return Some or None depending on current branches — just no panic.
+        let _ = resolve_scoring_ref(&cwd, "t-001");
     }
 
     #[test]

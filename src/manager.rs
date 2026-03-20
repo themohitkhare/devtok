@@ -1,14 +1,16 @@
-use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use serde_json::json;
+use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
 
 use crate::config::Config;
 use crate::db::Db;
 use crate::models::*;
-use crate::prompts;
-use crate::quality::score_ticket_from_branch;
+use crate::quality::{
+    compute_score, detect_changes_from_scoring_ref, notes_contain_ac_verification,
+    resolve_scoring_ref, score_ticket_from_branch,
+};
 use crate::spawner::Spawner;
 
 /// Builds a structured pre-loaded list of KB entries for a worker's ticket assignment.
@@ -44,7 +46,8 @@ fn format_kb_context(entries: &[crate::models::KnowledgeEntry]) -> String {
         .join("\n\n")
 }
 
-/// Builds a pre-loaded KB context string for a worker's ticket assignment.
+/// Builds a pre-loaded KB context string for tests.
+#[cfg(test)]
 fn build_kb_context(db: &Db, domain: &str) -> String {
     let entries = build_kb_context_entries(db, domain);
     format_kb_context(&entries)
@@ -133,7 +136,10 @@ fn select_provider_for_ticket(
 }
 
 fn pick_model_from_offers(models: &[String], tier_idx: usize) -> Option<String> {
-    models.get(tier_idx).cloned().or_else(|| models.last().cloned())
+    models
+        .get(tier_idx)
+        .cloned()
+        .or_else(|| models.last().cloned())
 }
 
 fn select_model_for_provider(
@@ -147,17 +153,6 @@ fn select_model_for_provider(
         "codex" => pick_model_from_offers(&agents.codex_models, tier),
         "agent" => pick_model_from_offers(&agents.agent_models, tier),
         _ => None,
-    }
-}
-
-fn get_diff_for_branch(branch: &str, project_dir: &std::path::Path) -> String {
-    let output = std::process::Command::new("git")
-        .args(["diff", "main...", branch])
-        .current_dir(project_dir)
-        .output();
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
-        _ => String::new(),
     }
 }
 
@@ -179,7 +174,21 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
         };
 
         for ticket in review_tickets {
-            // Auto-review path
+            // Auto-review path — score before marking completed so the quality record is persisted.
+            let scoring_ref = resolve_scoring_ref(project_dir, &ticket.id);
+            let (tests_added, docs_updated) = match &scoring_ref {
+                Some(r) => detect_changes_from_scoring_ref(project_dir, r),
+                None => (false, false),
+            };
+            let ac_met = notes_contain_ac_verification(&ticket.notes);
+            let score = compute_score(&ticket.id, tests_added, docs_updated, ac_met);
+            {
+                let guard = db.lock().unwrap();
+                if let Err(e) = guard.upsert_quality_score(&score) {
+                    eprintln!("[manager] quality scoring failed for ticket {}: {}", ticket.id, e);
+                }
+            }
+
             let guard = db.lock().unwrap();
             guard.update_ticket(
                 &ticket.id,
@@ -238,17 +247,14 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 );
 
                 let guard = db.lock().unwrap();
-                guard.update_ticket(
-                    &ticket.id,
-                    "pending",
-                    Some(&note),
-                    None,
-                    Some(None),
-                )?;
+                guard.update_ticket(&ticket.id, "pending", Some(&note), None, Some(None))?;
                 guard.log_event(
                     Some(assignee_id),
                     "ticket_requeued_stale_in_progress",
-                    &format!("ticket {} re-queued; assignee working on different ticket", ticket.id),
+                    &format!(
+                        "ticket {} re-queued; assignee working on different ticket",
+                        ticket.id
+                    ),
                     None,
                 )?;
                 eprintln!("[manager] re-queued stale ticket {} -> pending", ticket.id);
@@ -264,10 +270,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
         let agents = guard.list_agents()?;
         drop(guard);
 
-        let idle_workers: Vec<Agent> = agents
-            .into_iter()
-            .filter(|a| a.status == "idle")
-            .collect();
+        let idle_workers: Vec<Agent> = agents.into_iter().filter(|a| a.status == "idle").collect();
 
         for worker in idle_workers {
             let ticket_opt = {
@@ -343,36 +346,46 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 // Newer workers also include: { "tests_passed": bool }.
                 let (ticket_id, tests_passed, work_type, model) =
                     match serde_json::from_str::<serde_json::Value>(&msg.payload) {
-                    Ok(v) => {
-                        let tid = v.get("ticket_id")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| msg.payload.trim().to_string());
-                        let ok = v.get("tests_passed")
-                            .and_then(|b| b.as_bool())
-                            .unwrap_or(true);
-                        let wt = v.get("work_type")
-                            .or_else(|| v.get("provider"))
-                            .and_then(|w| w.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let model = v.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
-                        (tid, ok, wt, model)
-                    }
-                    Err(_) => (
-                        msg.payload.trim().to_string(),
-                        true,
-                        "unknown".to_string(),
-                        None,
-                    ),
-                };
+                        Ok(v) => {
+                            let tid = v
+                                .get("ticket_id")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| msg.payload.trim().to_string());
+                            let ok = v
+                                .get("tests_passed")
+                                .and_then(|b| b.as_bool())
+                                .unwrap_or(true);
+                            let wt = v
+                                .get("work_type")
+                                .or_else(|| v.get("provider"))
+                                .and_then(|w| w.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let model = v
+                                .get("model")
+                                .and_then(|m| m.as_str())
+                                .map(|s| s.to_string());
+                            (tid, ok, wt, model)
+                        }
+                        Err(_) => (
+                            msg.payload.trim().to_string(),
+                            true,
+                            "unknown".to_string(),
+                            None,
+                        ),
+                    };
 
                 let via = match model {
                     Some(m) => format!("{}:{}", work_type, m),
                     None => work_type,
                 };
 
-                let spawner = Spawner::new(project_dir, &config.agents.claude_path, &config.agents.tool_path);
+                let spawner = Spawner::new(
+                    project_dir,
+                    &config.agents.claude_path,
+                    &config.agents.tool_path,
+                );
 
                 if tests_passed {
                     let ticket_notes = {
@@ -408,7 +421,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                             if let Err(e) = {
                                 let guard = db.lock().unwrap();
                                 score_ticket_from_branch(
-                                    &*guard,
+                                    &guard,
                                     project_dir,
                                     &ticket_id,
                                     Some(&branch),
@@ -430,7 +443,10 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                                         guard.log_event(
                                             Some("mgr"),
                                             "branch_merged",
-                                            &format!("merged {} into main for ticket {}", branch, ticket_id),
+                                            &format!(
+                                                "merged {} into main for ticket {}",
+                                                branch, ticket_id
+                                            ),
                                             None,
                                         )?;
                                     }
@@ -468,7 +484,10 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                                     );
                                 }
                                 Err(e) => {
-                                    eprintln!("[manager] merge error for ticket {}: {}", ticket_id, e);
+                                    eprintln!(
+                                        "[manager] merge error for ticket {}: {}",
+                                        ticket_id, e
+                                    );
                                     let guard = db.lock().unwrap();
                                     guard.log_event(
                                         Some("mgr"),
@@ -507,10 +526,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                         guard.log_event(
                             Some(&msg.sender),
                             "ticket_tests_failed",
-                            &format!(
-                                "ticket {} tests failed via {}; re-queued",
-                                ticket_id, via
-                            ),
+                            &format!("ticket {} tests failed via {}; re-queued", ticket_id, via),
                             None,
                         )?;
                     }
@@ -546,7 +562,8 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
             if let Some(ref blocker_id) = ticket.blocked_by {
                 let blocker_done = {
                     let guard = db.lock().unwrap();
-                    guard.get_ticket(blocker_id)?
+                    guard
+                        .get_ticket(blocker_id)?
                         .map(|t| t.status == "completed")
                         .unwrap_or(false)
                 };
@@ -559,7 +576,10 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                         guard.log_event(
                             Some("mgr"),
                             "ticket_unblocked",
-                            &format!("ticket {} unblocked (blocker {} completed)", ticket.id, blocker_id),
+                            &format!(
+                                "ticket {} unblocked (blocker {} completed)",
+                                ticket.id, blocker_id
+                            ),
                             None,
                         )?;
                     }
@@ -684,7 +704,8 @@ mod tests {
         {
             let g = db.lock().unwrap();
             g.register_agent("w-1", "worker", "backend-dev").unwrap();
-            g.update_agent("w-1", "busy", Some("t-existing"), None).unwrap();
+            g.update_agent("w-1", "busy", Some("t-existing"), None)
+                .unwrap();
             g.create_ticket("Task A", "Do A", "general", 1).unwrap();
         }
 
@@ -692,7 +713,10 @@ mod tests {
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
-        assert_eq!(ticket.status, "pending", "ticket should remain pending when no idle workers");
+        assert_eq!(
+            ticket.status, "pending",
+            "ticket should remain pending when no idle workers"
+        );
         assert!(ticket.assignee.is_none());
     }
 
@@ -703,8 +727,10 @@ mod tests {
             let g = db.lock().unwrap();
             g.register_agent("w-1", "worker", "backend-dev").unwrap();
             // Lower priority number = higher priority; create low-priority first
-            g.create_ticket("Low priority", "LP", "general", 10).unwrap();
-            g.create_ticket("High priority", "HP", "general", 1).unwrap();
+            g.create_ticket("Low priority", "LP", "general", 10)
+                .unwrap();
+            g.create_ticket("High priority", "HP", "general", 1)
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
@@ -767,9 +793,11 @@ mod tests {
         {
             let g = db.lock().unwrap();
             let tid = g.create_ticket("Task A", "Do A", "general", 1).unwrap();
-            g.update_ticket(&tid, "in_progress", None, None, None).unwrap();
+            g.update_ticket(&tid, "in_progress", None, None, None)
+                .unwrap();
             // Worker sends completion to manager inbox
-            g.push_inbox("mgr", "ticket_completed", r#"{"ticket_id":"t-001"}"#, "w-1").unwrap();
+            g.push_inbox("mgr", "ticket_completed", r#"{"ticket_id":"t-001"}"#, "w-1")
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
@@ -785,7 +813,8 @@ mod tests {
         {
             let g = db.lock().unwrap();
             let tid = g.create_ticket("Task A", "Do A", "general", 1).unwrap();
-            g.update_ticket(&tid, "in_progress", None, None, None).unwrap();
+            g.update_ticket(&tid, "in_progress", None, None, None)
+                .unwrap();
 
             g.push_inbox(
                 "mgr",
@@ -809,8 +838,10 @@ mod tests {
         {
             let g = db.lock().unwrap();
             let tid = g.create_ticket("Task A", "Do A", "general", 1).unwrap();
-            g.update_ticket(&tid, "in_progress", None, None, None).unwrap();
-            g.push_inbox("mgr", "completion", r#"{"ticket_id":"t-001"}"#, "w-1").unwrap();
+            g.update_ticket(&tid, "in_progress", None, None, None)
+                .unwrap();
+            g.push_inbox("mgr", "completion", r#"{"ticket_id":"t-001"}"#, "w-1")
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
@@ -826,15 +857,20 @@ mod tests {
         {
             let g = db.lock().unwrap();
             let tid = g.create_ticket("Task A", "Do A", "general", 1).unwrap();
-            g.update_ticket(&tid, "in_progress", None, None, None).unwrap();
-            g.push_inbox("mgr", "random_noise", r#"{"ticket_id":"t-001"}"#, "w-1").unwrap();
+            g.update_ticket(&tid, "in_progress", None, None, None)
+                .unwrap();
+            g.push_inbox("mgr", "random_noise", r#"{"ticket_id":"t-001"}"#, "w-1")
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
-        assert_eq!(ticket.status, "in_progress", "unknown msg_type should not change ticket status");
+        assert_eq!(
+            ticket.status, "in_progress",
+            "unknown msg_type should not change ticket status"
+        );
     }
 
     #[test]
@@ -844,10 +880,14 @@ mod tests {
             let g = db.lock().unwrap();
             g.create_ticket("Task A", "Do A", "general", 1).unwrap();
             g.create_ticket("Task B", "Do B", "general", 1).unwrap();
-            g.update_ticket("t-001", "in_progress", None, None, None).unwrap();
-            g.update_ticket("t-002", "in_progress", None, None, None).unwrap();
-            g.push_inbox("mgr", "ticket_completed", r#"{"ticket_id":"t-001"}"#, "w-1").unwrap();
-            g.push_inbox("mgr", "ticket_completed", r#"{"ticket_id":"t-002"}"#, "w-2").unwrap();
+            g.update_ticket("t-001", "in_progress", None, None, None)
+                .unwrap();
+            g.update_ticket("t-002", "in_progress", None, None, None)
+                .unwrap();
+            g.push_inbox("mgr", "ticket_completed", r#"{"ticket_id":"t-001"}"#, "w-1")
+                .unwrap();
+            g.push_inbox("mgr", "ticket_completed", r#"{"ticket_id":"t-002"}"#, "w-2")
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
@@ -986,17 +1026,24 @@ mod tests {
         let (db, config) = setup();
         {
             let g = db.lock().unwrap();
-            g.create_ticket("Blocker", "Blocking ticket", "general", 1).unwrap();
-            g.create_ticket("Blocked", "Depends on blocker", "general", 1).unwrap();
-            g.update_ticket("t-001", "completed", None, None, None).unwrap();
-            g.update_ticket("t-002", "blocked", None, Some("t-001"), None).unwrap();
+            g.create_ticket("Blocker", "Blocking ticket", "general", 1)
+                .unwrap();
+            g.create_ticket("Blocked", "Depends on blocker", "general", 1)
+                .unwrap();
+            g.update_ticket("t-001", "completed", None, None, None)
+                .unwrap();
+            g.update_ticket("t-002", "blocked", None, Some("t-001"), None)
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-002").unwrap().unwrap();
-        assert_eq!(ticket.status, "pending", "blocked ticket should be reset to pending");
+        assert_eq!(
+            ticket.status, "pending",
+            "blocked ticket should be reset to pending"
+        );
         // blocked_by should be cleared
         assert!(
             ticket.blocked_by.is_none() || ticket.blocked_by.as_deref() == Some(""),
@@ -1009,10 +1056,14 @@ mod tests {
         let (db, config) = setup();
         {
             let g = db.lock().unwrap();
-            g.create_ticket("Blocker", "Still in progress", "general", 1).unwrap();
-            g.create_ticket("Blocked", "Depends on blocker", "general", 1).unwrap();
-            g.update_ticket("t-001", "in_progress", None, None, None).unwrap();
-            g.update_ticket("t-002", "blocked", None, Some("t-001"), None).unwrap();
+            g.create_ticket("Blocker", "Still in progress", "general", 1)
+                .unwrap();
+            g.create_ticket("Blocked", "Depends on blocker", "general", 1)
+                .unwrap();
+            g.update_ticket("t-001", "in_progress", None, None, None)
+                .unwrap();
+            g.update_ticket("t-002", "blocked", None, Some("t-001"), None)
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
@@ -1027,15 +1078,20 @@ mod tests {
         let (db, config) = setup();
         {
             let g = db.lock().unwrap();
-            g.create_ticket("Blocked", "Depends on nonexistent", "general", 1).unwrap();
-            g.update_ticket("t-001", "blocked", None, Some("t-999"), None).unwrap();
+            g.create_ticket("Blocked", "Depends on nonexistent", "general", 1)
+                .unwrap();
+            g.update_ticket("t-001", "blocked", None, Some("t-999"), None)
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
-        assert_eq!(ticket.status, "blocked", "should stay blocked if blocker doesn't exist");
+        assert_eq!(
+            ticket.status, "blocked",
+            "should stay blocked if blocker doesn't exist"
+        );
     }
 
     #[test]
@@ -1046,7 +1102,8 @@ mod tests {
             g.register_agent("w-0", "worker", "backend-dev").unwrap();
 
             // Agent is working on t-001.
-            g.update_agent("w-0", "working", Some("t-001"), None).unwrap();
+            g.update_agent("w-0", "working", Some("t-001"), None)
+                .unwrap();
 
             // Two tickets are in_progress and both assigned to w-0:
             // - t-001 matches current_ticket and should remain in_progress.
@@ -1080,7 +1137,8 @@ mod tests {
         {
             let g = db.lock().unwrap();
             g.create_ticket("Task A", "Do A", "general", 1).unwrap();
-            g.update_ticket("t-001", "review_pending", None, None, None).unwrap();
+            g.update_ticket("t-001", "review_pending", None, None, None)
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
@@ -1096,9 +1154,12 @@ mod tests {
         let (db, config) = setup();
         {
             let g = db.lock().unwrap();
-            g.create_ticket("Pending", "still pending", "general", 1).unwrap();
-            g.create_ticket("In prog", "in progress", "general", 1).unwrap();
-            g.update_ticket("t-002", "in_progress", None, None, None).unwrap();
+            g.create_ticket("Pending", "still pending", "general", 1)
+                .unwrap();
+            g.create_ticket("In prog", "in progress", "general", 1)
+                .unwrap();
+            g.update_ticket("t-002", "in_progress", None, None, None)
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
@@ -1117,8 +1178,10 @@ mod tests {
             let g = db.lock().unwrap();
             g.create_ticket("Task A", "Do A", "general", 1).unwrap();
             g.create_ticket("Task B", "Do B", "general", 1).unwrap();
-            g.update_ticket("t-001", "review_pending", None, None, None).unwrap();
-            g.update_ticket("t-002", "review_pending", None, None, None).unwrap();
+            g.update_ticket("t-001", "review_pending", None, None, None)
+                .unwrap();
+            g.update_ticket("t-002", "review_pending", None, None, None)
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
@@ -1134,7 +1197,8 @@ mod tests {
         {
             let g = db.lock().unwrap();
             g.create_ticket("Task A", "Do A", "general", 1).unwrap();
-            g.update_ticket("t-001", "review_pending", None, None, None).unwrap();
+            g.update_ticket("t-001", "review_pending", None, None, None)
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
@@ -1144,6 +1208,30 @@ mod tests {
         let review_event = events.iter().find(|e| e.event_type == "ticket_reviewed");
         assert!(review_event.is_some(), "should log a ticket_reviewed event");
         assert!(review_event.unwrap().detail.contains("t-001"));
+    }
+
+    #[test]
+    fn auto_review_scores_ticket_quality() {
+        // When manager auto-reviews a review_pending ticket, a quality score must be persisted.
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.create_ticket("Task A", "Do A", "general", 1).unwrap();
+            g.update_ticket("t-001", "review_pending", None, None, None)
+                .unwrap();
+        }
+
+        // Use the real repo path so git commands can run; branch won't exist so score=0 is fine.
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        run_cycle(&db, &config, &cwd).unwrap();
+
+        let g = db.lock().unwrap();
+        assert_eq!(g.get_ticket("t-001").unwrap().unwrap().status, "completed");
+        let score = g.get_quality_score("t-001").unwrap();
+        assert!(
+            score.is_some(),
+            "auto-review should persist a quality score for the completed ticket"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1193,9 +1281,15 @@ mod tests {
         let ready_event = events
             .iter()
             .find(|e| e.event_type == "milestone_ready_for_review");
-        assert!(ready_event.is_some(), "should log milestone_ready_for_review event");
         assert!(
-            ready_event.unwrap().detail.contains(&milestone_id.to_string()),
+            ready_event.is_some(),
+            "should log milestone_ready_for_review event"
+        );
+        assert!(
+            ready_event
+                .unwrap()
+                .detail
+                .contains(&milestone_id.to_string()),
             "event detail should include milestone_id"
         );
     }
@@ -1246,22 +1340,32 @@ mod tests {
             g.register_agent("w-1", "worker", "backend-dev").unwrap();
 
             // review_pending ticket → should be auto-reviewed
-            g.create_ticket("Review me", "needs review", "general", 1).unwrap();
-            g.update_ticket("t-001", "review_pending", None, None, None).unwrap();
+            g.create_ticket("Review me", "needs review", "general", 1)
+                .unwrap();
+            g.update_ticket("t-001", "review_pending", None, None, None)
+                .unwrap();
 
             // Pending ticket → should be assigned to idle w-1
-            g.create_ticket("Assign me", "needs assignment", "general", 1).unwrap();
+            g.create_ticket("Assign me", "needs assignment", "general", 1)
+                .unwrap();
 
             // Blocked ticket with completed blocker → should be unblocked
-            g.create_ticket("Blocker", "I block things", "general", 1).unwrap();
-            g.update_ticket("t-003", "completed", None, None, None).unwrap();
-            g.create_ticket("Blocked", "waiting on t-003", "general", 1).unwrap();
-            g.update_ticket("t-004", "blocked", None, Some("t-003"), None).unwrap();
+            g.create_ticket("Blocker", "I block things", "general", 1)
+                .unwrap();
+            g.update_ticket("t-003", "completed", None, None, None)
+                .unwrap();
+            g.create_ticket("Blocked", "waiting on t-003", "general", 1)
+                .unwrap();
+            g.update_ticket("t-004", "blocked", None, Some("t-003"), None)
+                .unwrap();
 
             // Completion message in mgr inbox
-            g.create_ticket("Almost done", "completing", "general", 1).unwrap();
-            g.update_ticket("t-005", "in_progress", None, None, None).unwrap();
-            g.push_inbox("mgr", "ticket_completed", r#"{"ticket_id":"t-005"}"#, "w-2").unwrap();
+            g.create_ticket("Almost done", "completing", "general", 1)
+                .unwrap();
+            g.update_ticket("t-005", "in_progress", None, None, None)
+                .unwrap();
+            g.push_inbox("mgr", "ticket_completed", r#"{"ticket_id":"t-005"}"#, "w-2")
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
@@ -1270,7 +1374,10 @@ mod tests {
         // t-001: review_pending → completed (auto-review)
         assert_eq!(g.get_ticket("t-001").unwrap().unwrap().status, "completed");
         // t-002: pending → in_progress (assigned to w-1)
-        assert_eq!(g.get_ticket("t-002").unwrap().unwrap().status, "in_progress");
+        assert_eq!(
+            g.get_ticket("t-002").unwrap().unwrap().status,
+            "in_progress"
+        );
         // t-004: blocked → pending (blocker t-003 completed)
         assert_eq!(g.get_ticket("t-004").unwrap().unwrap().status, "pending");
         // t-005: in_progress → completed (completion message)
@@ -1291,23 +1398,37 @@ mod tests {
     #[test]
     fn build_kb_context_includes_domain_stack_and_general_entries() {
         let db = Db::open_memory().expect("in-memory db");
-        db.write_knowledge("backend", "stack", "Rust, Axum").unwrap();
-        db.write_knowledge("general", "architecture", "Single-binary CLI").unwrap();
-        db.write_knowledge("general", "conventions", "Rust 2021 edition").unwrap();
-        db.write_knowledge("architecture", "api-contracts", "GET /users -> {id, name}").unwrap();
+        db.write_knowledge("backend", "stack", "Rust, Axum")
+            .unwrap();
+        db.write_knowledge("general", "architecture", "Single-binary CLI")
+            .unwrap();
+        db.write_knowledge("general", "conventions", "Rust 2021 edition")
+            .unwrap();
+        db.write_knowledge("architecture", "api-contracts", "GET /users -> {id, name}")
+            .unwrap();
 
         let ctx = build_kb_context(&db, "backend");
         assert!(ctx.contains("backend/stack"), "should include domain/stack");
         assert!(ctx.contains("Rust, Axum"), "should include stack value");
-        assert!(ctx.contains("general/architecture"), "should include general/architecture");
-        assert!(ctx.contains("general/conventions"), "should include conventions");
-        assert!(ctx.contains("architecture/api-contracts"), "should include api-contracts");
+        assert!(
+            ctx.contains("general/architecture"),
+            "should include general/architecture"
+        );
+        assert!(
+            ctx.contains("general/conventions"),
+            "should include conventions"
+        );
+        assert!(
+            ctx.contains("architecture/api-contracts"),
+            "should include api-contracts"
+        );
     }
 
     #[test]
     fn build_kb_context_skips_missing_entries_gracefully() {
         let db = Db::open_memory().expect("in-memory db");
-        db.write_knowledge("backend", "stack", "Node.js, Express").unwrap();
+        db.write_knowledge("backend", "stack", "Node.js, Express")
+            .unwrap();
 
         let ctx = build_kb_context(&db, "backend");
         assert!(ctx.contains("backend/stack"));
@@ -1324,24 +1445,42 @@ mod tests {
             g.register_agent("w-1", "worker", "backend-dev").unwrap();
             g.create_ticket("Task A", "Do A", "backend", 1).unwrap();
             g.write_knowledge("backend", "stack", "Rust, Axum").unwrap();
-            g.write_knowledge("general", "architecture", "Single-binary").unwrap();
+            g.write_knowledge("general", "architecture", "Single-binary")
+                .unwrap();
         }
 
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
 
         let g = db.lock().unwrap();
-        let msg = g.pop_inbox("w-1").unwrap().expect("worker should have received an assignment");
+        let msg = g
+            .pop_inbox("w-1")
+            .unwrap()
+            .expect("worker should have received an assignment");
         assert_eq!(msg.msg_type, "ticket_assignment");
 
         let payload: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
         let kb_context = payload["kb_context"].as_str().unwrap_or("");
         let kb_entries = payload["kb_entries"].as_array().unwrap();
-        assert!(!kb_context.is_empty(), "kb_context should be non-empty when KB has entries");
-        assert!(kb_context.contains("backend/stack"), "kb_context should contain domain stack");
-        assert!(kb_context.contains("Rust, Axum"), "kb_context should contain stack value");
-        assert!(kb_context.contains("general/architecture"), "kb_context should contain architecture");
         assert!(
-            kb_entries.iter().any(|e| e["domain"] == "backend" && e["key"] == "stack"),
+            !kb_context.is_empty(),
+            "kb_context should be non-empty when KB has entries"
+        );
+        assert!(
+            kb_context.contains("backend/stack"),
+            "kb_context should contain domain stack"
+        );
+        assert!(
+            kb_context.contains("Rust, Axum"),
+            "kb_context should contain stack value"
+        );
+        assert!(
+            kb_context.contains("general/architecture"),
+            "kb_context should contain architecture"
+        );
+        assert!(
+            kb_entries
+                .iter()
+                .any(|e| e["domain"] == "backend" && e["key"] == "stack"),
             "kb_entries should include backend/stack"
         );
     }
@@ -1359,12 +1498,21 @@ mod tests {
         run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
 
         let g = db.lock().unwrap();
-        let msg = g.pop_inbox("w-1").unwrap().expect("worker should have received an assignment");
+        let msg = g
+            .pop_inbox("w-1")
+            .unwrap()
+            .expect("worker should have received an assignment");
         let payload: serde_json::Value = serde_json::from_str(&msg.payload).unwrap();
         let kb_context = payload["kb_context"].as_str().unwrap_or("missing");
         let kb_entries = payload["kb_entries"].as_array().unwrap();
         // Should be present in payload but empty string
-        assert_eq!(kb_context, "", "kb_context should be empty string when KB has no entries");
-        assert!(kb_entries.is_empty(), "kb_entries should be empty when KB has no entries");
+        assert_eq!(
+            kb_context, "",
+            "kb_context should be empty string when KB has no entries"
+        );
+        assert!(
+            kb_entries.is_empty(),
+            "kb_entries should be empty when KB has no entries"
+        );
     }
 }
