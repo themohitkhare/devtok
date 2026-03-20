@@ -24,7 +24,13 @@ pub struct Agent {
     pub current_ticket: Option<String>,
     pub pid: Option<u32>,
     pub last_heartbeat: Option<String>,
+    /// Backend provider name (e.g. "claude", "cursor", "codex").
+    /// Defaults to "claude" for agents registered without an explicit backend.
+    #[serde(default = "default_backend")]
+    pub backend: String,
 }
+
+fn default_backend() -> String { "claude".to_string() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxMessage {

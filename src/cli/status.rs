@@ -30,8 +30,8 @@ fn execute_with_db(db: &Db, live: bool) -> Result<()> {
         for a in &agents {
             let ticket_info = a.current_ticket.as_deref().unwrap_or("-");
             println!(
-                "  {} ({}/{}) — {} [{}]",
-                a.id, a.role, a.persona, a.status, ticket_info
+                "  {} ({}) [{}] — {} [{}]",
+                a.id, a.role, a.backend, a.status, ticket_info
             );
         }
     }
@@ -97,5 +97,18 @@ mod tests {
         )
         .unwrap();
         execute_with_db(&db, false).unwrap();
+    }
+
+    #[test]
+    fn status_shows_backend_per_worker() {
+        let db = Db::open_memory().unwrap();
+        db.register_agent_with_backend("w-0", "worker", "general", "claude").unwrap();
+        db.register_agent_with_backend("w-1", "worker", "general", "cursor").unwrap();
+        // Should not panic; output includes backend labels
+        execute_with_db(&db, false).unwrap();
+        let agents = db.list_agents().unwrap();
+        let backends: Vec<&str> = agents.iter().map(|a| a.backend.as_str()).collect();
+        assert!(backends.contains(&"claude"));
+        assert!(backends.contains(&"cursor"));
     }
 }

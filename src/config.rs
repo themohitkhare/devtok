@@ -132,6 +132,12 @@ pub struct QualityConfig {
 /// command = "/path/to/my-agent"
 /// args = ["--task", "{prompt}", "--context", "{system_prompt}"]
 /// cwd_in_worktree = true
+///
+/// # Domain routing: prefer specific backends for specific ticket domains
+/// [backends.routing]
+/// qa = "cursor"
+/// core = "claude"
+/// default = "claude"
 /// ```
 #[derive(Debug, Clone)]
 pub struct BackendsConfig {
@@ -140,11 +146,30 @@ pub struct BackendsConfig {
     pub default: String,
     /// Named backend definitions. Keys match the `--backend` flag value.
     pub definitions: HashMap<String, BackendTemplate>,
+    /// Domain → preferred backend name mapping.
+    /// Used by the manager to route tickets to workers with the matching backend.
+    /// A special `"default"` key within the routing table sets the fallback backend.
+    /// Example: `{ "qa" → "cursor", "core" → "claude" }`
+    pub routing: HashMap<String, String>,
+}
+
+impl BackendsConfig {
+    /// Return the preferred backend name for a given ticket domain.
+    /// Falls back to `routing["default"]`, then to `self.default`.
+    pub fn backend_for_domain(&self, domain: &str) -> &str {
+        if let Some(b) = self.routing.get(domain) {
+            return b.as_str();
+        }
+        if let Some(b) = self.routing.get("default") {
+            return b.as_str();
+        }
+        self.default.as_str()
+    }
 }
 
 impl Default for BackendsConfig {
     fn default() -> Self {
-        Self { default: "claude".into(), definitions: HashMap::new() }
+        Self { default: "claude".into(), definitions: HashMap::new(), routing: HashMap::new() }
     }
 }
 
@@ -156,8 +181,8 @@ impl<'de> serde::Deserialize<'de> for BackendsConfig {
         use serde::de::Error as DeError;
 
         // Deserialise as a raw TOML value map so we can handle the mixed
-        // structure: a scalar "default" key alongside sub-tables for each
-        // backend definition.
+        // structure: a scalar "default" key, a "routing" sub-table, and
+        // named backend definition sub-tables.
         let raw: HashMap<String, toml::Value> = HashMap::deserialize(deserializer)?;
 
         let default = raw
@@ -166,9 +191,20 @@ impl<'de> serde::Deserialize<'de> for BackendsConfig {
             .unwrap_or("claude")
             .to_string();
 
+        // Extract domain → backend routing table if present.
+        let routing: HashMap<String, String> = raw
+            .get("routing")
+            .and_then(|v| v.as_table())
+            .map(|t| {
+                t.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut definitions = HashMap::new();
         for (k, v) in &raw {
-            if k == "default" {
+            if k == "default" || k == "routing" {
                 continue;
             }
             // Each backend value must be a TOML table
@@ -179,7 +215,7 @@ impl<'de> serde::Deserialize<'de> for BackendsConfig {
             definitions.insert(k.clone(), bt);
         }
 
-        Ok(BackendsConfig { default, definitions })
+        Ok(BackendsConfig { default, definitions, routing })
     }
 }
 
@@ -790,5 +826,72 @@ code_review = true
         // And it should round-trip
         let reparsed: Config = toml::from_str(&toml_str).expect("should re-parse");
         assert!(reparsed.quality.code_review);
+    }
+
+    // -----------------------------------------------------------------------
+    // BackendsConfig routing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn backends_routing_parses_domain_to_backend_map() {
+        let toml_content = r#"
+[project]
+name = "routing-test"
+
+[backends.routing]
+qa = "cursor"
+core = "claude"
+default = "claude"
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "{}", toml_content).unwrap();
+        let cfg = Config::load(tmp.path()).expect("should load");
+        assert_eq!(cfg.backends.routing.get("qa").map(|s| s.as_str()), Some("cursor"));
+        assert_eq!(cfg.backends.routing.get("core").map(|s| s.as_str()), Some("claude"));
+        assert_eq!(cfg.backends.routing.get("default").map(|s| s.as_str()), Some("claude"));
+    }
+
+    #[test]
+    fn backend_for_domain_returns_mapped_backend() {
+        let mut cfg = Config::default_for("proj");
+        cfg.backends.routing.insert("qa".to_string(), "cursor".to_string());
+        cfg.backends.routing.insert("core".to_string(), "claude".to_string());
+        assert_eq!(cfg.backends.backend_for_domain("qa"), "cursor");
+        assert_eq!(cfg.backends.backend_for_domain("core"), "claude");
+    }
+
+    #[test]
+    fn backend_for_domain_falls_back_to_routing_default() {
+        let mut cfg = Config::default_for("proj");
+        cfg.backends.routing.insert("default".to_string(), "codex".to_string());
+        assert_eq!(cfg.backends.backend_for_domain("unknown-domain"), "codex");
+    }
+
+    #[test]
+    fn backend_for_domain_falls_back_to_backends_default() {
+        let cfg = Config::default_for("proj");
+        // No routing configured — falls back to backends.default = "claude"
+        assert_eq!(cfg.backends.backend_for_domain("anything"), "claude");
+    }
+
+    #[test]
+    fn backends_routing_does_not_pollute_definitions() {
+        let toml_content = r#"
+[project]
+name = "routing-test"
+
+[backends.routing]
+qa = "cursor"
+
+[backends.claude]
+command = "claude"
+args = ["-p", "{prompt}"]
+"#;
+        let mut tmp = NamedTempFile::new().unwrap();
+        write!(tmp, "{}", toml_content).unwrap();
+        let cfg = Config::load(tmp.path()).expect("should load");
+        // "routing" must not appear as a backend definition
+        assert!(!cfg.backends.definitions.contains_key("routing"));
+        assert!(cfg.backends.definitions.contains_key("claude"));
     }
 }

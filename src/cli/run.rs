@@ -59,17 +59,21 @@ pub fn execute(
             workers
         };
 
+        // Build per-worker backend list (one entry per worker slot).
+        let worker_backends = build_worker_backends(backend.as_deref(), workers);
+
         for i in 0..min_active {
             let worker_id = format!("w-{}", i);
+            let backend_name = worker_backends.get(i).map(|s| s.as_str()).unwrap_or("claude");
             {
                 let db = db.lock().unwrap();
-                db.register_agent(&worker_id, "worker", "general")?;
+                db.register_agent_with_backend(&worker_id, "worker", "general", backend_name)?;
             }
             let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
             let w_db = db.clone();
             let w_config = config.clone();
             let w_dir = project_dir.clone();
-            let forced_provider = resolve_worker_provider(i, workers, backend.as_deref());
+            let forced_provider = Some(provider_for_backend(backend_name));
             let handle = tokio::spawn(async move {
                 worker::worker_loop(
                     worker_id,
@@ -143,15 +147,16 @@ pub fn execute(
                                 continue;
                             }
                             let worker_id = format!("w-{}", i);
+                            let backend_name = worker_backends.get(i).map(|s| s.as_str()).unwrap_or("claude");
                             {
                                 let db = db.lock().unwrap();
-                                db.register_agent(&worker_id, "worker", "general")?;
+                                db.register_agent_with_backend(&worker_id, "worker", "general", backend_name)?;
                             }
                             let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
                             let w_db = db.clone();
                             let w_config = config.clone();
                             let w_dir = project_dir.clone();
-                            let forced_provider = resolve_worker_provider(i, workers, backend.as_deref());
+                            let forced_provider = Some(provider_for_backend(backend_name));
                             let handle = tokio::spawn(async move {
                                 worker::worker_loop(
                                     worker_id,
@@ -324,6 +329,84 @@ pub fn resolve_worker_provider(
     }
 }
 
+/// Parse an allocation string like `"claude:2,cursor:2"` into a list of
+/// `(backend_name, count)` pairs.  Returns an error if the string is not in
+/// the `name:N` format or any count is zero.
+pub fn parse_backend_allocation(s: &str) -> Result<Vec<(String, usize)>> {
+    let mut result = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        let colon = part.rfind(':')
+            .ok_or_else(|| anyhow::anyhow!("expected 'backend:N' format, got '{}'", part))?;
+        let name = part[..colon].trim().to_string();
+        let count_str = part[colon + 1..].trim();
+        let count: usize = count_str.parse()
+            .map_err(|_| anyhow::anyhow!("invalid count '{}' for backend '{}'", count_str, name))?;
+        if count == 0 {
+            return Err(anyhow::anyhow!("count for backend '{}' must be > 0", name));
+        }
+        result.push((name, count));
+    }
+    Ok(result)
+}
+
+/// Build a flat list of backend names, one per worker slot.
+///
+/// Handles:
+/// - `None`            → all slots default to `"claude"`
+/// - `"claude:2,cursor:2"` (allocation format) → expanded list
+/// - `"claude"` / `"codex"` / etc. → all slots use that backend
+/// - `"mixed"`         → first half `"claude"`, second half `"cursor"`
+///
+/// If the allocation sum differs from `total`, the list is truncated or padded
+/// with the last backend so the result always has exactly `total` entries.
+pub fn build_worker_backends(backend: Option<&str>, total: usize) -> Vec<String> {
+    if total == 0 {
+        return vec![];
+    }
+    let s = match backend {
+        None => return vec!["claude".to_string(); total],
+        Some(s) => s,
+    };
+
+    // Detect allocation format: must contain both ':' and ','  OR a single 'name:N'
+    if s.contains(':') {
+        if let Ok(allocs) = parse_backend_allocation(s) {
+            let mut flat: Vec<String> = allocs
+                .into_iter()
+                .flat_map(|(name, count)| std::iter::repeat(name).take(count))
+                .collect();
+            // Truncate or pad to exactly `total`
+            flat.truncate(total);
+            while flat.len() < total {
+                let last = flat.last().cloned().unwrap_or_else(|| "claude".to_string());
+                flat.push(last);
+            }
+            return flat;
+        }
+    }
+
+    // Simple / legacy names
+    match s {
+        "mixed" => {
+            let split = total / 2;
+            let mut v: Vec<String> = std::iter::repeat("claude".to_string()).take(split).collect();
+            v.extend(std::iter::repeat("cursor".to_string()).take(total - split));
+            v
+        }
+        other => vec![other.to_string(); total],
+    }
+}
+
+/// Map the user-facing backend name to the internal spawner provider name.
+/// Currently only `"cursor"` needs remapping (→ `"agent"`).
+pub fn provider_for_backend(backend: &str) -> String {
+    match backend {
+        "cursor" => "agent".to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,5 +514,101 @@ mod tests {
     #[test]
     fn desired_workers_matches_queue_in_range() {
         assert_eq!(desired_workers_from_queue(4, 1, 8), 4);
+    }
+
+    // ── parse_backend_allocation ────────────────────────────────────
+
+    #[test]
+    fn parse_allocation_claude2_cursor2() {
+        let result = parse_backend_allocation("claude:2,cursor:2").unwrap();
+        assert_eq!(result, vec![("claude".to_string(), 2), ("cursor".to_string(), 2)]);
+    }
+
+    #[test]
+    fn parse_allocation_single_entry() {
+        let result = parse_backend_allocation("claude:4").unwrap();
+        assert_eq!(result, vec![("claude".to_string(), 4)]);
+    }
+
+    #[test]
+    fn parse_allocation_three_backends() {
+        let result = parse_backend_allocation("claude:2,cursor:1,codex:1").unwrap();
+        assert_eq!(result, vec![
+            ("claude".to_string(), 2),
+            ("cursor".to_string(), 1),
+            ("codex".to_string(), 1),
+        ]);
+    }
+
+    #[test]
+    fn parse_allocation_errors_on_non_numeric_count() {
+        assert!(parse_backend_allocation("claude:abc").is_err());
+    }
+
+    #[test]
+    fn parse_allocation_errors_on_zero_count() {
+        assert!(parse_backend_allocation("claude:0").is_err());
+    }
+
+    #[test]
+    fn parse_allocation_errors_on_missing_colon() {
+        assert!(parse_backend_allocation("claude").is_err());
+    }
+
+    // ── build_worker_backends ───────────────────────────────────────
+
+    #[test]
+    fn build_worker_backends_with_allocation_string() {
+        let backends = build_worker_backends(Some("claude:2,cursor:2"), 4);
+        assert_eq!(backends, vec!["claude", "claude", "cursor", "cursor"]);
+    }
+
+    #[test]
+    fn build_worker_backends_allocation_truncates_to_total() {
+        // If allocation sums to more than total, we take first `total` elements
+        let backends = build_worker_backends(Some("claude:3,cursor:3"), 4);
+        assert_eq!(backends.len(), 4);
+        assert_eq!(backends, vec!["claude", "claude", "claude", "cursor"]);
+    }
+
+    #[test]
+    fn build_worker_backends_simple_claude() {
+        let backends = build_worker_backends(Some("claude"), 3);
+        assert_eq!(backends, vec!["claude", "claude", "claude"]);
+    }
+
+    #[test]
+    fn build_worker_backends_simple_cursor() {
+        let backends = build_worker_backends(Some("cursor"), 2);
+        assert_eq!(backends, vec!["cursor", "cursor"]);
+    }
+
+    #[test]
+    fn build_worker_backends_mixed() {
+        let backends = build_worker_backends(Some("mixed"), 4);
+        assert_eq!(backends, vec!["claude", "claude", "cursor", "cursor"]);
+    }
+
+    #[test]
+    fn build_worker_backends_none_defaults_to_claude() {
+        let backends = build_worker_backends(None, 2);
+        assert_eq!(backends, vec!["claude", "claude"]);
+    }
+
+    // ── provider_for_backend ────────────────────────────────────────
+
+    #[test]
+    fn provider_for_backend_cursor_maps_to_agent() {
+        assert_eq!(provider_for_backend("cursor"), "agent");
+    }
+
+    #[test]
+    fn provider_for_backend_claude_unchanged() {
+        assert_eq!(provider_for_backend("claude"), "claude");
+    }
+
+    #[test]
+    fn provider_for_backend_codex_unchanged() {
+        assert_eq!(provider_for_backend("codex"), "codex");
     }
 }
