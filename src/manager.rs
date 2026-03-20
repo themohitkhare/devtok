@@ -52,6 +52,27 @@ fn build_kb_context_entries(db: &Db, domain: &str) -> Vec<crate::models::Knowled
         }
     }
 
+    // Inject relevant learnings from prior attempts in the same domain.
+    // We include up to 5 most recent learning entries (sorted by key descending)
+    // where the stored domain matches the current ticket's domain.
+    if let Ok(all_learnings) = db.list_knowledge_by_domain("learning") {
+        let mut domain_learnings: Vec<_> = all_learnings
+            .into_iter()
+            .filter(|e| {
+                // Parse the value JSON and check if its "domain" field matches.
+                serde_json::from_str::<serde_json::Value>(&e.value)
+                    .ok()
+                    .and_then(|v| v["domain"].as_str().map(|d| d == domain))
+                    .unwrap_or(false)
+            })
+            .collect();
+        // Sort descending by key so most recent (higher ticket number) appear first.
+        domain_learnings.sort_by(|a, b| b.key.cmp(&a.key));
+        for entry in domain_learnings.into_iter().take(5) {
+            out.push(entry);
+        }
+    }
+
     out
 }
 
@@ -2028,6 +2049,39 @@ mod tests {
         assert!(
             kb_entries.is_empty(),
             "kb_entries should be empty when KB has no entries"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_kb_context: learnings injection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_kb_context_includes_domain_learnings() {
+        let db = Db::open_memory().expect("in-memory db");
+        // Write a learning entry for the "backend" domain.
+        db.write_knowledge(
+            "learning",
+            "t-010-success",
+            r#"{"ticket_id":"t-010","domain":"backend","outcome":"success","approach":"used axum handlers","timestamp":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        // Write a learning entry for a different domain — should not appear.
+        db.write_knowledge(
+            "learning",
+            "t-011-failure",
+            r#"{"ticket_id":"t-011","domain":"qa","outcome":"failure","approach":"ran tests","timestamp":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let ctx = build_kb_context(&db, "backend");
+        assert!(
+            ctx.contains("t-010-success"),
+            "context should include backend domain learning"
+        );
+        assert!(
+            !ctx.contains("t-011-failure"),
+            "context should not include qa domain learning for backend ticket"
         );
     }
 

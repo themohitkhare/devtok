@@ -556,6 +556,22 @@ impl Db {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    pub fn list_knowledge_by_domain(&self, domain: &str) -> Result<Vec<KnowledgeEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT domain, key, value, version, updated_at FROM knowledge WHERE domain = ?1 ORDER BY key",
+        )?;
+        let rows = stmt.query_map(params![domain], |row| {
+            Ok(KnowledgeEntry {
+                domain: row.get(0)?,
+                key: row.get(1)?,
+                value: row.get(2)?,
+                version: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
     pub fn total_tokens_used(&self) -> Result<i64> {
         self.conn
             .query_row(
@@ -1090,5 +1106,24 @@ mod tests {
     fn schema_version_is_current() {
         let db = Db::open_memory().unwrap();
         assert_eq!(db.schema_version().unwrap(), Db::CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn list_knowledge_by_domain_returns_only_matching_domain() {
+        let db = Db::open_memory().unwrap();
+        db.write_knowledge("learning", "t-001-success", r#"{"domain":"core"}"#).unwrap();
+        db.write_knowledge("learning", "t-002-failure", r#"{"domain":"qa"}"#).unwrap();
+        db.write_knowledge("core", "stack", "Rust").unwrap();
+
+        let results = db.list_knowledge_by_domain("learning").unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|e| e.domain == "learning"));
+
+        let core_results = db.list_knowledge_by_domain("core").unwrap();
+        assert_eq!(core_results.len(), 1);
+        assert_eq!(core_results[0].key, "stack");
+
+        let empty = db.list_knowledge_by_domain("nonexistent").unwrap();
+        assert!(empty.is_empty());
     }
 }
