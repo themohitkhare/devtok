@@ -14,6 +14,7 @@ use ratatui::{
 };
 use std::{
     io,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -23,6 +24,7 @@ use crate::models::pricing;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const LOG_TAIL_LINES: usize = 10;
+const AGENT_LOG_TAIL_LINES: usize = 10;
 
 struct AppState {
     /// (status, count) pairs
@@ -36,14 +38,21 @@ struct AppState {
     output_tokens: i64,
     /// Last refresh timestamp for display
     last_refresh: chrono::DateTime<chrono::Local>,
+    /// Path to .acs/ directory
+    acs_dir: PathBuf,
+    /// Agent log lines: (worker_id, line)
+    agent_log_lines: Vec<(String, String)>,
 }
 
 impl AppState {
-    fn load(db: &Db) -> Result<Self> {
+    fn load(db: &Db, acs_dir: &Path) -> Result<Self> {
         let ticket_counts = db.count_by_status()?;
         let agents = db.list_agents()?;
         let recent_events = db.recent_events(LOG_TAIL_LINES)?;
         let (input_tokens, output_tokens) = db.total_token_details()?;
+
+        let agent_log_lines = load_agent_logs(&agents, acs_dir);
+
         Ok(AppState {
             ticket_counts,
             agents,
@@ -51,6 +60,8 @@ impl AppState {
             input_tokens,
             output_tokens,
             last_refresh: chrono::Local::now(),
+            acs_dir: acs_dir.to_path_buf(),
+            agent_log_lines,
         })
     }
 
@@ -67,7 +78,51 @@ impl AppState {
     }
 }
 
-pub fn run(db: &Db) -> Result<()> {
+fn load_agent_logs(agents: &[crate::models::Agent], acs_dir: &Path) -> Vec<(String, String)> {
+    let active: Vec<&crate::models::Agent> =
+        agents.iter().filter(|a| a.status == "working").collect();
+    let active_count = active.len();
+    if active_count == 0 {
+        return vec![];
+    }
+
+    let lines_per_worker = (AGENT_LOG_TAIL_LINES / active_count).max(1);
+    let mut result: Vec<(String, String)> = Vec::new();
+
+    for agent in &active {
+        let log_path = acs_dir.join("logs").join(format!("{}.log", agent.id));
+        let content = match std::fs::read(&log_path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(_) => continue,
+        };
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        let tail_start = lines.len().saturating_sub(lines_per_worker);
+        for line in &lines[tail_start..] {
+            result.push((agent.id.clone(), line.to_string()));
+        }
+    }
+
+    // Cap total to AGENT_LOG_TAIL_LINES
+    let len = result.len();
+    if len > AGENT_LOG_TAIL_LINES {
+        result = result[len - AGENT_LOG_TAIL_LINES..].to_vec();
+    }
+
+    result
+}
+
+fn worker_color(index: usize) -> Color {
+    let palette = [
+        Color::Cyan,
+        Color::Green,
+        Color::Magenta,
+        Color::Yellow,
+        Color::Blue,
+    ];
+    palette[index % palette.len()]
+}
+
+pub fn run(db: &Db, acs_dir: &Path) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -75,7 +130,7 @@ pub fn run(db: &Db) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, db);
+    let result = run_loop(&mut terminal, db, acs_dir);
 
     // Restore terminal regardless of outcome
     disable_raw_mode()?;
@@ -85,14 +140,18 @@ pub fn run(db: &Db) -> Result<()> {
     result
 }
 
-fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, db: &Db) -> Result<()> {
+fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    db: &Db,
+    acs_dir: &Path,
+) -> Result<()> {
     let mut last_tick = Instant::now() - REFRESH_INTERVAL; // force immediate first load
-    let mut state = AppState::load(db)?;
+    let mut state = AppState::load(db, acs_dir)?;
 
     loop {
         // Refresh data if interval elapsed
         if last_tick.elapsed() >= REFRESH_INTERVAL {
-            state = AppState::load(db)?;
+            state = AppState::load(db, acs_dir)?;
             last_tick = Instant::now();
         }
 
@@ -107,8 +166,9 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, db: &Db) -> R
             if let Event::Key(key) = event::read()? {
                 match (key.modifiers, key.code) {
                     // Ctrl+C or 'q' to exit
-                    (KeyModifiers::CONTROL, KeyCode::Char('c'))
-                    | (_, KeyCode::Char('q')) => return Ok(()),
+                    (KeyModifiers::CONTROL, KeyCode::Char('c')) | (_, KeyCode::Char('q')) => {
+                        return Ok(())
+                    }
                     _ => {}
                 }
             }
@@ -156,13 +216,13 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect) {
 }
 
 fn draw_body(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
-    // Body: top row (workers + progress) + log + tokens
+    // Body: top row (workers + progress) + log/agent-logs row + tokens
     let body = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(8),  // workers + progress bar
-            Constraint::Min(6),     // log tail
-            Constraint::Length(3),  // token counter
+            Constraint::Length(8), // workers + progress bar
+            Constraint::Min(6),    // log tail + agent logs
+            Constraint::Length(3), // token counter
         ])
         .split(area);
 
@@ -174,34 +234,47 @@ fn draw_body(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
 
     draw_workers(f, top_row[0], state);
     draw_progress(f, top_row[1], state);
-    draw_log(f, body[1], state);
+
+    // Bottom row: recent events | agent logs (50/50 split)
+    let bottom_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(body[1]);
+
+    draw_log(f, bottom_row[0], state);
+    draw_agent_logs(f, bottom_row[1], state);
+
     draw_tokens(f, body[2], state);
 }
 
 fn draw_workers(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
-    let header_cells = ["Agent", "Role", "Status", "Ticket"]
-        .iter()
-        .map(|h| ratatui::widgets::Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD)));
+    let header_cells = ["Agent", "Role", "Status", "Ticket"].iter().map(|h| {
+        ratatui::widgets::Cell::from(*h).style(Style::default().add_modifier(Modifier::BOLD))
+    });
     let header = Row::new(header_cells)
         .style(Style::default().fg(Color::Yellow))
         .height(1);
 
-    let rows: Vec<Row> = state.agents.iter().map(|a| {
-        let status_color = match a.status.as_str() {
-            "working" => Color::Green,
-            "idle" => Color::Gray,
-            _ => Color::White,
-        };
-        Row::new(vec![
-            ratatui::widgets::Cell::from(a.id.clone()),
-            ratatui::widgets::Cell::from(a.role.clone()),
-            ratatui::widgets::Cell::from(a.status.clone())
-                .style(Style::default().fg(status_color)),
-            ratatui::widgets::Cell::from(
-                a.current_ticket.clone().unwrap_or_else(|| "-".to_string()),
-            ),
-        ])
-    }).collect();
+    let rows: Vec<Row> = state
+        .agents
+        .iter()
+        .map(|a| {
+            let status_color = match a.status.as_str() {
+                "working" => Color::Green,
+                "idle" => Color::Gray,
+                _ => Color::White,
+            };
+            Row::new(vec![
+                ratatui::widgets::Cell::from(a.id.clone()),
+                ratatui::widgets::Cell::from(a.role.clone()),
+                ratatui::widgets::Cell::from(a.status.clone())
+                    .style(Style::default().fg(status_color)),
+                ratatui::widgets::Cell::from(
+                    a.current_ticket.clone().unwrap_or_else(|| "-".to_string()),
+                ),
+            ])
+        })
+        .collect();
 
     let table = Table::new(
         rows,
@@ -302,14 +375,63 @@ fn draw_log(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
             ListItem::new(Line::from(vec![
                 Span::styled(format!("[{}] ", ts), Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{} ", agent), Style::default().fg(Color::Yellow)),
-                Span::styled(format!("{}: ", e.event_type), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!("{}: ", e.event_type),
+                    Style::default().fg(Color::Cyan),
+                ),
                 Span::raw(format!("{}{}", e.detail, tokens)),
             ]))
         })
         .collect();
 
-    let log_list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Recent Events "));
+    let log_list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Recent Events "),
+    );
+    f.render_widget(log_list, area);
+}
+
+fn draw_agent_logs(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    let items: Vec<ListItem> = if state.agent_log_lines.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "No active workers",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        // Panel inner width (subtract 2 for borders)
+        let panel_width = area.width.saturating_sub(2) as usize;
+
+        state
+            .agent_log_lines
+            .iter()
+            .map(|(worker_id, line)| {
+                let index = worker_id
+                    .strip_prefix("w-")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let color = worker_color(index);
+                let prefix = format!("[{}] ", worker_id);
+                let prefix_len = prefix.len();
+                let max_line_len = panel_width.saturating_sub(prefix_len);
+                let truncated_line = if line.len() > max_line_len {
+                    &line[..max_line_len]
+                } else {
+                    line.as_str()
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(color)),
+                    Span::raw(truncated_line.to_string()),
+                ]))
+            })
+            .collect()
+    };
+
+    let log_list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Agent Logs "),
+    );
     f.render_widget(log_list, area);
 }
 
@@ -330,13 +452,21 @@ fn draw_tokens(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     );
     let tokens_widget = Paragraph::new(text)
         .style(Style::default().fg(Color::Magenta))
-        .block(Block::default().borders(Borders::ALL).title(" Token Usage "));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Token Usage "),
+        );
     f.render_widget(tokens_widget, area);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dummy_acs_dir() -> PathBuf {
+        std::env::temp_dir()
+    }
 
     #[test]
     fn completed_counts_only_completed_status() {
@@ -351,6 +481,8 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             last_refresh: chrono::Local::now(),
+            acs_dir: dummy_acs_dir(),
+            agent_log_lines: vec![],
         };
 
         assert_eq!(state.completed(), 3);
@@ -369,6 +501,8 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             last_refresh: chrono::Local::now(),
+            acs_dir: dummy_acs_dir(),
+            agent_log_lines: vec![],
         };
 
         assert_eq!(state.total(), 6);
@@ -383,8 +517,126 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             last_refresh: chrono::Local::now(),
+            acs_dir: dummy_acs_dir(),
+            agent_log_lines: vec![],
         };
 
         assert_eq!(state.completed(), 0);
     }
+
+    #[test]
+    fn agent_log_loading_reads_correct_lines() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acs_dir = tmp.path().join(".acs");
+        let logs_dir = acs_dir.join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        std::fs::write(
+            logs_dir.join("w-0.log"),
+            "line one\nline two\nline three\n",
+        )
+        .unwrap();
+
+        let db = crate::db::Db::open_memory().unwrap();
+        let tid = db.create_ticket("T1", "d", "core", 1).unwrap();
+        db.register_agent("w-0", "worker", "general").unwrap();
+        db.update_agent("w-0", "working", Some(&tid), None).unwrap();
+
+        let state = AppState::load(&db, &acs_dir).unwrap();
+
+        assert!(!state.agent_log_lines.is_empty());
+        assert!(state.agent_log_lines.iter().any(|(wid, _)| wid == "w-0"));
+        let lines: Vec<&str> = state
+            .agent_log_lines
+            .iter()
+            .filter(|(wid, _)| wid == "w-0")
+            .map(|(_, l)| l.as_str())
+            .collect();
+        assert!(
+            lines.contains(&"line one")
+                || lines.contains(&"line two")
+                || lines.contains(&"line three")
+        );
+    }
+
+    #[test]
+    fn agent_log_empty_when_no_active_workers() {
+        let db = crate::db::Db::open_memory().unwrap();
+        let tid = db.create_ticket("T1", "d", "core", 1).unwrap();
+        db.register_agent("w-0", "worker", "general").unwrap();
+        db.update_agent("w-0", "idle", Some(&tid), None).unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acs_dir = tmp.path().join(".acs");
+
+        let state = AppState::load(&db, &acs_dir).unwrap();
+        assert!(state.agent_log_lines.is_empty());
+    }
+
+    #[test]
+    fn agent_log_missing_file_is_skipped() {
+        let db = crate::db::Db::open_memory().unwrap();
+        let tid = db.create_ticket("T1", "d", "core", 1).unwrap();
+        db.register_agent("w-0", "worker", "general").unwrap();
+        db.update_agent("w-0", "working", Some(&tid), None).unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let acs_dir = tmp.path().join(".acs");
+        std::fs::create_dir_all(&acs_dir).unwrap();
+
+        // Should not panic; no log file exists so result is empty
+        let state = AppState::load(&db, &acs_dir).unwrap();
+        assert!(state.agent_log_lines.is_empty());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn status_live_draw_smoke_empty_state() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let acs_dir = tmp.path().join(".acs");
+
+    let backend = TestBackend::new(100, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let state = AppState {
+        ticket_counts: vec![],
+        agents: vec![],
+        recent_events: vec![],
+        input_tokens: 0,
+        output_tokens: 0,
+        last_refresh: chrono::Local::now(),
+        acs_dir,
+        agent_log_lines: vec![],
+    };
+    terminal.draw(|f| draw(f, &state)).unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn status_live_draw_smoke_populated() {
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let acs_dir = tmp.path().join(".acs");
+    let logs_dir = acs_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir).unwrap();
+    std::fs::write(
+        logs_dir.join("w-0.log"),
+        "cargo test passed\ncommitting changes\n",
+    )
+    .unwrap();
+
+    let db = crate::db::Db::open_memory().unwrap();
+    let tid = db.create_ticket("T1", "d", "core", 1).unwrap();
+    db.log_event(Some("w-0"), "assigned", "go", None).unwrap();
+    db.register_agent("w-0", "worker", "general").unwrap();
+    db.update_agent("w-0", "working", Some(&tid), None).unwrap();
+    let state = AppState::load(&db, &acs_dir).unwrap();
+
+    let backend = TestBackend::new(120, 45);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, &state)).unwrap();
 }
