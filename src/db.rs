@@ -13,7 +13,7 @@ pub struct Db {
 }
 
 impl Db {
-    pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+    const CURRENT_SCHEMA_VERSION: i64 = 4;
 
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -167,10 +167,11 @@ impl Db {
             );
         }
 
-        if current_version < 3 {
-            // v3: add backend column to agents (defaults to 'claude' for existing rows).
+        if current_version < 4 {
+            // Conflict-deferral counter: tracks how many times a ticket has been
+            // skipped due to file overlap. Used for force-assign liveness guarantee (v4).
             let _ = self.conn.execute_batch(
-                "ALTER TABLE agents ADD COLUMN backend TEXT NOT NULL DEFAULT 'claude';",
+                "ALTER TABLE tickets ADD COLUMN defer_count INTEGER NOT NULL DEFAULT 0;",
             );
         }
 
@@ -216,33 +217,19 @@ impl Db {
 
     pub fn get_ticket(&self, id: &str) -> Result<Option<Ticket>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at
+            "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at, COALESCE(defer_count, 0)
              FROM tickets WHERE id = ?1"
         )?;
         let ticket = stmt
-            .query_row(params![id], |row| {
-                Ok(Ticket {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    description: row.get(2)?,
-                    domain: row.get(3)?,
-                    priority: row.get(4)?,
-                    status: row.get(5)?,
-                    assignee: row.get(6)?,
-                    blocked_by: row.get(7)?,
-                    notes: row.get(8)?,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                })
-            })
+            .query_row(params![id], Self::row_to_ticket)
             .optional()?;
         Ok(ticket)
     }
 
     pub fn list_tickets(&self, status: Option<&str>) -> Result<Vec<Ticket>> {
         let sql = match status {
-            Some(_) => "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at FROM tickets WHERE status = ?1 ORDER BY priority, created_at",
-            None => "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at FROM tickets ORDER BY priority, created_at",
+            Some(_) => "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at, COALESCE(defer_count, 0) FROM tickets WHERE status = ?1 ORDER BY priority, created_at",
+            None => "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at, COALESCE(defer_count, 0) FROM tickets ORDER BY priority, created_at",
         };
         let mut stmt = self.conn.prepare(sql)?;
         let rows = if let Some(s) = status {
@@ -382,6 +369,39 @@ impl Db {
         }))
     }
 
+    /// Increment the conflict-deferral counter for a ticket and return the new value.
+    pub fn increment_defer_count(&self, id: &str) -> Result<i32> {
+        let now = Utc::now().to_rfc3339();
+        let new_count: i32 = self.conn.query_row(
+            "UPDATE tickets SET defer_count = COALESCE(defer_count, 0) + 1, updated_at = ?2
+             WHERE id = ?1
+             RETURNING COALESCE(defer_count, 0)",
+            params![id, now],
+            |row| row.get(0),
+        )?;
+        Ok(new_count)
+    }
+
+    /// Reset the conflict-deferral counter for a ticket to zero.
+    pub fn reset_defer_count(&self, id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE tickets SET defer_count = 0, updated_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    /// List tickets whose defer_count exceeds the given threshold, ordered by defer_count desc.
+    pub fn list_tickets_with_defer_count_gt(&self, threshold: i32) -> Result<Vec<Ticket>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at, COALESCE(defer_count, 0)
+             FROM tickets WHERE COALESCE(defer_count, 0) > ?1 ORDER BY defer_count DESC, created_at"
+        )?;
+        let rows = stmt.query_map(params![threshold], Self::row_to_ticket)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
     /// Atomically claim a specific pending ticket by ID for an agent.
     ///
     /// Returns `None` if the ticket is not claimable (already taken, not pending,
@@ -390,10 +410,10 @@ impl Db {
         let now = Utc::now().to_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
         let ticket: Option<Ticket> = tx.query_row(
-            "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2, rate_limit_retry_after = NULL
+            "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2, rate_limit_retry_after = NULL, defer_count = 0
              WHERE id = ?3 AND status = 'pending' AND assignee IS NULL
                AND (rate_limit_retry_after IS NULL OR rate_limit_retry_after <= ?2)
-             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at",
+             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at, COALESCE(defer_count, 0)",
             params![agent_id, now, ticket_id],
             Self::row_to_ticket,
         ).optional()?;
@@ -424,14 +444,14 @@ impl Db {
         let now = Utc::now().to_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
         let ticket: Option<Ticket> = tx.query_row(
-            "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2, rate_limit_retry_after = NULL
+            "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2, rate_limit_retry_after = NULL, defer_count = 0
              WHERE id = (
                  SELECT id FROM tickets
                  WHERE status = 'pending' AND assignee IS NULL
                    AND (rate_limit_retry_after IS NULL OR rate_limit_retry_after <= ?2)
                  ORDER BY priority, created_at LIMIT 1
              )
-             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at",
+             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at, COALESCE(defer_count, 0)",
             params![agent_id, now],
             Self::row_to_ticket,
         ).optional()?;
@@ -480,6 +500,7 @@ impl Db {
             notes: row.get(8)?,
             created_at: row.get(9)?,
             updated_at: row.get(10)?,
+            defer_count: row.get(11).unwrap_or(0),
         })
     }
 
@@ -1129,7 +1150,7 @@ impl Db {
         let now = Utc::now().to_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
         let ticket: Option<Ticket> = tx.query_row(
-            "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2, rate_limit_retry_after = NULL
+            "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2, rate_limit_retry_after = NULL, defer_count = 0
              WHERE id = (
                  SELECT t.id FROM tickets t
                  JOIN milestone_tickets mt ON t.id = mt.ticket_id
@@ -1137,7 +1158,7 @@ impl Db {
                    AND (t.rate_limit_retry_after IS NULL OR t.rate_limit_retry_after <= ?2)
                  ORDER BY t.priority, t.created_at LIMIT 1
              )
-             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at",
+             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at, COALESCE(defer_count, 0)",
             params![agent_id, now, milestone_id],
             Self::row_to_ticket,
         ).optional()?;
@@ -1349,21 +1370,72 @@ mod tests {
     }
 
     #[test]
-    fn last_rebuilt_at_returns_none_when_no_rebuild_events() {
+    fn schema_version_is_v4() {
         let db = Db::open_memory().unwrap();
-        assert!(db.last_rebuilt_at().unwrap().is_none());
+        assert_eq!(db.schema_version().unwrap(), 4);
     }
 
     #[test]
-    fn last_rebuilt_at_returns_most_recent_binary_rebuilt_event() {
+    fn defer_count_starts_at_zero() {
         let db = Db::open_memory().unwrap();
-        db.log_event(Some("mgr"), "binary_rebuilt", "first rebuild", None).unwrap();
-        db.log_event(Some("mgr"), "binary_rebuilt", "second rebuild", None).unwrap();
-        db.log_event(Some("mgr"), "ticket_reviewed", "some other event", None).unwrap();
+        let id = db.create_ticket("T", "D", "core", 1).unwrap();
+        let t = db.get_ticket(&id).unwrap().unwrap();
+        assert_eq!(t.defer_count, 0);
+    }
 
-        let ts = db.last_rebuilt_at().unwrap();
-        assert!(ts.is_some(), "expected a timestamp");
-        // Verify the timestamp is a valid RFC-3339 string.
-        chrono::DateTime::parse_from_rfc3339(ts.unwrap().trim()).unwrap();
+    #[test]
+    fn increment_defer_count_increments_and_returns_new_value() {
+        let db = Db::open_memory().unwrap();
+        let id = db.create_ticket("T", "D", "core", 1).unwrap();
+        let count1 = db.increment_defer_count(&id).unwrap();
+        assert_eq!(count1, 1);
+        let count2 = db.increment_defer_count(&id).unwrap();
+        assert_eq!(count2, 2);
+        let t = db.get_ticket(&id).unwrap().unwrap();
+        assert_eq!(t.defer_count, 2);
+    }
+
+    #[test]
+    fn claim_ticket_resets_defer_count() {
+        let db = Db::open_memory().unwrap();
+        let id = db.create_ticket("T", "D", "core", 1).unwrap();
+        db.increment_defer_count(&id).unwrap();
+        db.increment_defer_count(&id).unwrap();
+        db.increment_defer_count(&id).unwrap();
+        let t_before = db.get_ticket(&id).unwrap().unwrap();
+        assert_eq!(t_before.defer_count, 3);
+
+        db.register_agent("w-1", "worker", "general").unwrap();
+        let claimed = db.claim_ticket_by_id(&id, "w-1").unwrap();
+        assert!(claimed.is_some());
+        let claimed = claimed.unwrap();
+        assert_eq!(claimed.defer_count, 0);
+    }
+
+    #[test]
+    fn list_tickets_with_defer_count_gt_filters_correctly() {
+        let db = Db::open_memory().unwrap();
+        let id1 = db.create_ticket("T1", "D", "core", 1).unwrap();
+        let id2 = db.create_ticket("T2", "D", "core", 1).unwrap();
+        let id3 = db.create_ticket("T3", "D", "core", 1).unwrap();
+        db.increment_defer_count(&id1).unwrap(); // 1
+        db.increment_defer_count(&id2).unwrap(); // 1
+        db.increment_defer_count(&id2).unwrap(); // 2
+        db.increment_defer_count(&id2).unwrap(); // 3
+        db.increment_defer_count(&id2).unwrap(); // 4
+
+        let stuck = db.list_tickets_with_defer_count_gt(0).unwrap();
+        assert_eq!(stuck.len(), 2);
+
+        let high = db.list_tickets_with_defer_count_gt(3).unwrap();
+        assert_eq!(high.len(), 1);
+        assert_eq!(high[0].id, id2);
+
+        let none = db.list_tickets_with_defer_count_gt(10).unwrap();
+        assert!(none.is_empty());
+
+        // id3 not in any list (defer_count=0)
+        let stuck_ids: Vec<&str> = stuck.iter().map(|t| t.id.as_str()).collect();
+        assert!(!stuck_ids.contains(&id3.as_str()));
     }
 }

@@ -13,6 +13,9 @@ pub struct Ticket {
     pub notes: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Number of times this ticket has been conflict-deferred in the assign loop.
+    #[serde(default)]
+    pub defer_count: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
