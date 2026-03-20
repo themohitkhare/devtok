@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
 
@@ -95,6 +96,11 @@ const CI_CHECK_AFTER_MERGE_ENV: &str = "CI_CHECK_AFTER_MERGE";
 const CI_REGRESSION_TICKET_DOMAIN: &str = "core";
 const CI_REGRESSION_TICKET_PRIORITY_P1: i32 = 1;
 const CI_REGRESSION_FAILURE_SUMMARY_MAX_CHARS: usize = 500;
+
+/// Number of conflict deferrals before force-assigning (overrides file overlap protection).
+pub const CONFLICT_DEFER_FORCE_ASSIGN_THRESHOLD: i32 = 5;
+/// Log a warning when defer_count exceeds this value.
+pub const CONFLICT_DEFER_WARN_THRESHOLD: i32 = 3;
 
 struct CargoTestOutcome {
     ok: bool,
@@ -441,11 +447,12 @@ pub async fn run_loop(
     project_dir: std::path::PathBuf,
     mut shutdown: watch::Receiver<bool>,
     auto_merge: bool,
+    opus_limit_hit: Arc<AtomicBool>,
 ) {
     let cycle = Duration::from_secs(config.manager.cycle_seconds);
 
     loop {
-        if let Err(e) = run_cycle(&db, config, &project_dir, auto_merge) {
+        if let Err(e) = run_cycle(&db, config, &project_dir, auto_merge, &opus_limit_hit) {
             eprintln!("[manager] cycle error: {}", e);
         }
 
@@ -529,17 +536,32 @@ fn select_model_for_provider(
     provider: &str,
     agents: &crate::config::AgentConfig,
     ticket_priority: i32,
+    opus_limit_hit: bool,
 ) -> Option<String> {
     let tier = priority_tier_index(ticket_priority);
     match provider {
-        "claude" => pick_model_from_offers(&agents.claude_models, tier),
+        "claude" => {
+            if opus_limit_hit {
+                // Filter out Opus-tier models for the session; fall back to Sonnet or cheaper.
+                let filtered: Vec<String> = agents
+                    .claude_models
+                    .iter()
+                    .filter(|m| !m.to_lowercase().contains("opus"))
+                    .cloned()
+                    .collect();
+                pick_model_from_offers(&filtered, tier)
+                    .or_else(|| pick_model_from_offers(&agents.claude_models, tier.max(1)))
+            } else {
+                pick_model_from_offers(&agents.claude_models, tier)
+            }
+        }
         "codex" => pick_model_from_offers(&agents.codex_models, tier),
         "agent" => pick_model_from_offers(&agents.agent_models, tier),
         _ => None,
     }
 }
 
-fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path, auto_merge: bool) -> Result<()> {
+fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path, auto_merge: bool, opus_limit_hit: &Arc<AtomicBool>) -> Result<()> {
     let mut assignments = 0usize;
     let mut completions = 0usize;
     let mut unblocked = 0usize;
@@ -837,6 +859,32 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
     // 1. Claim and assign tickets to idle workers
     // -----------------------------------------------------------------------
     {
+        // Check if Opus limit was hit this session (from shared AtomicBool set by workers).
+        // Also scan recent events in case a worker from a previous manager restart hit the limit.
+        if !opus_limit_hit.load(Ordering::Relaxed) {
+            let guard = db.lock().unwrap();
+            if let Ok(recent) = guard.list_recent_events_of_type("opus_model_limit", 1) {
+                if !recent.is_empty() {
+                    opus_limit_hit.store(true, Ordering::Relaxed);
+                    eprintln!("[manager] Opus limit hit — downgrading all workers to Sonnet");
+                }
+            }
+        }
+        let opus_exhausted = opus_limit_hit.load(Ordering::Relaxed);
+
+        // Warn about stuck tickets that have been deferred many times.
+        {
+            let guard = db.lock().unwrap();
+            if let Ok(stuck) = guard.list_stuck_tickets(CONFLICT_DEFER_WARN_THRESHOLD) {
+                for t in &stuck {
+                    eprintln!(
+                        "[manager] ticket {} has been conflict-deferred {} time(s)",
+                        t.id, t.defer_count
+                    );
+                }
+            }
+        }
+
         let guard = db.lock().unwrap();
         let agents = guard.list_agents()?;
         drop(guard);
@@ -870,53 +918,29 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 let candidate_files = extract_file_hints(&candidate.title, &candidate.description);
                 let ratio = files_overlap_ratio(&candidate_files, &in_progress_files);
 
-                // Defer if >50% of the candidate's hinted files are already in progress,
-                // unless the ticket has been deferred >= 5 times (force-assign for liveness).
-                if ratio > 0.5 {
-                    let new_defer_count = {
-                        let guard = db.lock().unwrap();
-                        let count = guard.increment_defer_count(&candidate.id).unwrap_or(1);
-                        guard.log_event(
-                            Some("mgr"),
-                            "conflict_deferred",
-                            &format!(
-                                "ticket {} deferred: {:.0}% file overlap with in-progress tickets (files: {}) [defer_count={}]",
-                                candidate.id,
-                                ratio * 100.0,
-                                candidate_files.join(", "),
-                                count,
-                            ),
-                            None,
-                        )?;
-                        count
-                    };
-
-                    if new_defer_count >= 5 {
-                        // Force-assign: ticket has been starved too long — ignore file overlap.
-                        eprintln!(
-                            "[manager] force-assigning {} after 5 deferrals (ignoring file overlap)",
-                            candidate.id
-                        );
-                        let guard = db.lock().unwrap();
-                        guard.log_event(
-                            Some("mgr"),
-                            "force_assigned",
-                            &format!(
-                                "[manager] force-assigning {} after 5 deferrals",
-                                candidate.id
-                            ),
-                            None,
-                        )?;
-                        // Fall through to the claim below — don't continue.
-                    } else {
-                        eprintln!(
-                            "[manager] deferred ticket {} — {:.0}% file overlap (defer_count={})",
+                // Defer if >50% of the candidate's hinted files are already in progress.
+                if ratio > 0.5 && candidate.defer_count < CONFLICT_DEFER_FORCE_ASSIGN_THRESHOLD {
+                    let guard = db.lock().unwrap();
+                    let new_count = guard.increment_defer_count(&candidate.id).unwrap_or(candidate.defer_count + 1);
+                    guard.log_event(
+                        Some("mgr"),
+                        "conflict_deferred",
+                        &format!(
+                            "ticket {} deferred (count={}): {:.0}% file overlap with in-progress tickets (files: {})",
                             candidate.id,
+                            new_count,
                             ratio * 100.0,
-                            new_defer_count,
-                        );
-                        continue;
-                    }
+                            candidate_files.join(", ")
+                        ),
+                        None,
+                    )?;
+                    eprintln!(
+                        "[manager] deferred ticket {} (count={}) — {:.0}% file overlap",
+                        candidate.id,
+                        new_count,
+                        ratio * 100.0
+                    );
+                    continue;
                 }
 
                 // Attempt an atomic claim of this specific ticket.
@@ -942,7 +966,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
 
                 let persona = config.persona_for_domain(&ticket.domain).to_string();
                 let work_type = select_provider_for_ticket(&config.agents, &worker.id, &ticket.id);
-                let model = select_model_for_provider(&work_type, &config.agents, ticket.priority);
+                let model = select_model_for_provider(&work_type, &config.agents, ticket.priority, opus_exhausted);
 
                 // Pre-load KB entries so the worker has immediate context.
                 let (kb_entries, kb_context) = {
@@ -1443,11 +1467,16 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use std::sync::atomic::AtomicBool;
 
     fn setup() -> (Arc<Mutex<Db>>, Config) {
         let db = Db::open_memory().expect("in-memory db");
         let config = Config::default_for("test-project");
         (Arc::new(Mutex::new(db)), config)
+    }
+
+    fn no_opus_limit() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
     }
 
     // -----------------------------------------------------------------------
@@ -1463,7 +1492,7 @@ mod tests {
             g.create_ticket("Task A", "Do A", "general", 1).unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1482,7 +1511,7 @@ mod tests {
             g.create_ticket("Task A", "Do A", "general", 1).unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1506,7 +1535,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         // High priority (t-002, priority=1) should be assigned first
@@ -1526,7 +1555,7 @@ mod tests {
             g.create_ticket("Task B", "Do B", "general", 1).unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let t1 = g.get_ticket("t-001").unwrap().unwrap();
@@ -1583,7 +1612,7 @@ mod tests {
             g.create_ticket("Task A", "Do A", "general", 1).unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let msg = g.pop_inbox("w-1").unwrap();
@@ -1610,7 +1639,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1635,7 +1664,7 @@ mod tests {
             .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1660,7 +1689,7 @@ mod tests {
             .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1701,7 +1730,7 @@ mod tests {
             .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1729,7 +1758,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let msg = g.pop_inbox("w-1").unwrap().unwrap();
@@ -1754,7 +1783,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1773,7 +1802,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1800,7 +1829,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         assert_eq!(g.get_ticket("t-001").unwrap().unwrap().status, "completed");
@@ -1914,7 +1943,7 @@ mod tests {
             .unwrap();
         }
 
-        run_cycle(&db, &config, repo_path, false).unwrap();
+        run_cycle(&db, &config, repo_path, false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let score = g
@@ -1946,7 +1975,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-002").unwrap().unwrap();
@@ -1976,7 +2005,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-002").unwrap().unwrap();
@@ -1994,7 +2023,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -2028,7 +2057,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let tt1 = g.get_ticket("t-001").unwrap().unwrap();
@@ -2064,7 +2093,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let tt1 = g.get_ticket("t-001").unwrap().unwrap();
@@ -2089,7 +2118,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -2110,7 +2139,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         // t-001 was pending and got assigned (if idle workers exist), but not auto-reviewed
@@ -2132,7 +2161,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         assert_eq!(g.get_ticket("t-001").unwrap().unwrap().status, "completed");
@@ -2149,7 +2178,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let events = g.recent_events(10).unwrap();
@@ -2171,7 +2200,7 @@ mod tests {
 
         // Use the real repo path so git commands can run; branch won't exist so score=0 is fine.
         let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        run_cycle(&db, &config, &cwd, false).unwrap();
+        run_cycle(&db, &config, &cwd, false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         assert_eq!(g.get_ticket("t-001").unwrap().unwrap().status, "completed");
@@ -2193,7 +2222,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -2214,7 +2243,7 @@ mod tests {
 
         // Use real project dir so git runs, but no acs/t-001-* branch will exist.
         let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        run_cycle(&db, &config, &cwd, true).unwrap();
+        run_cycle(&db, &config, &cwd, true, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -2302,7 +2331,7 @@ mod tests {
             mid
         };
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ms = g.get_milestone(milestone_id).unwrap().unwrap();
@@ -2358,7 +2387,7 @@ mod tests {
             mid
         };
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ms = g.get_milestone(milestone_id).unwrap().unwrap();
@@ -2412,7 +2441,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         // t-001: review_pending → completed (auto-review)
@@ -2514,7 +2543,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let msg = g
@@ -2560,7 +2589,7 @@ mod tests {
             // No KB entries written
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let msg = g
@@ -2662,7 +2691,7 @@ mod tests {
             .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let msg = g
@@ -2692,7 +2721,7 @@ mod tests {
             // No checkpoint KB entry and no git branch.
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let msg = g
@@ -2722,7 +2751,7 @@ mod tests {
             g.requeue_ticket_rate_limited("t-001", 0).unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -2749,7 +2778,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -2774,7 +2803,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
 
         let expected_backoffs: &[(i32, u64)] = &[(0, 30), (1, 60), (2, 120), (3, 240)];
         for &(current_strikes, expected_secs) in expected_backoffs {
@@ -2808,7 +2837,7 @@ mod tests {
             };
             assert_eq!(strikes, current_strikes + 1);
 
-            run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+            run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false, &no_opus_limit()).unwrap();
             {
                 let g = db.lock().unwrap();
                 let t = g.get_ticket("t-001").unwrap().unwrap();
