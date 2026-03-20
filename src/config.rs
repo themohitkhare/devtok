@@ -151,6 +151,15 @@ pub struct BackendsConfig {
     /// A special `"default"` key within the routing table sets the fallback backend.
     /// Example: `{ "qa" → "cursor", "core" → "claude" }`
     pub routing: HashMap<String, String>,
+    /// Provider failover order (t-090). Workers try providers in this order,
+    /// skipping BLACKLISTED ones. Empty means no failover order is configured.
+    /// Example: `['claude', 'cursor', 'codex']`
+    pub failover_order: Vec<String>,
+    /// Per-provider quota-error strings (t-090). When a worker log contains
+    /// any of these strings for the active provider, it is treated as a quota
+    /// exhaustion (not a generic rate-limit).
+    /// Example: `{ claude = ['usage limit for Opus', 'Spend Limit'] }`
+    pub quota_errors: HashMap<String, Vec<String>>,
 }
 
 impl BackendsConfig {
@@ -169,7 +178,7 @@ impl BackendsConfig {
 
 impl Default for BackendsConfig {
     fn default() -> Self {
-        Self { default: "claude".into(), definitions: HashMap::new(), routing: HashMap::new() }
+        Self { default: "claude".into(), definitions: HashMap::new(), routing: HashMap::new(), failover_order: vec!["claude".into(), "cursor".into(), "codex".into()] }
     }
 }
 
@@ -215,7 +224,7 @@ impl<'de> serde::Deserialize<'de> for BackendsConfig {
             definitions.insert(k.clone(), bt);
         }
 
-        Ok(BackendsConfig { default, definitions, routing })
+        Ok(BackendsConfig { default, definitions, routing, failover_order: vec!["claude".into(), "cursor".into(), "codex".into()] })
     }
 }
 

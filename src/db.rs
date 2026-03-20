@@ -13,7 +13,7 @@ pub struct Db {
 }
 
 impl Db {
-    const CURRENT_SCHEMA_VERSION: i64 = 3;
+    pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
