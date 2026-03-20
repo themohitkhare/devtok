@@ -1071,6 +1071,49 @@ impl Db {
 }
 
 impl Db {
+    /// Tickets completed (status = 'completed') with updated_at >= since_rfc3339.
+    pub fn tickets_completed_since(&self, since_rfc3339: &str) -> Result<Vec<Ticket>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at \
+             FROM tickets WHERE status = 'completed' AND updated_at >= ?1 ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![since_rfc3339], Self::row_to_ticket)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Rolling 7-day ticket velocity: tickets completed in last 7 days / 7.
+    pub fn velocity_7day(&self) -> Result<f64> {
+        let since = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tickets WHERE status = 'completed' AND updated_at >= ?1",
+            params![since],
+            |row| row.get(0),
+        )?;
+        Ok(count as f64 / 7.0)
+    }
+
+    /// Sum of input+output tokens for events with timestamp >= since_rfc3339.
+    pub fn token_details_since(&self, since_rfc3339: &str) -> Result<(i64, i64)> {
+        let (input, output) = self.conn.query_row(
+            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0) FROM events WHERE timestamp >= ?1",
+            params![since_rfc3339],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        Ok((input, output))
+    }
+
+    /// Timestamp when a ticket was last assigned (from ticket_assignment events).
+    pub fn ticket_assigned_at(&self, ticket_id: &str) -> Result<Option<String>> {
+        let ts = self.conn.query_row(
+            "SELECT timestamp FROM events WHERE event_type = 'ticket_assignment' AND ticket_id = ?1 ORDER BY id DESC LIMIT 1",
+            params![ticket_id],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(ts)
+    }
+}
+
+impl Db {
     pub fn schema_version(&self) -> Result<i64> {
         self.conn
             .query_row(

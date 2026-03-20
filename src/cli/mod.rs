@@ -17,6 +17,7 @@ pub mod reject;
 pub mod report;
 pub mod restart;
 pub mod run;
+pub mod standup;
 pub mod status;
 pub mod status_live;
 pub mod stop;
@@ -46,9 +47,9 @@ pub enum Commands {
     Plan,
     /// Start manager + workers to execute tickets
     Run {
-        /// Number of worker agents
-        #[arg(long, default_value = "2")]
-        workers: usize,
+        /// Number of worker agents (overrides profile/config default)
+        #[arg(long)]
+        workers: Option<usize>,
         /// Backend provider: claude, cursor, codex, or mixed (first half claude, second half cursor)
         #[arg(long)]
         backend: Option<String>,
@@ -58,12 +59,15 @@ pub enum Commands {
         /// Minimum workers to keep when autoscaling
         #[arg(long, default_value = "1")]
         min_workers: usize,
+        /// Named config profile (dev/ci/prod). Also set via ACS_PROFILE env var.
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Iteratively run manager/workers + incremental bootstrap (self-development loop)
     Evolve {
-        /// Number of worker agents
-        #[arg(long, default_value = "2")]
-        workers: usize,
+        /// Number of worker agents (overrides profile/config default)
+        #[arg(long)]
+        workers: Option<usize>,
         /// Maximum evolution iterations
         #[arg(long, default_value = "1")]
         max_iterations: usize,
@@ -89,6 +93,9 @@ pub enum Commands {
         /// Backend provider: claude, cursor, codex, or mixed (first half claude, second half cursor)
         #[arg(long)]
         backend: Option<String>,
+        /// Named config profile (dev/ci/prod). Also set via ACS_PROFILE env var.
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Show project status
     Status {
@@ -170,4 +177,13 @@ pub enum Commands {
     /// Quality scoring and North Star metrics
     #[command(subcommand)]
     Quality(quality::QualityCommands),
+    /// Generate a daily standup summary (completed, in-progress, blocked, metrics)
+    Standup {
+        /// Output machine-readable JSON instead of human text
+        #[arg(long)]
+        json: bool,
+        /// Post the standup as a GitHub issue comment (requires gh CLI)
+        #[arg(long)]
+        post_github: bool,
+    },
 }
