@@ -11,6 +11,9 @@ pub enum TicketCommands {
     List {
         #[arg(long)]
         status: Option<String>,
+        /// Show only tickets stuck in conflict-deferral loop (defer_count > 0)
+        #[arg(long, default_value = "false")]
+        stuck: bool,
     },
     /// Create a ticket
     Create {
@@ -121,8 +124,12 @@ pub fn execute(cmd: TicketCommands) -> Result<()> {
             let out = serde_json::json!({ "status": "created", "id": id });
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
-        TicketCommands::List { status } => {
-            let tickets = db.list_tickets(status.as_deref())?;
+        TicketCommands::List { status, stuck } => {
+            let tickets = if stuck {
+                db.list_tickets_with_defer_count_gt(0)?
+            } else {
+                db.list_tickets(status.as_deref())?
+            };
             println!("{}", serde_json::to_string_pretty(&tickets)?);
         }
         TicketCommands::Update { id, status, notes, blocked_by } => {
@@ -183,6 +190,7 @@ fn print_ticket_card(ticket: &crate::models::Ticket) {
         ticket.assignee.as_deref().unwrap_or("<none>"));
     println!("│ {:<20} {:<37} │", "Blocked by:",
         ticket.blocked_by.as_deref().unwrap_or("<none>"));
+    println!("│ {:<20} {:<37} │", "Defer count:", ticket.defer_count);
     println!("│ {:<20} {:<37} │", "Created:", ticket.created_at);
     println!("│ {:<20} {:<37} │", "Updated:", ticket.updated_at);
     println!("├{}┤", sep);

@@ -28,18 +28,20 @@ pub struct HealthReport {
     pub orphaned_worktrees: CheckReport,
     pub git_merge_safety: CheckReport,
     pub blocked_vs_stale: CheckReport,
+    pub conflict_deferred_warnings: CheckReport,
 }
 
 impl HealthReport {
     pub fn short_summary(&self) -> String {
         format!(
-            "overall={} db={} stuck_workers={} orphaned_worktrees={} git_merge_safety={} blocked_vs_stale={}",
+            "overall={} db={} stuck_workers={} orphaned_worktrees={} git_merge_safety={} blocked_vs_stale={} conflict_deferred_warnings={}",
             self.overall,
             self.db.status,
             self.stuck_workers.status,
             self.orphaned_worktrees.status,
             self.git_merge_safety.status,
-            self.blocked_vs_stale.status
+            self.blocked_vs_stale.status,
+            self.conflict_deferred_warnings.status
         )
     }
 }
@@ -90,12 +92,25 @@ pub fn run_health_checks(project_dir: &Path, acs_dir: &Path, config: &Config) ->
         }
     };
 
+    let conflict_deferred_warnings_report = if db_report.status == STATUS_OK {
+        check_conflict_deferred_warnings(&db_path)
+    } else {
+        CheckReport {
+            status: STATUS_ERROR.to_string(),
+            details: Some(json!({
+                "reason": "db_unavailable_or_locked",
+                "db_check_status": db_report.status,
+            })),
+        }
+    };
+
     let overall = worst_overall_status(&[
         &db_report,
         &stuck_workers_report,
         &orphaned_worktrees_report,
         &git_merge_safety_report,
         &blocked_vs_stale_report,
+        &conflict_deferred_warnings_report,
     ]);
 
     HealthReport {
@@ -105,6 +120,7 @@ pub fn run_health_checks(project_dir: &Path, acs_dir: &Path, config: &Config) ->
         orphaned_worktrees: orphaned_worktrees_report,
         git_merge_safety: git_merge_safety_report,
         blocked_vs_stale: blocked_vs_stale_report,
+        conflict_deferred_warnings: conflict_deferred_warnings_report,
     }
 }
 
@@ -504,6 +520,49 @@ fn compute_blocked_vs_stale(db: &Db) -> Result<(Vec<String>, Vec<String>)> {
     }
 
     Ok((truly_blocked, stale))
+}
+
+fn check_conflict_deferred_warnings(db_path: &Path) -> CheckReport {
+    let db = match Db::open(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            return CheckReport {
+                status: STATUS_ERROR.to_string(),
+                details: Some(json!({ "error": e.to_string() })),
+            };
+        }
+    };
+
+    let high_defer = match db.list_tickets_with_defer_count_gt(3) {
+        Ok(v) => v,
+        Err(e) => {
+            return CheckReport {
+                status: STATUS_ERROR.to_string(),
+                details: Some(json!({ "error": e.to_string() })),
+            };
+        }
+    };
+
+    if high_defer.is_empty() {
+        CheckReport {
+            status: STATUS_OK.to_string(),
+            details: Some(json!({ "high_defer_count": 0 })),
+        }
+    } else {
+        let sample: Vec<serde_json::Value> = high_defer
+            .iter()
+            .take(25)
+            .map(|t| json!({ "ticket_id": t.id, "defer_count": t.defer_count, "status": t.status }))
+            .collect();
+        CheckReport {
+            status: STATUS_WARN.to_string(),
+            details: Some(json!({
+                "high_defer_count": high_defer.len(),
+                "tickets": sample,
+                "note": "tickets deferred >3 times may be stuck in conflict loop"
+            })),
+        }
+    }
 }
 
 fn check_blocked_vs_stale(_project_dir: &Path, _acs_dir: &Path, db_path: &Path) -> CheckReport {

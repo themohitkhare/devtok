@@ -643,26 +643,53 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 let candidate_files = extract_file_hints(&candidate.title, &candidate.description);
                 let ratio = files_overlap_ratio(&candidate_files, &in_progress_files);
 
-                // Defer if >50% of the candidate's hinted files are already in progress.
+                // Defer if >50% of the candidate's hinted files are already in progress,
+                // unless the ticket has been deferred >= 5 times (force-assign for liveness).
                 if ratio > 0.5 {
-                    let guard = db.lock().unwrap();
-                    guard.log_event(
-                        Some("mgr"),
-                        "conflict_deferred",
-                        &format!(
-                            "ticket {} deferred: {:.0}% file overlap with in-progress tickets (files: {})",
+                    let new_defer_count = {
+                        let guard = db.lock().unwrap();
+                        let count = guard.increment_defer_count(&candidate.id).unwrap_or(1);
+                        guard.log_event(
+                            Some("mgr"),
+                            "conflict_deferred",
+                            &format!(
+                                "ticket {} deferred: {:.0}% file overlap with in-progress tickets (files: {}) [defer_count={}]",
+                                candidate.id,
+                                ratio * 100.0,
+                                candidate_files.join(", "),
+                                count,
+                            ),
+                            None,
+                        )?;
+                        count
+                    };
+
+                    if new_defer_count >= 5 {
+                        // Force-assign: ticket has been starved too long — ignore file overlap.
+                        eprintln!(
+                            "[manager] force-assigning {} after 5 deferrals (ignoring file overlap)",
+                            candidate.id
+                        );
+                        let guard = db.lock().unwrap();
+                        guard.log_event(
+                            Some("mgr"),
+                            "force_assigned",
+                            &format!(
+                                "[manager] force-assigning {} after 5 deferrals",
+                                candidate.id
+                            ),
+                            None,
+                        )?;
+                        // Fall through to the claim below — don't continue.
+                    } else {
+                        eprintln!(
+                            "[manager] deferred ticket {} — {:.0}% file overlap (defer_count={})",
                             candidate.id,
                             ratio * 100.0,
-                            candidate_files.join(", ")
-                        ),
-                        None,
-                    )?;
-                    eprintln!(
-                        "[manager] deferred ticket {} — {:.0}% file overlap",
-                        candidate.id,
-                        ratio * 100.0
-                    );
-                    continue;
+                            new_defer_count,
+                        );
+                        continue;
+                    }
                 }
 
                 // Attempt an atomic claim of this specific ticket.
