@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
@@ -59,6 +60,12 @@ fn format_kb_context(entries: &[crate::models::KnowledgeEntry]) -> String {
         .map(|entry| format!("**{}/{}:** {}", entry.domain, entry.key, entry.value))
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn parse_rfc3339_to_utc(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Builds a pre-loaded KB context string for tests.
@@ -239,6 +246,9 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
             (agents, tickets)
         };
 
+        let timeout_seconds = config.manager.worker_timeout_seconds;
+        let now = Utc::now();
+
         for ticket in in_progress_tickets {
             let assignee_id = match ticket.assignee.as_deref() {
                 Some(a) if !a.is_empty() => a,
@@ -251,7 +261,26 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 Some(agent) => agent.current_ticket.as_deref() != Some(ticket.id.as_str()),
             };
 
-            if should_requeue {
+            let updated_at_utc = match parse_rfc3339_to_utc(&ticket.updated_at) {
+                Some(ts) => ts,
+                None => {
+                    eprintln!(
+                        "[manager] skipping stale requeue for ticket {}: invalid updated_at '{}'",
+                        ticket.id, ticket.updated_at
+                    );
+                    continue;
+                }
+            };
+
+            // Only treat mismatched assignments as stale once the ticket has
+            // aged past the configured worker timeout. This prevents immediate
+            // re-queue churn while workers are starting up.
+            let age_secs = now
+                .signed_duration_since(updated_at_utc)
+                .num_seconds();
+            let is_old_enough = age_secs >= timeout_seconds as i64;
+
+            if should_requeue && is_old_enough {
                 let note = format!(
                     "Re-queued stale in_progress: assignee={} current_ticket={:?}",
                     assignee_id,
@@ -1111,7 +1140,9 @@ mod tests {
 
     #[test]
     fn requeues_stale_in_progress_assigned_to_working_agent_on_other_ticket() {
-        let (db, config) = setup();
+        let (db, mut config) = setup();
+        // Ensure the time gate doesn't block this regression test.
+        config.manager.worker_timeout_seconds = 0;
         {
             let g = db.lock().unwrap();
             g.register_agent("w-0", "worker", "backend-dev").unwrap();
@@ -1140,6 +1171,42 @@ mod tests {
         assert_eq!(tt1.status, "in_progress");
         assert_eq!(tt2.status, "pending");
         assert!(tt2.assignee.is_none());
+    }
+
+    #[test]
+    fn does_not_requeue_stale_in_progress_within_worker_timeout() {
+        let (db, mut config) = setup();
+        config.manager.worker_timeout_seconds = 3600;
+
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-0", "worker", "backend-dev").unwrap();
+
+            // Agent is working on t-001.
+            g.update_agent("w-0", "working", Some("t-001"), None)
+                .unwrap();
+
+            // Two tickets are in_progress and both assigned to w-0:
+            // - t-001 matches current_ticket and should remain in_progress.
+            // - t-002 mismatches current_ticket but is "fresh" relative to
+            //   worker_timeout, so it should NOT be re-queued.
+            let t1 = g.create_ticket("T1", "Do", "general", 1).unwrap();
+            let t2 = g.create_ticket("T2", "Do", "general", 1).unwrap();
+            g.update_ticket(&t1, "in_progress", None, None, Some(Some("w-0")))
+                .unwrap();
+            g.update_ticket(&t2, "in_progress", None, None, Some(Some("w-0")))
+                .unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let tt1 = g.get_ticket("t-001").unwrap().unwrap();
+        let tt2 = g.get_ticket("t-002").unwrap().unwrap();
+
+        assert_eq!(tt1.status, "in_progress");
+        assert_eq!(tt2.status, "in_progress");
+        assert_eq!(tt2.assignee.as_deref(), Some("w-0"));
     }
 
     // -----------------------------------------------------------------------
