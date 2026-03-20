@@ -1,6 +1,7 @@
 pub mod acs_dir;
 pub mod approve;
 pub mod check;
+pub mod doctor;
 pub mod cleanup;
 pub mod cost;
 pub mod evolve;
@@ -173,4 +174,10 @@ pub enum Commands {
     Quality(quality::QualityCommands),
     /// Check for and install the latest ACS release from GitHub Releases
     Update(update::UpdateArgs),
+    /// Validate the environment and auto-fix common issues
+    Doctor {
+        /// Apply automatic fixes (read-only by default)
+        #[arg(long)]
+        fix: bool,
+    },
 }

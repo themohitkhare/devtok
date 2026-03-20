@@ -76,6 +76,7 @@ fn main() -> ExitCode {
         cli::Commands::Reject { reason } => cli::reject::execute(reason),
         cli::Commands::Quality(cmd) => cli::quality::execute(cmd),
         cli::Commands::Update(args) => cli::update::execute(args),
+        cli::Commands::Doctor { fix } => cli::doctor::execute(fix),
     };
 
     match result {
