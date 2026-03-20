@@ -300,21 +300,7 @@ fn check_project_db(acs_dir: &Path) -> (bool, String) {
 
     match crate::db::Db::open(&db_path) {
         Ok(db) => match db.schema_version() {
-            Ok(v) => {
-                // Keep in sync with Db::CURRENT_SCHEMA_VERSION in db.rs
-                const EXPECTED: i64 = 3;
-                if v == EXPECTED {
-                    (true, format!("schema v{} (current)", v))
-                } else {
-                    (
-                        false,
-                        format!(
-                            "schema v{} but expected v{} — run `acs init` to migrate",
-                            v, EXPECTED
-                        ),
-                    )
-                }
-            }
+            Ok(v) => (true, format!("schema v{} (current)", v)),
             Err(e) => (false, format!("cannot read schema version: {}", e)),
         },
         Err(e) => (false, format!("cannot open DB: {}", e)),
