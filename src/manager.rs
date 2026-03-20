@@ -93,12 +93,19 @@ fn make_ci_failure_summary(outcome: &CargoTestOutcome) -> String {
         outcome.stdout.as_str()
     };
 
-    // Keep the summary stable/deterministic: exit code prefix + first N chars.
-    let prefix = format!("cargo test failed (exit code {})\n\n", outcome.exit_code);
-    truncate_chars(
-        &(prefix + failure_body),
-        CI_REGRESSION_FAILURE_SUMMARY_MAX_CHARS,
-    )
+    // Keep the summary stable/deterministic: exit code prefix + single-line failure body.
+    let body_one_line = failure_body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let prefix = format!("cargo test failed (exit code {})", outcome.exit_code);
+    let combined = if body_one_line.is_empty() {
+        prefix
+    } else {
+        format!("{}: {}", prefix, body_one_line)
+    };
+
+    truncate_chars(&combined, CI_REGRESSION_FAILURE_SUMMARY_MAX_CHARS)
 }
 
 fn record_ci_regression(db: &Db, branch: &str, failure_summary: &str) -> Result<String> {
@@ -1483,6 +1490,28 @@ mod tests {
         assert!(
             regression_event.unwrap().detail.contains(&ticket_id),
             "ci_regression event should reference created ticket id"
+        );
+    }
+
+    #[test]
+    fn ci_failure_summary_is_single_line_and_mentions_exit_code() {
+        let outcome = CargoTestOutcome {
+            ok: false,
+            exit_code: 42,
+            stdout: "stdout line 1\nstdout\tline 2".to_string(),
+            stderr: "stderr line 1\nstderr\tline 2".to_string(),
+        };
+
+        let summary = make_ci_failure_summary(&outcome);
+        assert!(!summary.contains('\n'), "summary should collapse newlines");
+        assert!(!summary.contains('\t'), "summary should collapse tabs");
+        assert!(
+            summary.contains("exit code 42"),
+            "summary should include exit code context"
+        );
+        assert!(
+            summary.len() <= CI_REGRESSION_FAILURE_SUMMARY_MAX_CHARS,
+            "summary should be truncated to max chars"
         );
     }
 
