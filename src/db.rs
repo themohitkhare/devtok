@@ -13,6 +13,8 @@ pub struct Db {
 }
 
 impl Db {
+    const CURRENT_SCHEMA_VERSION: i64 = 2;
+
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
@@ -29,6 +31,29 @@ impl Db {
     }
 
     fn migrate(&self) -> Result<()> {
+        // Tracks DB schema state so we can safely evolve migrations over time.
+        // (Ticket t-062 / DB2)
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                schema_version INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );"
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_meta (id, schema_version, updated_at) VALUES (1, 1, ?1)",
+            params![now],
+        )?;
+        let current_version: i64 = self
+            .conn
+            .query_row(
+                "SELECT schema_version FROM schema_meta WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(1);
+
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tickets (
                 id TEXT PRIMARY KEY,
@@ -120,20 +145,27 @@ impl Db {
             );"
         )?;
 
-        // Additive migrations: add new columns to existing tables.
-        // SQLite returns an error when the column already exists; we ignore it.
-        let _ = self.conn.execute_batch(
-            "ALTER TABLE events ADD COLUMN input_tokens INTEGER DEFAULT 0;
-             ALTER TABLE events ADD COLUMN output_tokens INTEGER DEFAULT 0;
-             ALTER TABLE events ADD COLUMN ticket_id TEXT;
-             ALTER TABLE events ADD COLUMN model TEXT;",
-        );
+        if current_version < Self::CURRENT_SCHEMA_VERSION {
+            // Additive migrations: add new columns to existing tables.
+            // SQLite returns an error when the column already exists; we ignore it.
+            let _ = self.conn.execute_batch(
+                "ALTER TABLE events ADD COLUMN input_tokens INTEGER DEFAULT 0;
+                 ALTER TABLE events ADD COLUMN output_tokens INTEGER DEFAULT 0;
+                 ALTER TABLE events ADD COLUMN ticket_id TEXT;
+                 ALTER TABLE events ADD COLUMN model TEXT;",
+            );
 
-        // Rate-limit tracking columns on tickets.
-        let _ = self.conn.execute_batch(
-            "ALTER TABLE tickets ADD COLUMN rate_limit_strikes INTEGER NOT NULL DEFAULT 0;
-             ALTER TABLE tickets ADD COLUMN rate_limit_retry_after TEXT;",
-        );
+            // Rate-limit tracking columns on tickets.
+            let _ = self.conn.execute_batch(
+                "ALTER TABLE tickets ADD COLUMN rate_limit_strikes INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE tickets ADD COLUMN rate_limit_retry_after TEXT;",
+            );
+        }
+
+        self.conn.execute(
+            "UPDATE schema_meta SET schema_version = ?1, updated_at = ?2 WHERE id = 1",
+            params![Self::CURRENT_SCHEMA_VERSION, now],
+        )?;
 
         Ok(())
     }
@@ -1035,5 +1067,28 @@ impl Db {
             score: row.get(4)?,
             computed_at: row.get(5)?,
         })
+    }
+}
+
+impl Db {
+    pub fn schema_version(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT schema_version FROM schema_meta WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_version_is_current() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(db.schema_version().unwrap(), Db::CURRENT_SCHEMA_VERSION);
     }
 }
