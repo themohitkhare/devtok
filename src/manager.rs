@@ -581,7 +581,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 let spawner = Spawner::new_with_agent_config(project_dir, &config.agents);
                 match spawner.find_branch_for_ticket(&ticket.id) {
                     Ok(Some(branch)) => {
-                        match spawner.merge_branch(&branch) {
+                        match spawner.merge_branch(&branch, "main") {
                             Ok(true) => {
                                 // Merge succeeded — clean up branch, mark completed, rebuild.
                                 spawner.delete_branch(&branch);
