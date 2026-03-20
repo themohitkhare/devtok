@@ -416,7 +416,8 @@ impl Db {
     /// List tickets whose defer_count exceeds the given threshold, ordered by defer_count desc.
     pub fn list_tickets_with_defer_count_gt(&self, threshold: i32) -> Result<Vec<Ticket>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at, COALESCE(defer_count, 0)
+            "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at,
+                    COALESCE(defer_count, 0), files_hint
              FROM tickets WHERE COALESCE(defer_count, 0) > ?1 ORDER BY defer_count DESC, created_at"
         )?;
         let rows = stmt.query_map(params![threshold], Self::row_to_ticket)?;
