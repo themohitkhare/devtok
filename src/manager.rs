@@ -15,7 +15,7 @@ use crate::quality::{
     compute_score, detect_changes_from_scoring_ref, notes_contain_ac_verification,
     resolve_scoring_ref, score_ticket_from_branch,
 };
-use crate::spawner::Spawner;
+use crate::spawner::{MergeOutcome, Spawner};
 
 /// Builds a structured pre-loaded list of KB entries for a worker's ticket assignment.
 ///
@@ -624,7 +624,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 match spawner.find_branch_for_ticket(&ticket.id) {
                     Ok(Some(branch)) => {
                         match spawner.merge_branch(&branch, &config.project.base_branch) {
-                            Ok(true) => {
+                            Ok(MergeOutcome::Success) => {
                                 // Merge succeeded — clean up branch, mark completed, rebuild.
                                 spawner.delete_branch(&branch);
                                 {
@@ -663,8 +663,8 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                                 post_merge_rebuild(db.clone(), project_dir.to_path_buf());
                                 reviewed += 1;
                             }
-                            Ok(false) => {
-                                // Merge conflict — escalate to human.
+                            Ok(MergeOutcome::RebaseConflict) | Ok(MergeOutcome::MergeConflict) => {
+                                // Conflict — escalate to human.
                                 let existing_notes = {
                                     let guard = db.lock().unwrap();
                                     guard
@@ -1216,7 +1216,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                             }
 
                             match spawner.merge_branch(&branch, &config.project.base_branch) {
-                                Ok(true) => {
+                                Ok(MergeOutcome::Success) => {
                                     // Merge succeeded — clean up the branch
                                     spawner.delete_branch(&branch);
                                     {
@@ -1245,8 +1245,8 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                                     );
                                     merged += 1;
                                 }
-                                Ok(false) => {
-                                    // Merge conflict — re-queue the ticket
+                                Ok(MergeOutcome::RebaseConflict) | Ok(MergeOutcome::MergeConflict) => {
+                                    // Conflict — re-queue the ticket
                                     spawner.delete_branch(&branch);
                                     {
                                         let guard = db.lock().unwrap();

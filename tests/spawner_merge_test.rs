@@ -1,7 +1,7 @@
 use std::process::Command;
 use std::path::Path;
 
-use acs::spawner::Spawner;
+use acs::spawner::{MergeOutcome, Spawner};
 
 /// Creates a temporary git repository with an initial commit, returning the tempdir.
 fn setup_git_repo() -> tempfile::TempDir {
@@ -70,7 +70,7 @@ fn test_merge_branch_success() {
 
     let s = spawner(p);
     let result = s.merge_branch("acs/t-002-1234", "main").unwrap();
-    assert!(result, "merge should succeed");
+    assert_eq!(result, MergeOutcome::Success, "merge should succeed");
 
     // Verify the file exists on main now
     assert!(p.join("feature.txt").exists());
@@ -95,9 +95,9 @@ fn test_merge_branch_conflict() {
 
     let s = spawner(p);
     let result = s.merge_branch("acs/t-003-5678", "main").unwrap();
-    assert!(!result, "merge should fail due to conflict");
+    assert_eq!(result, MergeOutcome::RebaseConflict, "conflicting histories should return RebaseConflict");
 
-    // Verify main is still clean (merge was aborted)
+    // Verify main is still clean (rebase was aborted, back on main)
     let content = std::fs::read_to_string(p.join("README.md")).unwrap();
     assert_eq!(content, "main content\n");
 }
