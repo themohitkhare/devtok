@@ -385,6 +385,20 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
                         })
                         .to_string();
                         db.write_knowledge(&domain, &kb_key, &kb_value)?;
+                        // Persist a learning entry so future workers benefit from this outcome.
+                        let learning_key = format!("t-{}-success", ticket_id.trim_start_matches("t-"));
+                        let learning_value = serde_json::json!({
+                            "ticket_id": ticket_id,
+                            "domain": domain,
+                            "outcome": "success",
+                            "approach": format!(
+                                "Ticket {} completed successfully (tests_passed={}, model={:?})",
+                                ticket_id, tests_passed, model
+                            ),
+                            "timestamp": Utc::now().to_rfc3339()
+                        })
+                        .to_string();
+                        let _ = db.write_knowledge("learning", &learning_key, &learning_value);
                         db.push_inbox(
                             "mgr",
                             "ticket_completed",
@@ -464,6 +478,20 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
                             &format!("ticket {} exited with code {}, re-queued", ticket_id, code),
                             None,
                         )?;
+                        // Persist a failure learning so the next retry knows what was tried.
+                        let learning_key = format!("t-{}-failure", ticket_id.trim_start_matches("t-"));
+                        let learning_value = serde_json::json!({
+                            "ticket_id": ticket_id,
+                            "domain": domain,
+                            "outcome": "failure",
+                            "approach": format!(
+                                "Ticket {} exited with code {} — re-queued for retry",
+                                ticket_id, code
+                            ),
+                            "timestamp": Utc::now().to_rfc3339()
+                        })
+                        .to_string();
+                        let _ = db.write_knowledge("learning", &learning_key, &learning_value);
                     }
 
                     let _ = spawner.remove_worktree(worker_id);

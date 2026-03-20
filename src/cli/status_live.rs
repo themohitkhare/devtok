@@ -42,6 +42,8 @@ struct AppState {
     acs_dir: PathBuf,
     /// Agent log lines: (worker_id, line)
     agent_log_lines: Vec<(String, String)>,
+    /// RFC-3339 timestamp of the last binary rebuild, if any
+    last_rebuilt_at: Option<String>,
 }
 
 impl AppState {
@@ -50,6 +52,7 @@ impl AppState {
         let agents = db.list_agents()?;
         let recent_events = db.recent_events(LOG_TAIL_LINES)?;
         let (input_tokens, output_tokens) = db.total_token_details()?;
+        let last_rebuilt_at = db.last_rebuilt_at().unwrap_or(None);
 
         let agent_log_lines = load_agent_logs(&agents, acs_dir);
 
@@ -62,6 +65,7 @@ impl AppState {
             last_refresh: chrono::Local::now(),
             acs_dir: acs_dir.to_path_buf(),
             agent_log_lines,
+            last_rebuilt_at,
         })
     }
 
@@ -194,11 +198,35 @@ fn draw(f: &mut ratatui::Frame, state: &AppState) {
     draw_footer(f, outer[2]);
 }
 
+fn format_time_ago(ts: &str) -> String {
+    use chrono::Utc;
+    match chrono::DateTime::parse_from_rfc3339(ts) {
+        Ok(dt) => {
+            let secs = Utc::now()
+                .signed_duration_since(dt.with_timezone(&Utc))
+                .num_seconds()
+                .max(0);
+            if secs < 60 {
+                format!("{}s ago", secs)
+            } else if secs < 3600 {
+                format!("{}m ago", secs / 60)
+            } else {
+                format!("{}h ago", secs / 3600)
+            }
+        }
+        Err(_) => ts.to_string(),
+    }
+}
+
 fn draw_title(f: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let refresh_str = state.last_refresh.format("%H:%M:%S").to_string();
+    let rebuilt_str = match &state.last_rebuilt_at {
+        Some(ts) => format!("  •  Last rebuilt: {}", format_time_ago(ts)),
+        None => String::new(),
+    };
     let title = Paragraph::new(format!(
-        " ACS Live Status Monitor  —  Last refresh: {}",
-        refresh_str
+        " ACS Live Status Monitor  —  Last refresh: {}{}",
+        refresh_str, rebuilt_str
     ))
     .style(
         Style::default()
@@ -483,6 +511,7 @@ mod tests {
             last_refresh: chrono::Local::now(),
             acs_dir: dummy_acs_dir(),
             agent_log_lines: vec![],
+            last_rebuilt_at: None,
         };
 
         assert_eq!(state.completed(), 3);
@@ -503,6 +532,7 @@ mod tests {
             last_refresh: chrono::Local::now(),
             acs_dir: dummy_acs_dir(),
             agent_log_lines: vec![],
+            last_rebuilt_at: None,
         };
 
         assert_eq!(state.total(), 6);
@@ -519,6 +549,7 @@ mod tests {
             last_refresh: chrono::Local::now(),
             acs_dir: dummy_acs_dir(),
             agent_log_lines: vec![],
+            last_rebuilt_at: None,
         };
 
         assert_eq!(state.completed(), 0);
@@ -609,6 +640,7 @@ fn status_live_draw_smoke_empty_state() {
         last_refresh: chrono::Local::now(),
         acs_dir,
         agent_log_lines: vec![],
+        last_rebuilt_at: None,
     };
     terminal.draw(|f| draw(f, &state)).unwrap();
 }

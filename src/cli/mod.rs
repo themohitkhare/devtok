@@ -94,9 +94,9 @@ pub enum Commands {
         /// Backend provider: claude, cursor, codex, or mixed (first half claude, second half cursor)
         #[arg(long)]
         backend: Option<String>,
-        /// Named config profile (dev/ci/prod). Also set via ACS_PROFILE env var.
-        #[arg(long)]
-        profile: Option<String>,
+        /// Auto-merge approved tickets to main and rebuild the acs binary (opt-in)
+        #[arg(long, default_value = "false")]
+        auto_merge: bool,
     },
     /// Show project status
     Status {

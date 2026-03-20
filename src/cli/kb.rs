@@ -20,6 +20,12 @@ pub enum KbCommands {
         #[arg(long)]
         value: String,
     },
+    /// List knowledge base entries, optionally filtered by type (domain)
+    List {
+        /// Filter by type/domain (e.g. --type learning)
+        #[arg(long = "type")]
+        kb_type: Option<String>,
+    },
 }
 
 pub fn execute(cmd: KbCommands) -> Result<()> {
@@ -38,6 +44,13 @@ pub fn execute(cmd: KbCommands) -> Result<()> {
             db.write_knowledge(&domain, &key, &value)?;
             let out = serde_json::json!({ "status": "written", "domain": domain, "key": key });
             println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        KbCommands::List { kb_type } => {
+            let entries = match kb_type.as_deref() {
+                Some(domain) => db.list_knowledge_by_domain(domain)?,
+                None => db.list_all_knowledge()?,
+            };
+            println!("{}", serde_json::to_string_pretty(&entries)?);
         }
     }
 

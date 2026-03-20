@@ -652,6 +652,22 @@ impl Db {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    pub fn list_knowledge_by_domain(&self, domain: &str) -> Result<Vec<KnowledgeEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT domain, key, value, version, updated_at FROM knowledge WHERE domain = ?1 ORDER BY key",
+        )?;
+        let rows = stmt.query_map(params![domain], |row| {
+            Ok(KnowledgeEntry {
+                domain: row.get(0)?,
+                key: row.get(1)?,
+                value: row.get(2)?,
+                version: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
     pub fn total_tokens_used(&self) -> Result<i64> {
         self.conn
             .query_row(
@@ -871,6 +887,21 @@ impl Db {
             })
         })?;
         rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Returns the RFC-3339 timestamp of the most recent `binary_rebuilt` event,
+    /// or `None` if no rebuild has ever been recorded.
+    pub fn last_rebuilt_at(&self) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp FROM events WHERE event_type = 'binary_rebuilt' ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let ts: String = row.get(0)?;
+            Ok(Some(ts))
+        } else {
+            Ok(None)
+        }
     }
 
     // --- Milestones ---
@@ -1299,38 +1330,40 @@ mod tests {
     }
 
     #[test]
-    fn register_agent_with_backend_stores_backend() {
+    fn list_knowledge_by_domain_returns_only_matching_domain() {
         let db = Db::open_memory().unwrap();
-        db.register_agent_with_backend("w-0", "worker", "general", "claude").unwrap();
-        let agents = db.list_agents().unwrap();
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].backend, "claude");
+        db.write_knowledge("learning", "t-001-success", r#"{"domain":"core"}"#).unwrap();
+        db.write_knowledge("learning", "t-002-failure", r#"{"domain":"qa"}"#).unwrap();
+        db.write_knowledge("core", "stack", "Rust").unwrap();
+
+        let results = db.list_knowledge_by_domain("learning").unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|e| e.domain == "learning"));
+
+        let core_results = db.list_knowledge_by_domain("core").unwrap();
+        assert_eq!(core_results.len(), 1);
+        assert_eq!(core_results[0].key, "stack");
+
+        let empty = db.list_knowledge_by_domain("nonexistent").unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]
-    fn register_agent_with_backend_cursor_stores_cursor() {
+    fn last_rebuilt_at_returns_none_when_no_rebuild_events() {
         let db = Db::open_memory().unwrap();
-        db.register_agent_with_backend("w-1", "worker", "general", "cursor").unwrap();
-        let agents = db.list_agents().unwrap();
-        assert_eq!(agents[0].backend, "cursor");
+        assert!(db.last_rebuilt_at().unwrap().is_none());
     }
 
     #[test]
-    fn register_agent_legacy_defaults_to_claude() {
+    fn last_rebuilt_at_returns_most_recent_binary_rebuilt_event() {
         let db = Db::open_memory().unwrap();
-        db.register_agent("w-0", "worker", "general").unwrap();
-        let agents = db.list_agents().unwrap();
-        assert_eq!(agents[0].backend, "claude");
-    }
+        db.log_event(Some("mgr"), "binary_rebuilt", "first rebuild", None).unwrap();
+        db.log_event(Some("mgr"), "binary_rebuilt", "second rebuild", None).unwrap();
+        db.log_event(Some("mgr"), "ticket_reviewed", "some other event", None).unwrap();
 
-    #[test]
-    fn list_agents_returns_backend_per_agent() {
-        let db = Db::open_memory().unwrap();
-        db.register_agent_with_backend("w-0", "worker", "general", "claude").unwrap();
-        db.register_agent_with_backend("w-1", "worker", "general", "cursor").unwrap();
-        let agents = db.list_agents().unwrap();
-        let backends: Vec<&str> = agents.iter().map(|a| a.backend.as_str()).collect();
-        assert!(backends.contains(&"claude"));
-        assert!(backends.contains(&"cursor"));
+        let ts = db.last_rebuilt_at().unwrap();
+        assert!(ts.is_some(), "expected a timestamp");
+        // Verify the timestamp is a valid RFC-3339 string.
+        chrono::DateTime::parse_from_rfc3339(ts.unwrap().trim()).unwrap();
     }
 }

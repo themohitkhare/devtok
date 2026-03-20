@@ -15,7 +15,7 @@ fn run_one_cycle(db: &Arc<Mutex<Db>>, config: &Config) {
         let (tx, rx) = tokio::sync::watch::channel(false);
         // Send shutdown immediately so the loop runs one cycle then exits
         tx.send(true).unwrap();
-        acs::manager::run_loop(db.clone(), config, std::path::PathBuf::from("/tmp/test"), rx).await;
+        acs::manager::run_loop(db.clone(), config, std::path::PathBuf::from("/tmp/test"), rx, false).await;
     });
 }
 

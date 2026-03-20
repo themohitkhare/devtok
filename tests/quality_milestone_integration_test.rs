@@ -11,7 +11,7 @@ fn run_one_cycle(db: Arc<Mutex<Db>>, project_dir: std::path::PathBuf) {
     rt.block_on(async {
         let (tx, rx) = tokio::sync::watch::channel(false);
         tx.send(true).expect("send shutdown");
-        acs::manager::run_loop(db, &config, project_dir, rx).await;
+        acs::manager::run_loop(db, &config, project_dir, rx, false).await;
     });
 }
 

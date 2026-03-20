@@ -83,7 +83,7 @@ fn execute_with_dir(
         let skip_loop_mgr = skip_loop;
         let mgr_handle = tokio::spawn(async move {
             if !skip_loop_mgr {
-                let _ = manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown).await;
+                let _ = manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown, false).await;
             }
         });
 

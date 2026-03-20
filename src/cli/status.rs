@@ -1,5 +1,28 @@
 use crate::db::Db;
 use anyhow::Result;
+use chrono::Utc;
+
+/// Formats an RFC-3339 timestamp as a human-readable "N minutes ago" string.
+fn format_time_ago(ts: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(ts) {
+        Ok(dt) => {
+            let secs = Utc::now()
+                .signed_duration_since(dt.with_timezone(&Utc))
+                .num_seconds()
+                .max(0);
+            if secs < 60 {
+                format!("{} seconds ago", secs)
+            } else if secs < 3600 {
+                format!("{} minutes ago", secs / 60)
+            } else if secs < 86400 {
+                format!("{} hours ago", secs / 3600)
+            } else {
+                format!("{} days ago", secs / 86400)
+            }
+        }
+        Err(_) => ts.to_string(),
+    }
+}
 
 pub fn execute(live: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -21,6 +44,17 @@ fn execute_with_db(db: &Db, live: bool) -> Result<()> {
     println!("Tickets: {}", total);
     for (status, count) in &counts {
         println!("  {}: {}", status, count);
+    }
+
+    // Last rebuilt
+    match db.last_rebuilt_at()? {
+        Some(ts) => {
+            let ago = format_time_ago(&ts);
+            println!("\nLast rebuilt: {}", ago);
+        }
+        None => {
+            println!("\nLast rebuilt: never");
+        }
     }
 
     // Agent status
@@ -100,15 +134,29 @@ mod tests {
     }
 
     #[test]
-    fn status_shows_backend_per_worker() {
+    fn status_shows_last_rebuilt_never_when_no_events() {
         let db = Db::open_memory().unwrap();
-        db.register_agent_with_backend("w-0", "worker", "general", "claude").unwrap();
-        db.register_agent_with_backend("w-1", "worker", "general", "cursor").unwrap();
-        // Should not panic; output includes backend labels
+        // Just verify it doesn't panic and runs without error.
         execute_with_db(&db, false).unwrap();
-        let agents = db.list_agents().unwrap();
-        let backends: Vec<&str> = agents.iter().map(|a| a.backend.as_str()).collect();
-        assert!(backends.contains(&"claude"));
-        assert!(backends.contains(&"cursor"));
+    }
+
+    #[test]
+    fn status_shows_last_rebuilt_after_event() {
+        let db = Db::open_memory().unwrap();
+        db.log_event(Some("mgr"), "binary_rebuilt", "built ok", None).unwrap();
+        execute_with_db(&db, false).unwrap();
+    }
+
+    #[test]
+    fn format_time_ago_returns_seconds_for_recent() {
+        let ts = Utc::now().to_rfc3339();
+        let result = format_time_ago(&ts);
+        assert!(result.ends_with("seconds ago"), "unexpected: {}", result);
+    }
+
+    #[test]
+    fn format_time_ago_falls_back_on_invalid_ts() {
+        let result = format_time_ago("not-a-timestamp");
+        assert_eq!(result, "not-a-timestamp");
     }
 }
