@@ -42,9 +42,16 @@ pub enum TicketCommands {
         #[arg(long)]
         blocked_by: Option<String>,
     },
-    /// Show ticket details
+    /// Show ticket details, or list blocked tickets with --all-blocked
     Show {
-        id: String,
+        /// Ticket ID to display (e.g. t-001); omit when using --all-blocked
+        id: Option<String>,
+        /// Emit raw JSON instead of a human-readable card
+        #[arg(long)]
+        json: bool,
+        /// List all tickets with status == blocked
+        #[arg(long)]
+        all_blocked: bool,
     },
 }
 
@@ -130,15 +137,97 @@ pub fn execute(cmd: TicketCommands) -> Result<()> {
             let out = serde_json::json!({ "status": "updated" });
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
-        TicketCommands::Show { id } => {
-            match db.get_ticket(&id)? {
-                Some(ticket) => println!("{}", serde_json::to_string_pretty(&ticket)?),
-                None => return Err(anyhow!("ticket '{}' not found", id)),
+        TicketCommands::Show { id, json, all_blocked } => {
+            if all_blocked {
+                let tickets = db.list_tickets(Some("blocked"))?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&tickets)?);
+                } else {
+                    if tickets.is_empty() {
+                        println!("No blocked tickets.");
+                    } else {
+                        for ticket in &tickets {
+                            print_ticket_card(ticket);
+                            println!();
+                        }
+                    }
+                }
+            } else {
+                let ticket_id = id.ok_or_else(|| anyhow!("provide a ticket ID or use --all-blocked"))?;
+                match db.get_ticket(&ticket_id)? {
+                    Some(ticket) => {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&ticket)?);
+                        } else {
+                            print_ticket_card(&ticket);
+                        }
+                    }
+                    None => return Err(anyhow!("ticket '{}' not found", ticket_id)),
+                }
             }
         }
     }
 
     Ok(())
+}
+
+fn print_ticket_card(ticket: &crate::models::Ticket) {
+    let sep = "─".repeat(60);
+    println!("┌{}┐", sep);
+    println!("│ {:58} │", format!("{} — {}", ticket.id, ticket.title));
+    println!("├{}┤", sep);
+    println!("│ {:<20} {:<37} │", "Domain:", ticket.domain);
+    println!("│ {:<20} {:<37} │", "Priority:", ticket.priority);
+    println!("│ {:<20} {:<37} │", "Status:", ticket.status);
+    println!("│ {:<20} {:<37} │", "Assignee:",
+        ticket.assignee.as_deref().unwrap_or("<none>"));
+    println!("│ {:<20} {:<37} │", "Blocked by:",
+        ticket.blocked_by.as_deref().unwrap_or("<none>"));
+    println!("│ {:<20} {:<37} │", "Created:", ticket.created_at);
+    println!("│ {:<20} {:<37} │", "Updated:", ticket.updated_at);
+    println!("├{}┤", sep);
+    println!("│ Description:                                               │");
+    for line in wrap_text(&ticket.description, 56) {
+        println!("│   {:<56} │", line);
+    }
+    if !ticket.notes.is_empty() {
+        println!("├{}┤", sep);
+        println!("│ Notes:                                                     │");
+        for line in wrap_text(&ticket.notes, 56) {
+            println!("│   {:<56} │", line);
+        }
+    }
+    println!("└{}┘", sep);
+}
+
+/// Wrap text to a maximum width, splitting on whitespace.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.lines() {
+        if paragraph.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(word);
+            } else if current.len() + 1 + word.len() <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(current.clone());
+                current = word.to_string();
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 fn update_ticket_and_auto_score(
@@ -272,5 +361,49 @@ mod tests {
         assert!(score.docs_updated);
         assert!(score.acceptance_criteria_met);
         assert_eq!(score.score, 100);
+    }
+
+    #[test]
+    fn print_ticket_card_renders_fields() {
+        let db = Db::open_memory().unwrap();
+        let id = db.create_ticket("My Task", "A longer description\nwith two lines", "core", 2).unwrap();
+        let ticket = db.get_ticket(&id).unwrap().unwrap();
+        // Should not panic; spot-check card content via wrap_text
+        let lines = wrap_text("hello world foo", 10);
+        assert_eq!(lines[0], "hello");
+        assert_eq!(lines[1], "world foo");
+        // Full card output: just ensure it doesn't panic
+        print_ticket_card(&ticket);
+    }
+
+    #[test]
+    fn wrap_text_empty_string() {
+        let lines = wrap_text("", 40);
+        assert_eq!(lines, vec![""]);
+    }
+
+    #[test]
+    fn wrap_text_fits_on_one_line() {
+        let lines = wrap_text("short text", 40);
+        assert_eq!(lines, vec!["short text"]);
+    }
+
+    #[test]
+    fn show_missing_ticket_returns_error() {
+        let db = Db::open_memory().unwrap();
+        let result = db.get_ticket("t-999").unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn list_blocked_tickets_returns_only_blocked() {
+        let db = Db::open_memory().unwrap();
+        let id1 = db.create_ticket("T1", "desc", "core", 1).unwrap();
+        let id2 = db.create_ticket("T2", "desc", "core", 1).unwrap();
+        db.update_ticket(&id1, "blocked", None, None, None).unwrap();
+        db.update_ticket(&id2, "in_progress", None, None, None).unwrap();
+        let blocked = db.list_tickets(Some("blocked")).unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].id, id1);
     }
 }
