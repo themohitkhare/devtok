@@ -339,3 +339,150 @@ fn test_plan_without_tickets_errors() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("No tickets found"));
 }
+
+// --- acs init tests ---
+
+/// Helper: create a bare git repo in a temp dir (no .acs, no remote).
+fn setup_fresh_git_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    dir
+}
+
+#[test]
+fn test_init_bootstraps_acs_dir() {
+    let bin = acs_bin();
+    let dir = setup_fresh_git_repo();
+
+    let output = Command::new(&bin)
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "acs init failed.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+
+    // .acs/ directory and required files were created
+    assert!(dir.path().join(".acs").exists(), ".acs/ dir missing");
+    assert!(dir.path().join(".acs/config.toml").exists(), ".acs/config.toml missing");
+    assert!(dir.path().join(".acs/project.db").exists(), ".acs/project.db missing");
+    assert!(dir.path().join(".acs/logs").exists(), ".acs/logs/ missing");
+}
+
+#[test]
+fn test_init_adds_gitignore_entry() {
+    let bin = acs_bin();
+    let dir = setup_fresh_git_repo();
+
+    Command::new(&bin)
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let gitignore_path = dir.path().join(".gitignore");
+    assert!(gitignore_path.exists(), ".gitignore was not created");
+    let contents = fs::read_to_string(&gitignore_path).unwrap();
+    assert!(
+        contents.contains(".acs/"),
+        ".gitignore does not contain .acs/ entry. Contents: {}",
+        contents
+    );
+}
+
+#[test]
+fn test_init_detects_project_name_from_git_remote() {
+    let bin = acs_bin();
+    let dir = setup_fresh_git_repo();
+
+    // Add a fake remote
+    Command::new("git")
+        .args(["remote", "add", "origin", "https://github.com/testowner/awesome-project.git"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    Command::new(&bin)
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    let config_path = dir.path().join(".acs/config.toml");
+    if config_path.exists() {
+        let contents = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            contents.contains("awesome-project"),
+            "config.toml should use project name from git remote. Contents: {}",
+            contents
+        );
+    }
+}
+
+#[test]
+fn test_init_falls_back_to_dir_name_without_remote() {
+    let bin = acs_bin();
+    let base = tempfile::tempdir().unwrap();
+    let proj_dir = base.path().join("my-test-project");
+    fs::create_dir(&proj_dir).unwrap();
+    Command::new("git")
+        .args(["init"])
+        .current_dir(&proj_dir)
+        .output()
+        .unwrap();
+
+    Command::new(&bin)
+        .args(["init"])
+        .current_dir(&proj_dir)
+        .output()
+        .unwrap();
+
+    let config_path = proj_dir.join(".acs/config.toml");
+    if config_path.exists() {
+        let contents = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            contents.contains("my-test-project"),
+            "config.toml should fall back to dir name. Contents: {}",
+            contents
+        );
+    }
+}
+
+#[test]
+fn test_init_idempotency_error() {
+    let bin = acs_bin();
+    let dir = setup_fresh_git_repo();
+
+    // First init should succeed
+    let first = Command::new(&bin)
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(first.status.success(), "First acs init should succeed");
+
+    // Second init should fail with a clear message
+    let second = Command::new(&bin)
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!second.status.success(), "Second acs init should fail");
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains(".acs/") || stderr.contains("already exists"),
+        "Expected error about .acs/ already existing. stderr: {}",
+        stderr
+    );
+}

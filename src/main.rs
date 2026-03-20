@@ -80,6 +80,7 @@ fn main() -> ExitCode {
         cli::Commands::Quality(cmd) => cli::quality::execute(cmd),
         cli::Commands::Update(args) => cli::update::execute(args),
         cli::Commands::Doctor { fix } => cli::doctor::execute(fix),
+        cli::Commands::Provider(cmd) => cli::provider::execute(cmd),
     };
 
     match result {
