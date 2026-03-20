@@ -15,6 +15,27 @@ cargo build --release
 # Binary is at target/release/acs
 ```
 
+Install the latest tagged release binary:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/themohitkhare/devtok/main/scripts/install.sh | sh
+```
+
+Homebrew users can install from the formula in this repo or from the generated release asset:
+
+```bash
+brew install ./Formula/acs.rb
+```
+
+To update an existing installation in place:
+
+```bash
+acs update
+acs update --check
+```
+
+For crates.io publication, the package metadata is now publish-ready, but `cargo install acs` still depends on ownership of the `acs` crate name on crates.io.
+
 ## Usage
 
 ### Initialize a project
@@ -175,6 +196,23 @@ cargo build
 # Run with logging
 RUST_LOG=debug cargo run -- status
 ```
+
+### Release workflow
+
+Tagging `v<version>` triggers `.github/workflows/release.yml`, which:
+
+```bash
+cargo test
+cargo build --release
+scripts/package-release.sh <target> target/release/acs dist <version>
+```
+
+Each release publishes:
+
+- `acs-<version>-macos-arm64.tar.gz`
+- `acs-<version>-macos-x64.tar.gz`
+- `acs-<version>-linux-x64.tar.gz`
+- `acs.rb` Homebrew formula
 
 ## Project Structure
 

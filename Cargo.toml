@@ -2,6 +2,12 @@
 name = "acs"
 version = "0.1.0"
 edition = "2021"
+description = "Auto Consulting Service CLI"
+repository = "https://github.com/themohitkhare/devtok"
+homepage = "https://github.com/themohitkhare/devtok"
+readme = "README.md"
+keywords = ["cli", "automation", "ai", "devops"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -16,6 +22,10 @@ anyhow = "1"
 ratatui = "0.29"
 crossterm = "0.28"
 colored = "3.1.1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+flate2 = "1"
+tar = "0.4"
+tempfile = "3"
+semver = "1"
 
 [dev-dependencies]
-tempfile = "3"

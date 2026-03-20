@@ -21,6 +21,7 @@ pub mod status;
 pub mod status_live;
 pub mod stop;
 pub mod ticket;
+pub mod update;
 
 use clap::{Parser, Subcommand};
 
@@ -170,4 +171,6 @@ pub enum Commands {
     /// Quality scoring and North Star metrics
     #[command(subcommand)]
     Quality(quality::QualityCommands),
+    /// Check for and install the latest ACS release from GitHub Releases
+    Update(update::UpdateArgs),
 }

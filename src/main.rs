@@ -75,6 +75,7 @@ fn main() -> ExitCode {
         cli::Commands::Approve => cli::approve::execute(),
         cli::Commands::Reject { reason } => cli::reject::execute(reason),
         cli::Commands::Quality(cmd) => cli::quality::execute(cmd),
+        cli::Commands::Update(args) => cli::update::execute(args),
     };
 
     match result {
