@@ -321,6 +321,9 @@ pub struct ProjectConfig {
     pub name: String,
     #[serde(default = "default_workers")]
     pub default_workers: usize,
+    /// The base branch to merge into and restore after evolve runs. Defaults to "main".
+    #[serde(default = "default_base_branch")]
+    pub base_branch: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -378,6 +381,7 @@ pub struct AgentConfig {
 }
 
 fn default_workers() -> usize { 2 }
+fn default_base_branch() -> String { "main".into() }
 fn default_cycle() -> u64 { 15 }
 fn default_timeout() -> u64 { 300 }
 fn default_poll() -> u64 { 3 }
@@ -441,7 +445,7 @@ impl Config {
 
     pub fn default_for(project_name: &str) -> Self {
         Config {
-            project: ProjectConfig { name: project_name.into(), default_workers: 2 },
+            project: ProjectConfig { name: project_name.into(), default_workers: 2, base_branch: default_base_branch() },
             manager: ManagerConfig::default(),
             personas: PersonaConfig::default(),
             agents: AgentConfig::default(),
@@ -518,6 +522,7 @@ impl Config {
             r#"[project]
 name = "{}"
 default_workers = {}
+base_branch = "{}"
 
 [manager]
 cycle_seconds = {}
@@ -530,6 +535,7 @@ claude_path = "{}"
 "#,
             self.project.name,
             self.project.default_workers,
+            escape_toml_string(&self.project.base_branch),
             self.manager.cycle_seconds,
             self.manager.worker_timeout_seconds,
             self.manager.worker_poll_seconds,

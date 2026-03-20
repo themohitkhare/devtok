@@ -1105,7 +1105,7 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                                 );
                             }
 
-                            match spawner.merge_branch(&branch) {
+                            match spawner.merge_branch(&branch, &config.project.base_branch) {
                                 Ok(true) => {
                                     // Merge succeeded — clean up the branch
                                     spawner.delete_branch(&branch);

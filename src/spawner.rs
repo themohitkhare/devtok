@@ -35,6 +35,42 @@ pub struct Spawner {
     tool_path: String,
 }
 
+/// Returns the name of the currently checked-out branch in `project_dir`,
+/// or `None` if the repo is in detached-HEAD state or the command fails.
+pub fn current_branch(project_dir: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(project_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() || s == "HEAD" { None } else { Some(s) }
+    } else {
+        None
+    }
+}
+
+/// Checks out `base_branch` in `project_dir` so that subsequent git operations
+/// (merge, branch listing) target the correct branch.
+///
+/// Runs `git checkout <base_branch>` with suppressed output.
+pub fn checkout_base_branch(project_dir: &Path, base_branch: &str) -> Result<()> {
+    let status = Command::new("git")
+        .args(["checkout", base_branch])
+        .current_dir(project_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("Failed to run git checkout {}", base_branch))?;
+    if !status.success() {
+        anyhow::bail!("git checkout {} failed in {}", base_branch, project_dir.display());
+    }
+    Ok(())
+}
+
 impl Spawner {
     /// Backwards-compatible constructor: only `claude` is enabled, no custom backends.
     pub fn new(project_dir: &Path, claude_path: &str, tool_path: &str) -> Self {
@@ -457,12 +493,17 @@ impl Spawner {
         Ok(branch)
     }
 
-    /// Merges the given branch into main using `--no-ff`. Must be run from
-    /// the main project directory (not a worktree).
+    /// Merges the given branch into `base_branch` using `--no-ff`.
+    ///
+    /// Ensures `base_branch` is checked out in the project directory before
+    /// running the merge so the operation never targets a stale branch.
     ///
     /// Returns `Ok(true)` if merge succeeded, `Ok(false)` if there were
     /// conflicts (merge is aborted), or `Err` on unexpected failures.
-    pub fn merge_branch(&self, branch: &str) -> Result<bool> {
+    pub fn merge_branch(&self, branch: &str, base_branch: &str) -> Result<bool> {
+        // Ensure we are on the base branch before merging.
+        checkout_base_branch(&self.project_dir, base_branch)?;
+
         let status = Command::new("git")
             .args(["merge", "--no-ff", branch])
             .current_dir(&self.project_dir)
