@@ -840,6 +840,21 @@ impl Db {
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
+    /// Returns the RFC-3339 timestamp of the most recent `binary_rebuilt` event,
+    /// or `None` if no rebuild has ever been recorded.
+    pub fn last_rebuilt_at(&self) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp FROM events WHERE event_type = 'binary_rebuilt' ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let ts: String = row.get(0)?;
+            Ok(Some(ts))
+        } else {
+            Ok(None)
+        }
+    }
+
     // --- Milestones ---
 
     pub fn create_milestone(&self, name: &str, goal: &str) -> Result<i64> {
@@ -1225,5 +1240,24 @@ mod tests {
 
         let empty = db.list_knowledge_by_domain("nonexistent").unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn last_rebuilt_at_returns_none_when_no_rebuild_events() {
+        let db = Db::open_memory().unwrap();
+        assert!(db.last_rebuilt_at().unwrap().is_none());
+    }
+
+    #[test]
+    fn last_rebuilt_at_returns_most_recent_binary_rebuilt_event() {
+        let db = Db::open_memory().unwrap();
+        db.log_event(Some("mgr"), "binary_rebuilt", "first rebuild", None).unwrap();
+        db.log_event(Some("mgr"), "binary_rebuilt", "second rebuild", None).unwrap();
+        db.log_event(Some("mgr"), "ticket_reviewed", "some other event", None).unwrap();
+
+        let ts = db.last_rebuilt_at().unwrap();
+        assert!(ts.is_some(), "expected a timestamp");
+        // Verify the timestamp is a valid RFC-3339 string.
+        chrono::DateTime::parse_from_rfc3339(ts.unwrap().trim()).unwrap();
     }
 }

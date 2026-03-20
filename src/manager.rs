@@ -224,6 +224,71 @@ fn post_merge_ci_check(db: Arc<Mutex<Db>>, project_dir: std::path::PathBuf, bran
     });
 }
 
+/// Triggers `cargo build --release` in the background after a successful auto-merge.
+///
+/// On success, logs a `binary_rebuilt` event so `acs status` can show "last rebuilt".
+/// Swaps the `.acs/acs` symlink to point at the freshly built binary.
+fn post_merge_rebuild(db: Arc<Mutex<Db>>, project_dir: std::path::PathBuf) {
+    tokio::spawn(async move {
+        eprintln!("[manager] post_merge_rebuild: starting cargo build --release");
+
+        let dir = project_dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            Command::new("cargo")
+                .args(["build", "--release"])
+                .current_dir(&dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .status()
+        })
+        .await;
+
+        let success = match result {
+            Ok(Ok(status)) => status.success(),
+            Ok(Err(e)) => {
+                eprintln!("[manager] post_merge_rebuild: failed to run cargo build: {}", e);
+                false
+            }
+            Err(join_err) => {
+                eprintln!("[manager] post_merge_rebuild: task panicked: {}", join_err);
+                false
+            }
+        };
+
+        if !success {
+            eprintln!("[manager] post_merge_rebuild: cargo build --release failed");
+            return;
+        }
+
+        // Swap symlink: .acs/acs -> ../target/release/acs
+        let symlink_path = project_dir.join(".acs").join("acs");
+        let binary_path = project_dir.join("target").join("release").join("acs");
+        if binary_path.exists() {
+            // Remove old symlink if present, then create new one.
+            let _ = std::fs::remove_file(&symlink_path);
+            if let Err(e) = std::os::unix::fs::symlink(&binary_path, &symlink_path) {
+                eprintln!("[manager] post_merge_rebuild: failed to update symlink: {}", e);
+            }
+        }
+
+        // Log the rebuild event so acs status can show last rebuilt time.
+        let log_res = {
+            let guard = db.lock().unwrap();
+            guard.log_event(
+                Some("mgr"),
+                "binary_rebuilt",
+                "cargo build --release succeeded after auto-merge",
+                None,
+            )
+        };
+        if let Err(e) = log_res {
+            eprintln!("[manager] post_merge_rebuild: failed to log event: {}", e);
+        } else {
+            eprintln!("[manager] post_merge_rebuild: binary rebuilt successfully");
+        }
+    });
+}
+
 /// Returns the checkpoint branch name and last-committed timestamp for `ticket_id`.
 ///
 /// Resolution order:
@@ -374,11 +439,12 @@ pub async fn run_loop(
     config: &Config,
     project_dir: std::path::PathBuf,
     mut shutdown: watch::Receiver<bool>,
+    auto_merge: bool,
 ) {
     let cycle = Duration::from_secs(config.manager.cycle_seconds);
 
     loop {
-        if let Err(e) = run_cycle(&db, config, &project_dir) {
+        if let Err(e) = run_cycle(&db, config, &project_dir, auto_merge) {
             eprintln!("[manager] cycle error: {}", e);
         }
 
@@ -472,7 +538,7 @@ fn select_model_for_provider(
     }
 }
 
-fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path) -> Result<()> {
+fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path, auto_merge: bool) -> Result<()> {
     let mut assignments = 0usize;
     let mut completions = 0usize;
     let mut unblocked = 0usize;
@@ -508,22 +574,182 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
                 }
             }
 
-            let guard = db.lock().unwrap();
-            guard.update_ticket(
-                &ticket.id,
-                "completed",
-                Some("Auto-reviewed by manager"),
-                None,
-                None,
-            )?;
-            guard.log_event(
-                Some("mgr"),
-                "ticket_reviewed",
-                &format!("ticket {} auto-reviewed and completed", ticket.id),
-                None,
-            )?;
-            eprintln!("[manager] auto-reviewed ticket {} → completed", ticket.id);
-            reviewed += 1;
+            // Auto-merge path: when --auto-merge is enabled, try to merge the branch before
+            // marking the ticket completed. On conflict we leave it as review_pending so a
+            // human can resolve it; on success we trigger a background binary rebuild.
+            if auto_merge {
+                let spawner = Spawner::new_with_agent_config(project_dir, &config.agents);
+                match spawner.find_branch_for_ticket(&ticket.id) {
+                    Ok(Some(branch)) => {
+                        match spawner.merge_branch(&branch) {
+                            Ok(true) => {
+                                // Merge succeeded — clean up branch, mark completed, rebuild.
+                                spawner.delete_branch(&branch);
+                                {
+                                    let guard = db.lock().unwrap();
+                                    guard.update_ticket(
+                                        &ticket.id,
+                                        "completed",
+                                        Some("Auto-reviewed and merged by manager"),
+                                        None,
+                                        None,
+                                    )?;
+                                    guard.log_event(
+                                        Some("mgr"),
+                                        "ticket_reviewed",
+                                        &format!(
+                                            "[manager] merged acs/{} to main and completed",
+                                            ticket.id
+                                        ),
+                                        None,
+                                    )?;
+                                    guard.log_event(
+                                        Some("mgr"),
+                                        "branch_merged",
+                                        &format!(
+                                            "merged {} into main for ticket {}",
+                                            branch, ticket.id
+                                        ),
+                                        None,
+                                    )?;
+                                }
+                                eprintln!(
+                                    "[manager] auto-merge: merged {} for ticket {} → completed",
+                                    branch, ticket.id
+                                );
+                                // Trigger background binary rebuild.
+                                post_merge_rebuild(db.clone(), project_dir.to_path_buf());
+                                reviewed += 1;
+                            }
+                            Ok(false) => {
+                                // Merge conflict — escalate to human.
+                                let existing_notes = {
+                                    let guard = db.lock().unwrap();
+                                    guard
+                                        .get_ticket(&ticket.id)?
+                                        .map(|t| t.notes)
+                                        .unwrap_or_default()
+                                };
+                                let conflict_note = format!(
+                                    "**[Auto-merge failed - merge conflict]** Branch: `{}`, Reason: merge conflict when merging into main. Resolve manually.",
+                                    branch
+                                );
+                                let new_notes = if existing_notes.is_empty() {
+                                    conflict_note
+                                } else {
+                                    format!("{}\n\n---\n{}", existing_notes, conflict_note)
+                                };
+                                {
+                                    let guard = db.lock().unwrap();
+                                    guard.update_ticket(
+                                        &ticket.id,
+                                        "review_pending",
+                                        Some(&new_notes),
+                                        None,
+                                        None,
+                                    )?;
+                                    guard.log_event(
+                                        Some("mgr"),
+                                        "merge_conflict_escalated",
+                                        &format!(
+                                            "merge conflict for ticket {} on branch {} (left in review_pending for human resolution)",
+                                            ticket.id, branch
+                                        ),
+                                        None,
+                                    )?;
+                                }
+                                eprintln!(
+                                    "[manager] auto-merge: conflict for ticket {} on branch {} — escalated to human",
+                                    ticket.id, branch
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[manager] auto-merge: error merging branch {} for ticket {}: {}",
+                                    branch, ticket.id, e
+                                );
+                                // Fall through: mark completed without merge on error.
+                                let guard = db.lock().unwrap();
+                                guard.update_ticket(
+                                    &ticket.id,
+                                    "completed",
+                                    Some("Auto-reviewed by manager (merge error)"),
+                                    None,
+                                    None,
+                                )?;
+                                guard.log_event(
+                                    Some("mgr"),
+                                    "ticket_reviewed",
+                                    &format!(
+                                        "ticket {} auto-reviewed (merge error: {})",
+                                        ticket.id, e
+                                    ),
+                                    None,
+                                )?;
+                                reviewed += 1;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // No branch found — mark completed as normal (may have been merged already).
+                        let guard = db.lock().unwrap();
+                        guard.update_ticket(
+                            &ticket.id,
+                            "completed",
+                            Some("Auto-reviewed by manager"),
+                            None,
+                            None,
+                        )?;
+                        guard.log_event(
+                            Some("mgr"),
+                            "ticket_reviewed",
+                            &format!("ticket {} auto-reviewed and completed (no branch)", ticket.id),
+                            None,
+                        )?;
+                        eprintln!("[manager] auto-reviewed ticket {} → completed (no branch found)", ticket.id);
+                        reviewed += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[manager] auto-merge: error finding branch for ticket {}: {}",
+                            ticket.id, e
+                        );
+                        let guard = db.lock().unwrap();
+                        guard.update_ticket(
+                            &ticket.id,
+                            "completed",
+                            Some("Auto-reviewed by manager"),
+                            None,
+                            None,
+                        )?;
+                        guard.log_event(
+                            Some("mgr"),
+                            "ticket_reviewed",
+                            &format!("ticket {} auto-reviewed and completed", ticket.id),
+                            None,
+                        )?;
+                        reviewed += 1;
+                    }
+                }
+            } else {
+                // auto_merge=false: existing behavior — mark completed without merging.
+                let guard = db.lock().unwrap();
+                guard.update_ticket(
+                    &ticket.id,
+                    "completed",
+                    Some("Auto-reviewed by manager"),
+                    None,
+                    None,
+                )?;
+                guard.log_event(
+                    Some("mgr"),
+                    "ticket_reviewed",
+                    &format!("ticket {} auto-reviewed and completed", ticket.id),
+                    None,
+                )?;
+                eprintln!("[manager] auto-reviewed ticket {} → completed", ticket.id);
+                reviewed += 1;
+            }
         }
     }
 
@@ -1150,7 +1376,7 @@ mod tests {
             g.create_ticket("Task A", "Do A", "general", 1).unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1169,7 +1395,7 @@ mod tests {
             g.create_ticket("Task A", "Do A", "general", 1).unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1193,7 +1419,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         // High priority (t-002, priority=1) should be assigned first
@@ -1213,7 +1439,7 @@ mod tests {
             g.create_ticket("Task B", "Do B", "general", 1).unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let t1 = g.get_ticket("t-001").unwrap().unwrap();
@@ -1233,7 +1459,7 @@ mod tests {
             g.create_ticket("Task A", "Do A", "general", 1).unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let msg = g.pop_inbox("w-1").unwrap();
@@ -1260,7 +1486,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1285,7 +1511,7 @@ mod tests {
             .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1310,7 +1536,7 @@ mod tests {
             .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1351,7 +1577,7 @@ mod tests {
             .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1379,7 +1605,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let msg = g.pop_inbox("w-1").unwrap().unwrap();
@@ -1404,7 +1630,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1423,7 +1649,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1450,7 +1676,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         assert_eq!(g.get_ticket("t-001").unwrap().unwrap().status, "completed");
@@ -1564,7 +1790,7 @@ mod tests {
             .unwrap();
         }
 
-        run_cycle(&db, &config, repo_path).unwrap();
+        run_cycle(&db, &config, repo_path, false).unwrap();
 
         let g = db.lock().unwrap();
         let score = g
@@ -1596,7 +1822,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-002").unwrap().unwrap();
@@ -1626,7 +1852,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-002").unwrap().unwrap();
@@ -1644,7 +1870,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1678,7 +1904,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let tt1 = g.get_ticket("t-001").unwrap().unwrap();
@@ -1714,7 +1940,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let tt1 = g.get_ticket("t-001").unwrap().unwrap();
@@ -1739,7 +1965,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ticket = g.get_ticket("t-001").unwrap().unwrap();
@@ -1760,7 +1986,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         // t-001 was pending and got assigned (if idle workers exist), but not auto-reviewed
@@ -1782,7 +2008,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         assert_eq!(g.get_ticket("t-001").unwrap().unwrap().status, "completed");
@@ -1799,7 +2025,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let events = g.recent_events(10).unwrap();
@@ -1821,7 +2047,7 @@ mod tests {
 
         // Use the real repo path so git commands can run; branch won't exist so score=0 is fine.
         let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        run_cycle(&db, &config, &cwd).unwrap();
+        run_cycle(&db, &config, &cwd, false).unwrap();
 
         let g = db.lock().unwrap();
         assert_eq!(g.get_ticket("t-001").unwrap().unwrap().status, "completed");
@@ -1830,6 +2056,46 @@ mod tests {
             score.is_some(),
             "auto-review should persist a quality score for the completed ticket"
         );
+    }
+
+    #[test]
+    fn auto_review_with_auto_merge_false_marks_completed() {
+        // When auto_merge=false, review_pending tickets get marked completed (no merge attempted).
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.create_ticket("Task A", "Do A", "general", 1).unwrap();
+            g.update_ticket("t-001", "review_pending", None, None, None)
+                .unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+
+        let g = db.lock().unwrap();
+        let ticket = g.get_ticket("t-001").unwrap().unwrap();
+        assert_eq!(ticket.status, "completed");
+        assert_eq!(ticket.notes, "Auto-reviewed by manager");
+    }
+
+    #[test]
+    fn auto_review_with_auto_merge_true_no_branch_marks_completed() {
+        // When auto_merge=true but no branch exists, ticket gets marked completed normally.
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.create_ticket("Task A", "Do A", "general", 1).unwrap();
+            g.update_ticket("t-001", "review_pending", None, None, None)
+                .unwrap();
+        }
+
+        // Use real project dir so git runs, but no acs/t-001-* branch will exist.
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        run_cycle(&db, &config, &cwd, true).unwrap();
+
+        let g = db.lock().unwrap();
+        let ticket = g.get_ticket("t-001").unwrap().unwrap();
+        // Ticket should be completed (no branch → falls through to normal completion).
+        assert_eq!(ticket.status, "completed");
     }
 
     #[test]
@@ -1912,7 +2178,7 @@ mod tests {
             mid
         };
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ms = g.get_milestone(milestone_id).unwrap().unwrap();
@@ -1968,7 +2234,7 @@ mod tests {
             mid
         };
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let ms = g.get_milestone(milestone_id).unwrap().unwrap();
@@ -2022,7 +2288,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         // t-001: review_pending → completed (auto-review)
@@ -2124,7 +2390,7 @@ mod tests {
                 .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let msg = g
@@ -2170,7 +2436,7 @@ mod tests {
             // No KB entries written
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let msg = g
@@ -2272,7 +2538,7 @@ mod tests {
             .unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let msg = g
@@ -2302,7 +2568,7 @@ mod tests {
             // No checkpoint KB entry and no git branch.
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let msg = g
@@ -2409,7 +2675,7 @@ mod tests {
             g.register_agent("w-1", "worker", "backend-dev").unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let t2 = g.get_ticket("t-002").unwrap().unwrap();
@@ -2460,7 +2726,7 @@ mod tests {
             g.register_agent("w-1", "worker", "backend-dev").unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let t2 = g.get_ticket("t-002").unwrap().unwrap();
@@ -2501,7 +2767,7 @@ mod tests {
             g.register_agent("w-1", "worker", "backend-dev").unwrap();
         }
 
-        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
 
         let g = db.lock().unwrap();
         let t2 = g.get_ticket("t-002").unwrap().unwrap();

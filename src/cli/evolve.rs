@@ -23,6 +23,7 @@ pub fn execute(
     preserve_agents: bool,
     dry_run: bool,
     backend: Option<String>,
+    auto_merge: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     execute_with_dir(
@@ -36,6 +37,7 @@ pub fn execute(
         preserve_agents,
         dry_run,
         backend,
+        auto_merge,
     )
 }
 
@@ -51,6 +53,7 @@ fn execute_with_dir(
     preserve_agents: bool,
     dry_run: bool,
     backend: Option<String>,
+    auto_merge: bool,
 ) -> Result<()> {
     let acs_dir = acs_dir::resolve_acs_dir(cwd)?;
     let project_dir = acs_dir
@@ -122,6 +125,7 @@ fn execute_with_dir(
                 max_run_seconds,
                 preserve_agents,
                 backend.clone(),
+                auto_merge,
             )
             .await?;
 
@@ -209,6 +213,7 @@ async fn run_bounded_workers(
     max_run_seconds: Option<u64>,
     preserve_agents: bool,
     backend: Option<String>,
+    auto_merge: bool,
 ) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -245,7 +250,7 @@ async fn run_bounded_workers(
     let mgr_shutdown = shutdown_rx.clone();
     let mgr_dir = project_dir.clone();
     let mgr_handle = tokio::spawn(async move {
-        manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown).await
+        manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown, auto_merge).await
     });
 
     // Spawn worker tasks.
@@ -418,7 +423,7 @@ mod tests {
     fn execute_dry_run_returns_ok_with_ticket_count() {
         let tmp = TempDir::new().unwrap();
         make_test_project(tmp.path());
-        execute_with_dir(tmp.path(), 1, 1, false, false, false, None, false, true, None).unwrap();
+        execute_with_dir(tmp.path(), 1, 1, false, false, false, None, false, true, None, false).unwrap();
     }
 
     // -----------------------------------------------------------------------
@@ -429,7 +434,7 @@ mod tests {
     fn execute_max_iterations_zero_is_no_op() {
         let tmp = TempDir::new().unwrap();
         make_test_project(tmp.path());
-        execute_with_dir(tmp.path(), 1, 0, false, false, false, None, false, false, None).unwrap();
+        execute_with_dir(tmp.path(), 1, 0, false, false, false, None, false, false, None, false).unwrap();
     }
 
     // -----------------------------------------------------------------------
@@ -453,6 +458,7 @@ mod tests {
             false, // preserve_agents
             false, // dry_run
             None,  // backend
+            false, // auto_merge
         )
         .unwrap();
     }
@@ -477,6 +483,7 @@ mod tests {
             false,
             false,
             None,
+            false, // auto_merge
         );
         assert!(result.is_err());
         let msg = format!("{:#}", result.unwrap_err());
@@ -503,6 +510,7 @@ mod tests {
             false,
             false,
             None,
+            false, // auto_merge
         )
         .unwrap();
     }
@@ -529,6 +537,7 @@ mod tests {
             false,
             false,
             None,
+            false, // auto_merge
         )
         .unwrap();
     }
@@ -558,6 +567,7 @@ mod tests {
             true,  // preserve_agents
             false,
             None,
+            false, // auto_merge
         )
         .unwrap();
     }
@@ -582,6 +592,7 @@ mod tests {
             false,
             false,
             Some("claude".to_string()),
+            false, // auto_merge
         )
         .unwrap();
     }
