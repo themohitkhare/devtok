@@ -38,9 +38,29 @@ For crates.io publication, the package metadata is now publish-ready, but `cargo
 
 ## Usage
 
+### Use ACS on any git repository
+
+ACS is a portable framework — it works on any git repository, not just the one it ships with.
+
+```bash
+# Clone any repo, initialize ACS, and start the AI team
+git clone <your-repo-url>
+cd <your-repo>
+acs init
+acs run
+```
+
+`acs init` will:
+- Auto-detect the project name from your git remote (`origin`) or fall back to the directory name
+- Create `.acs/` with a database, config, and log storage
+- Add `.acs/` to `.gitignore` so orchestration state stays local
+
 ### Initialize a project
 
 ```bash
+# Plain init (no auto-analysis)
+acs init
+
 # Bootstrap: analyze the repo and auto-create tickets
 acs init --auto
 

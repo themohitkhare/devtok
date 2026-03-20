@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration, Instant};
@@ -263,7 +264,7 @@ async fn run_bounded_workers(
     let mgr_shutdown = shutdown_rx.clone();
     let mgr_dir = project_dir.clone();
     let mgr_handle = tokio::spawn(async move {
-        manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown, auto_merge).await
+        manager::run_loop(mgr_db, &mgr_config, mgr_dir, mgr_shutdown, auto_merge, Arc::new(AtomicBool::new(false))).await
     });
 
     // Spawn worker tasks.

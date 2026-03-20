@@ -13,7 +13,7 @@ pub struct Db {
 }
 
 impl Db {
-    pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+    pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -174,6 +174,13 @@ impl Db {
             );
         }
 
+        if current_version < 4 {
+            // v4: conflict-deferral counter for tickets.
+            let _ = self.conn.execute_batch(
+                "ALTER TABLE tickets ADD COLUMN defer_count INTEGER NOT NULL DEFAULT 0;",
+            );
+        }
+
         self.conn.execute(
             "UPDATE schema_meta SET schema_version = ?1, updated_at = ?2 WHERE id = 1",
             params![Self::CURRENT_SCHEMA_VERSION, now],
@@ -216,33 +223,20 @@ impl Db {
 
     pub fn get_ticket(&self, id: &str) -> Result<Option<Ticket>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at
+            "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at,
+                    COALESCE(defer_count, 0), files_hint
              FROM tickets WHERE id = ?1"
         )?;
         let ticket = stmt
-            .query_row(params![id], |row| {
-                Ok(Ticket {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    description: row.get(2)?,
-                    domain: row.get(3)?,
-                    priority: row.get(4)?,
-                    status: row.get(5)?,
-                    assignee: row.get(6)?,
-                    blocked_by: row.get(7)?,
-                    notes: row.get(8)?,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                })
-            })
+            .query_row(params![id], Self::row_to_ticket)
             .optional()?;
         Ok(ticket)
     }
 
     pub fn list_tickets(&self, status: Option<&str>) -> Result<Vec<Ticket>> {
         let sql = match status {
-            Some(_) => "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at FROM tickets WHERE status = ?1 ORDER BY priority, created_at",
-            None => "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at FROM tickets ORDER BY priority, created_at",
+            Some(_) => "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at, COALESCE(defer_count, 0), files_hint FROM tickets WHERE status = ?1 ORDER BY priority, created_at",
+            None => "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at, COALESCE(defer_count, 0), files_hint FROM tickets ORDER BY priority, created_at",
         };
         let mut stmt = self.conn.prepare(sql)?;
         let rows = if let Some(s) = status {
@@ -393,12 +387,65 @@ impl Db {
             "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2, rate_limit_retry_after = NULL
              WHERE id = ?3 AND status = 'pending' AND assignee IS NULL
                AND (rate_limit_retry_after IS NULL OR rate_limit_retry_after <= ?2)
-             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at",
+             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at,
+                       COALESCE(defer_count, 0), files_hint",
             params![agent_id, now, ticket_id],
             Self::row_to_ticket,
         ).optional()?;
         tx.commit()?;
         Ok(ticket)
+    }
+
+    /// Peek at the next pending ticket without claiming it.
+    /// Used by the manager for conflict detection before deciding to assign or defer.
+    pub fn peek_next_pending_ticket(&self) -> Result<Option<Ticket>> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.query_row(
+            "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at,
+                    COALESCE(defer_count, 0), files_hint
+             FROM tickets
+             WHERE status = 'pending' AND assignee IS NULL
+               AND (rate_limit_retry_after IS NULL OR rate_limit_retry_after <= ?1)
+             ORDER BY priority, created_at LIMIT 1",
+            params![now],
+            Self::row_to_ticket,
+        ).optional().map_err(Into::into)
+    }
+
+    /// Increment the defer_count for a ticket (called when conflict-deferred).
+    /// Returns the new defer_count.
+    pub fn increment_defer_count(&self, ticket_id: &str) -> Result<i32> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.query_row(
+            "UPDATE tickets SET defer_count = COALESCE(defer_count, 0) + 1, updated_at = ?2
+             WHERE id = ?1
+             RETURNING COALESCE(defer_count, 0)",
+            params![ticket_id, now],
+            |row| row.get(0),
+        ).map_err(Into::into)
+    }
+
+    /// Set the files_hint for a ticket (comma-separated file paths).
+    pub fn set_files_hint(&self, ticket_id: &str, hint: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE tickets SET files_hint = ?2, updated_at = ?3 WHERE id = ?1",
+            params![ticket_id, hint, now],
+        )?;
+        Ok(())
+    }
+
+    /// List tickets with defer_count >= min_defer_count (the "stuck" tickets).
+    pub fn list_stuck_tickets(&self, min_defer_count: i32) -> Result<Vec<Ticket>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at,
+                    COALESCE(defer_count, 0), files_hint
+             FROM tickets
+             WHERE COALESCE(defer_count, 0) >= ?1
+             ORDER BY defer_count DESC, priority, created_at",
+        )?;
+        let rows = stmt.query_map(params![min_defer_count], Self::row_to_ticket)?;
+        rows.map(|r| r.map_err(Into::into)).collect()
     }
 
     /// Create a ticket with an explicit ID (used in tests).
@@ -431,7 +478,8 @@ impl Db {
                    AND (rate_limit_retry_after IS NULL OR rate_limit_retry_after <= ?2)
                  ORDER BY priority, created_at LIMIT 1
              )
-             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at",
+             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at,
+                       COALESCE(defer_count, 0), files_hint",
             params![agent_id, now],
             Self::row_to_ticket,
         ).optional()?;
@@ -480,6 +528,8 @@ impl Db {
             notes: row.get(8)?,
             created_at: row.get(9)?,
             updated_at: row.get(10)?,
+            defer_count: row.get(11)?,
+            files_hint: row.get(12)?,
         })
     }
 
@@ -798,6 +848,32 @@ impl Db {
              FROM events ORDER BY id DESC LIMIT ?1"
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(Event {
+                id: row.get(0)?,
+                timestamp: row.get(1)?,
+                agent: row.get(2)?,
+                event_type: row.get(3)?,
+                detail: row.get(4)?,
+                tokens_used: row.get(5)?,
+                input_tokens: row.get(6)?,
+                output_tokens: row.get(7)?,
+                ticket_id: row.get(8)?,
+                model: row.get(9)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(Into::into)).collect()
+    }
+
+    /// Return events of a specific type, most recent first, up to `limit`.
+    pub fn list_recent_events_of_type(&self, event_type: &str, limit: usize) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, agent, event_type, detail, tokens_used, input_tokens, output_tokens, ticket_id, model
+             FROM events
+             WHERE event_type = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![event_type, limit as i64], |row| {
             Ok(Event {
                 id: row.get(0)?,
                 timestamp: row.get(1)?,
@@ -1137,7 +1213,8 @@ impl Db {
                    AND (t.rate_limit_retry_after IS NULL OR t.rate_limit_retry_after <= ?2)
                  ORDER BY t.priority, t.created_at LIMIT 1
              )
-             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at",
+             RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at,
+                       COALESCE(defer_count, 0), files_hint",
             params![agent_id, now, milestone_id],
             Self::row_to_ticket,
         ).optional()?;
@@ -1217,8 +1294,8 @@ impl Db {
     /// Tickets completed (status = 'completed') with updated_at >= since_rfc3339.
     pub fn tickets_completed_since(&self, since_rfc3339: &str) -> Result<Vec<Ticket>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at \
-             FROM tickets WHERE status = 'completed' AND updated_at >= ?1 ORDER BY updated_at DESC",
+            "SELECT id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at, \
+             COALESCE(defer_count, 0), files_hint FROM tickets WHERE status = 'completed' AND updated_at >= ?1 ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map(params![since_rfc3339], Self::row_to_ticket)?;
         rows.map(|r| r.map_err(Into::into)).collect()

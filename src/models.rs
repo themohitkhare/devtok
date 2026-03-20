@@ -13,6 +13,11 @@ pub struct Ticket {
     pub notes: String,
     pub created_at: String,
     pub updated_at: String,
+    /// How many times this ticket was deferred due to file conflicts with in-progress tickets.
+    #[serde(default)]
+    pub defer_count: i32,
+    /// Comma-separated list of file paths this ticket is expected to touch (for conflict detection).
+    pub files_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
