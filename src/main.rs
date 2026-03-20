@@ -30,7 +30,8 @@ fn main() -> ExitCode {
             backend,
             autoscale,
             min_workers,
-        } => cli::run::execute(workers, backend, autoscale, min_workers),
+            profile,
+        } => cli::run::execute(workers, backend, autoscale, min_workers, profile),
         cli::Commands::Health => cli::health::execute(),
         cli::Commands::Evolve {
             workers,
@@ -42,6 +43,7 @@ fn main() -> ExitCode {
             preserve_agents,
             dry_run,
             backend,
+            profile,
         } => cli::evolve::execute(
             workers,
             max_iterations,
@@ -52,6 +54,7 @@ fn main() -> ExitCode {
             preserve_agents,
             dry_run,
             backend,
+            profile,
         ),
         cli::Commands::Cleanup => cli::cleanup::execute(),
         cli::Commands::Restart {
@@ -75,7 +78,9 @@ fn main() -> ExitCode {
         cli::Commands::Approve => cli::approve::execute(),
         cli::Commands::Reject { reason } => cli::reject::execute(reason),
         cli::Commands::Quality(cmd) => cli::quality::execute(cmd),
-        cli::Commands::Update(args) => cli::update::execute(args),
+        cli::Commands::Standup { json, post_github } => {
+            cli::standup::execute(json, post_github)
+        }
     };
 
     match result {

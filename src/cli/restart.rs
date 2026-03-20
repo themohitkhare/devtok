@@ -23,7 +23,7 @@ pub fn execute(workers: Option<usize>, backend: Option<String>, wait_seconds: u6
             .unwrap_or_default()
     );
 
-    crate::cli::run::execute(workers, backend, false, 1)
+    crate::cli::run::execute(Some(workers), backend, false, 1, None)
 }
 
 pub fn stop_existing_if_any(acs_dir: &Path, wait_seconds: u64) -> Result<()> {

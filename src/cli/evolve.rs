@@ -14,7 +14,7 @@ use crate::worker;
 
 #[allow(clippy::too_many_arguments)]
 pub fn execute(
-    workers: usize,
+    workers: Option<usize>,
     max_iterations: usize,
     plan_each_iteration: bool,
     bootstrap_after_run: bool,
@@ -23,6 +23,7 @@ pub fn execute(
     preserve_agents: bool,
     dry_run: bool,
     backend: Option<String>,
+    profile: Option<String>,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     execute_with_dir(
@@ -58,7 +59,20 @@ fn execute_with_dir(
         .context("Expected `.acs/` to be inside a project directory")?
         .to_path_buf();
 
-    let config = Config::load(&acs_dir.join("config.toml"))?;
+    let mut config = Config::load(&acs_dir.join("config.toml"))?;
+
+    // Apply named profile: --profile flag > ACS_PROFILE env > default "dev" (if defined).
+    if let Some(name) = crate::cli::run::resolve_profile_name(profile.as_deref()) {
+        config.apply_profile(&name)?;
+    } else if config.profile.contains_key("dev") {
+        config.apply_profile("dev").ok();
+    }
+
+    // ANTHROPIC_MODEL env var overrides all claude model tiers.
+    config.apply_anthropic_model_env();
+
+    // --workers overrides the profile/config default.
+    let workers = workers.unwrap_or(config.project.default_workers);
     let db = Arc::new(Mutex::new(Db::open(&acs_dir.join("project.db"))?));
 
     if dry_run {

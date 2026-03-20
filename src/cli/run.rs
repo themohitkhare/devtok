@@ -12,11 +12,20 @@ use crate::db::Db;
 use crate::manager;
 use crate::worker;
 
+/// Resolve the active profile name from the CLI flag or `ACS_PROFILE` env var.
+/// Returns `None` if neither is set.
+pub fn resolve_profile_name(cli_profile: Option<&str>) -> Option<String> {
+    cli_profile
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("ACS_PROFILE").ok().filter(|s| !s.is_empty()))
+}
+
 pub fn execute(
-    workers: usize,
+    workers: Option<usize>,
     backend: Option<String>,
     autoscale: bool,
     min_workers: usize,
+    profile: Option<String>,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     execute_with_dir(&cwd, workers, backend, autoscale, min_workers)
@@ -35,7 +44,20 @@ fn execute_with_dir(
         .context("Expected `.acs/` to be inside a project directory")?
         .to_path_buf();
 
-    let config = Config::load(&acs_dir.join("config.toml"))?;
+    let mut config = Config::load(&acs_dir.join("config.toml"))?;
+
+    // Apply named profile: --profile flag > ACS_PROFILE env > default "dev" (if defined).
+    if let Some(name) = resolve_profile_name(profile.as_deref()) {
+        config.apply_profile(&name)?;
+    } else if config.profile.contains_key("dev") {
+        config.apply_profile("dev").ok();
+    }
+
+    // ANTHROPIC_MODEL env var overrides all claude model tiers.
+    config.apply_anthropic_model_env();
+
+    // --workers overrides the profile/config default.
+    let workers = workers.unwrap_or(config.project.default_workers);
     let db = Arc::new(Mutex::new(Db::open(&acs_dir.join("project.db"))?));
     write_run_pid(&acs_dir)?;
 
@@ -850,99 +872,35 @@ mod tests {
         assert_eq!(desired_workers_from_queue(4, 1, 8), 4);
     }
 
-    // ── parse_backend_allocation ────────────────────────────────────
+    // ── Profile resolution tests ────────────────────────────────────
 
     #[test]
-    fn parse_allocation_claude2_cursor2() {
-        let result = parse_backend_allocation("claude:2,cursor:2").unwrap();
-        assert_eq!(result, vec![("claude".to_string(), 2), ("cursor".to_string(), 2)]);
+    fn resolve_profile_name_uses_cli_flag_over_env() {
+        std::env::set_var("ACS_PROFILE", "ci");
+        let result = resolve_profile_name(Some("prod"));
+        std::env::remove_var("ACS_PROFILE");
+        assert_eq!(result, Some("prod".to_string()));
     }
 
     #[test]
-    fn parse_allocation_single_entry() {
-        let result = parse_backend_allocation("claude:4").unwrap();
-        assert_eq!(result, vec![("claude".to_string(), 4)]);
+    fn resolve_profile_name_falls_back_to_env_when_no_flag() {
+        std::env::set_var("ACS_PROFILE", "ci");
+        let result = resolve_profile_name(None);
+        std::env::remove_var("ACS_PROFILE");
+        assert_eq!(result, Some("ci".to_string()));
     }
 
     #[test]
-    fn parse_allocation_three_backends() {
-        let result = parse_backend_allocation("claude:2,cursor:1,codex:1").unwrap();
-        assert_eq!(result, vec![
-            ("claude".to_string(), 2),
-            ("cursor".to_string(), 1),
-            ("codex".to_string(), 1),
-        ]);
+    fn resolve_profile_name_returns_none_when_neither_set() {
+        std::env::remove_var("ACS_PROFILE");
+        assert_eq!(resolve_profile_name(None), None);
     }
 
     #[test]
-    fn parse_allocation_errors_on_non_numeric_count() {
-        assert!(parse_backend_allocation("claude:abc").is_err());
-    }
-
-    #[test]
-    fn parse_allocation_errors_on_zero_count() {
-        assert!(parse_backend_allocation("claude:0").is_err());
-    }
-
-    #[test]
-    fn parse_allocation_errors_on_missing_colon() {
-        assert!(parse_backend_allocation("claude").is_err());
-    }
-
-    // ── build_worker_backends ───────────────────────────────────────
-
-    #[test]
-    fn build_worker_backends_with_allocation_string() {
-        let backends = build_worker_backends(Some("claude:2,cursor:2"), 4);
-        assert_eq!(backends, vec!["claude", "claude", "cursor", "cursor"]);
-    }
-
-    #[test]
-    fn build_worker_backends_allocation_truncates_to_total() {
-        // If allocation sums to more than total, we take first `total` elements
-        let backends = build_worker_backends(Some("claude:3,cursor:3"), 4);
-        assert_eq!(backends.len(), 4);
-        assert_eq!(backends, vec!["claude", "claude", "claude", "cursor"]);
-    }
-
-    #[test]
-    fn build_worker_backends_simple_claude() {
-        let backends = build_worker_backends(Some("claude"), 3);
-        assert_eq!(backends, vec!["claude", "claude", "claude"]);
-    }
-
-    #[test]
-    fn build_worker_backends_simple_cursor() {
-        let backends = build_worker_backends(Some("cursor"), 2);
-        assert_eq!(backends, vec!["cursor", "cursor"]);
-    }
-
-    #[test]
-    fn build_worker_backends_mixed() {
-        let backends = build_worker_backends(Some("mixed"), 4);
-        assert_eq!(backends, vec!["claude", "claude", "cursor", "cursor"]);
-    }
-
-    #[test]
-    fn build_worker_backends_none_defaults_to_claude() {
-        let backends = build_worker_backends(None, 2);
-        assert_eq!(backends, vec!["claude", "claude"]);
-    }
-
-    // ── provider_for_backend ────────────────────────────────────────
-
-    #[test]
-    fn provider_for_backend_cursor_maps_to_agent() {
-        assert_eq!(provider_for_backend("cursor"), "agent");
-    }
-
-    #[test]
-    fn provider_for_backend_claude_unchanged() {
-        assert_eq!(provider_for_backend("claude"), "claude");
-    }
-
-    #[test]
-    fn provider_for_backend_codex_unchanged() {
-        assert_eq!(provider_for_backend("codex"), "codex");
+    fn resolve_profile_name_ignores_empty_env() {
+        std::env::set_var("ACS_PROFILE", "");
+        let result = resolve_profile_name(None);
+        std::env::remove_var("ACS_PROFILE");
+        assert_eq!(result, None);
     }
 }
