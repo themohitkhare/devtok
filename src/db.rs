@@ -167,6 +167,12 @@ impl Db {
             params![Self::CURRENT_SCHEMA_VERSION, now],
         )?;
 
+        // Additive migrations: rate-limit deferral columns for tickets.
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE tickets ADD COLUMN rate_limit_retry_after TEXT;
+             ALTER TABLE tickets ADD COLUMN rate_limit_strikes INTEGER NOT NULL DEFAULT 0;",
+        );
+
         Ok(())
     }
 
@@ -361,6 +367,88 @@ impl Db {
         ).optional()?;
         tx.commit()?;
         Ok(ticket)
+    }
+
+    /// Re-queue a ticket that was rate-limited by the API.
+    ///
+    /// `current_strikes` is the number of rate-limit strikes the ticket had
+    /// *before* this call; the function increments it by 1 and sets
+    /// `rate_limit_retry_after` to `now + backoff`, where the backoff schedule
+    /// is 30 → 60 → 120 → 240 seconds (capped at 240 s for strike 4+).
+    pub fn requeue_ticket_rate_limited(&self, id: &str, current_strikes: i32) -> Result<()> {
+        let backoff_secs: u64 = match current_strikes {
+            0 => 30,
+            1 => 60,
+            2 => 120,
+            _ => 240,
+        };
+        let retry_after = (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
+        let new_strikes = current_strikes + 1;
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE tickets SET status = 'pending', assignee = NULL,
+             rate_limit_retry_after = ?2, rate_limit_strikes = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![id, retry_after, new_strikes, now],
+        )?;
+        Ok(())
+    }
+
+    /// Return the `rate_limit_retry_after` timestamp for a ticket, if set.
+    pub fn get_ticket_rate_limit_retry_after(
+        &self,
+        id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let ts: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT rate_limit_retry_after FROM tickets WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        match ts {
+            None => Ok(None),
+            Some(s) => {
+                let dt = chrono::DateTime::parse_from_rfc3339(&s)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .map_err(|e| anyhow::anyhow!("invalid rate_limit_retry_after timestamp: {}", e))?;
+                Ok(Some(dt))
+            }
+        }
+    }
+
+    /// Return the `rate_limit_strikes` counter for a ticket.
+    pub fn get_ticket_rate_limit_strikes(&self, id: &str) -> Result<i32> {
+        let strikes: i32 = self
+            .conn
+            .query_row(
+                "SELECT rate_limit_strikes FROM tickets WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )?;
+        Ok(strikes)
+    }
+
+    /// Force-set the `rate_limit_retry_after` timestamp for a ticket (used in tests).
+    ///
+    /// Pass `None` to clear the field, or `Some(dt)` to set it to any arbitrary
+    /// timestamp — including one in the past — so tests can simulate an expired
+    /// retry window without sleeping.
+    #[cfg(test)]
+    pub fn force_set_rate_limit_retry_after(
+        &self,
+        id: &str,
+        retry_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let ts = retry_after.map(|dt| dt.to_rfc3339());
+        self.conn.execute(
+            "UPDATE tickets SET rate_limit_retry_after = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, ts, now],
+        )?;
+        Ok(())
     }
 
     pub fn count_by_status(&self) -> Result<Vec<(String, i64)>> {

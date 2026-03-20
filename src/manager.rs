@@ -2123,4 +2123,139 @@ mod tests {
             "payload should not include checkpoint_branch when no prior checkpoint exists"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // rate_limit_deferral: run_cycle skips tickets within their retry window
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn run_cycle_skips_rate_limited_ticket_with_future_retry_after() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            g.create_ticket("Rate limited task", "Should be deferred", "general", 1)
+                .unwrap();
+            g.requeue_ticket_rate_limited("t-001", 0).unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let ticket = g.get_ticket("t-001").unwrap().unwrap();
+        assert_eq!(
+            ticket.status, "pending",
+            "rate-limited ticket should not be claimed while retry_after is in the future"
+        );
+        assert!(
+            ticket.assignee.is_none(),
+            "deferred ticket must not be assigned to any worker"
+        );
+    }
+
+    #[test]
+    fn run_cycle_claims_ticket_after_rate_limit_window_expires() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            g.create_ticket("Rate limited task", "Window expired", "general", 1)
+                .unwrap();
+            let past = chrono::Utc::now() - chrono::Duration::seconds(60);
+            g.force_set_rate_limit_retry_after("t-001", Some(past))
+                .unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+
+        let g = db.lock().unwrap();
+        let ticket = g.get_ticket("t-001").unwrap().unwrap();
+        assert_eq!(
+            ticket.status, "in_progress",
+            "ticket should be claimed once the retry window has expired"
+        );
+        assert_eq!(
+            ticket.assignee.as_deref(),
+            Some("w-1"),
+            "ticket should be assigned to the idle worker"
+        );
+    }
+
+    #[test]
+    fn run_cycle_rate_limit_backoff_escalates_30_60_120_240_secs() {
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            g.create_ticket("Backoff test", "Test escalation", "general", 1)
+                .unwrap();
+        }
+
+        let expected_backoffs: &[(i32, u64)] = &[(0, 30), (1, 60), (2, 120), (3, 240)];
+
+        for &(current_strikes, expected_secs) in expected_backoffs {
+            let before = chrono::Utc::now();
+            {
+                let g = db.lock().unwrap();
+                g.requeue_ticket_rate_limited("t-001", current_strikes)
+                    .unwrap();
+            }
+            let after = chrono::Utc::now();
+
+            let retry_after = {
+                let g = db.lock().unwrap();
+                g.get_ticket_rate_limit_retry_after("t-001")
+                    .unwrap()
+                    .expect("retry_after should be set after requeue")
+            };
+            let lower = before + chrono::Duration::seconds(expected_secs as i64);
+            let upper = after + chrono::Duration::seconds(expected_secs as i64 + 1);
+            assert!(
+                retry_after >= lower && retry_after <= upper,
+                "strike {}: expected retry_after ~{}s from now, got {:?}",
+                current_strikes + 1,
+                expected_secs,
+                retry_after
+            );
+
+            let strikes = {
+                let g = db.lock().unwrap();
+                g.get_ticket_rate_limit_strikes("t-001").unwrap()
+            };
+            assert_eq!(strikes, current_strikes + 1);
+
+            run_cycle(&db, &config, std::path::Path::new("/tmp/test")).unwrap();
+            {
+                let g = db.lock().unwrap();
+                let t = g.get_ticket("t-001").unwrap().unwrap();
+                assert_eq!(
+                    t.status, "pending",
+                    "ticket should stay deferred within the {}s window (strike {})",
+                    expected_secs,
+                    current_strikes + 1
+                );
+            }
+        }
+
+        // Verify cap at 240 s for strike count beyond the schedule.
+        let before = chrono::Utc::now();
+        {
+            let g = db.lock().unwrap();
+            g.requeue_ticket_rate_limited("t-001", 4).unwrap();
+        }
+        let after = chrono::Utc::now();
+        let retry_after = {
+            let g = db.lock().unwrap();
+            g.get_ticket_rate_limit_retry_after("t-001")
+                .unwrap()
+                .expect("retry_after should be set")
+        };
+        let lower = before + chrono::Duration::seconds(240);
+        let upper = after + chrono::Duration::seconds(241);
+        assert!(
+            retry_after >= lower && retry_after <= upper,
+            "backoff should be capped at 240s for strike 5+, got {:?}",
+            retry_after
+        );
+    }
 }
