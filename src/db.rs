@@ -369,68 +369,6 @@ impl Db {
         Ok(ticket)
     }
 
-    /// Re-queue a ticket that was rate-limited by the API.
-    ///
-    /// `current_strikes` is the number of rate-limit strikes the ticket had
-    /// *before* this call; the function increments it by 1 and sets
-    /// `rate_limit_retry_after` to `now + backoff`, where the backoff schedule
-    /// is 30 → 60 → 120 → 240 seconds (capped at 240 s for strike 4+).
-    pub fn requeue_ticket_rate_limited(&self, id: &str, current_strikes: i32) -> Result<()> {
-        let backoff_secs: u64 = match current_strikes {
-            0 => 30,
-            1 => 60,
-            2 => 120,
-            _ => 240,
-        };
-        let retry_after = (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
-        let new_strikes = current_strikes + 1;
-        let now = Utc::now().to_rfc3339();
-        self.conn.execute(
-            "UPDATE tickets SET status = 'pending', assignee = NULL,
-             rate_limit_retry_after = ?2, rate_limit_strikes = ?3, updated_at = ?4
-             WHERE id = ?1",
-            params![id, retry_after, new_strikes, now],
-        )?;
-        Ok(())
-    }
-
-    /// Return the `rate_limit_retry_after` timestamp for a ticket, if set.
-    pub fn get_ticket_rate_limit_retry_after(
-        &self,
-        id: &str,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-        let ts: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT rate_limit_retry_after FROM tickets WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        match ts {
-            None => Ok(None),
-            Some(s) => {
-                let dt = chrono::DateTime::parse_from_rfc3339(&s)
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .map_err(|e| anyhow::anyhow!("invalid rate_limit_retry_after timestamp: {}", e))?;
-                Ok(Some(dt))
-            }
-        }
-    }
-
-    /// Return the `rate_limit_strikes` counter for a ticket.
-    pub fn get_ticket_rate_limit_strikes(&self, id: &str) -> Result<i32> {
-        let strikes: i32 = self
-            .conn
-            .query_row(
-                "SELECT rate_limit_strikes FROM tickets WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )?;
-        Ok(strikes)
-    }
-
     /// Force-set the `rate_limit_retry_after` timestamp for a ticket (used in tests).
     ///
     /// Pass `None` to clear the field, or `Some(dt)` to set it to any arbitrary
@@ -1167,6 +1105,57 @@ impl Db {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    /// Compute rolling throughput metrics over the last 60 minutes.
+    pub fn throughput_metrics(&self) -> Result<crate::models::ThroughputMetrics> {
+        let one_hour_ago = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+
+        // Tickets completed in the last hour
+        let tickets_per_hour: f64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'ticket_completed' AND timestamp >= ?1",
+            params![one_hour_ago],
+            |row| row.get::<_, i64>(0),
+        ).unwrap_or(0) as f64;
+
+        // Average tokens per completed ticket (all-time)
+        let (total_tokens, completed_count): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(tokens_used), 0), COUNT(*) FROM events WHERE event_type = 'ticket_completed'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap_or((0, 0));
+        let avg_tokens_per_ticket = if completed_count > 0 {
+            total_tokens as f64 / completed_count as f64
+        } else {
+            0.0
+        };
+
+        // Merge conflict rate and timeout rate (last hour)
+        let completions_hour: f64 = tickets_per_hour.max(1.0);
+        let conflicts: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'merge_conflict_requeued' AND timestamp >= ?1",
+            params![one_hour_ago],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        let timeouts: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type = 'ticket_requeued_stale_in_progress' AND timestamp >= ?1",
+            params![one_hour_ago],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        let pending_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tickets WHERE status = 'pending'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        Ok(crate::models::ThroughputMetrics {
+            tickets_per_hour,
+            avg_tokens_per_ticket,
+            merge_conflict_rate: conflicts as f64 / completions_hour,
+            timeout_rate: timeouts as f64 / completions_hour,
+            pending_count,
+        })
     }
 }
 
