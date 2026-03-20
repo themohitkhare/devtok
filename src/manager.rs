@@ -17,24 +17,39 @@ use crate::spawner::Spawner;
 ///
 /// This is used to enrich the `ticket_assignment` payload with immediate context.
 fn build_kb_context_entries(db: &Db, domain: &str) -> Vec<crate::models::KnowledgeEntry> {
-    let keys_to_fetch: &[(&str, &str)] = &[
-        // Domain-owned tech stack.
-        (domain, "stack"),
-        // Domain-owned API contracts (if present).
-        (domain, "api-contracts"),
-        // Cross-domain architecture/conventions for consistent implementation style.
+    let mut out = Vec::new();
+
+    // Domain-owned tech stack preferred; fall back to bootstrap-written general stack.
+    // This keeps worker prompts consistent even when `(<domain>, "stack")` entries
+    // haven't been created yet for a domain.
+    if let Ok(Some(entry)) = db.read_knowledge(domain, "stack") {
+        out.push(entry);
+    } else if let Ok(Some(general_stack)) = db.read_knowledge("general", "stack") {
+        out.push(KnowledgeEntry {
+            domain: domain.to_string(),
+            key: "stack".to_string(),
+            value: general_stack.value,
+            version: general_stack.version,
+            updated_at: general_stack.updated_at,
+        });
+    }
+
+    // Domain-owned API contracts (optional).
+    if let Ok(Some(entry)) = db.read_knowledge(domain, "api-contracts") {
+        out.push(entry);
+    }
+
+    // Cross-domain architecture/conventions for consistent implementation style.
+    for &(d, k) in &[
         ("general", "architecture"),
         ("general", "conventions"),
-        // Cross-domain API contracts (if present).
         ("architecture", "api-contracts"),
-    ];
-
-    let mut out = Vec::new();
-    for &(d, k) in keys_to_fetch {
+    ] {
         if let Ok(Some(entry)) = db.read_knowledge(d, k) {
             out.push(entry);
         }
     }
+
     out
 }
 
@@ -1435,6 +1450,24 @@ mod tests {
         assert!(ctx.contains("Node.js, Express"));
         assert!(!ctx.contains("general/architecture"));
         assert!(!ctx.contains("general/conventions"));
+    }
+
+    #[test]
+    fn build_kb_context_falls_back_to_general_stack_for_domain() {
+        let db = Db::open_memory().expect("in-memory db");
+        db.write_knowledge("general", "stack", "Rust, Axum")
+            .unwrap();
+
+        let ctx = build_kb_context(&db, "backend");
+        assert!(
+            ctx.contains("backend/stack"),
+            "should synthesize backend/stack from general/stack"
+        );
+        assert!(ctx.contains("Rust, Axum"), "should reuse general/stack value");
+        assert!(
+            !ctx.contains("general/stack"),
+            "should not include general/stack label directly"
+        );
     }
 
     #[test]
