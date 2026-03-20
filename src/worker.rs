@@ -3,9 +3,9 @@
 // Each worker runs as a tokio task, polling its inbox and spawning Claude Code
 // in a git worktree when it receives a ticket_assignment message.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -84,7 +84,10 @@ pub async fn worker_loop(
                 let _ = db.log_event(
                     Some(&worker_id),
                     "unknown_message",
-                    &format!("ignoring unknown msg_type '{}': {}", message.msg_type, message.payload),
+                    &format!(
+                        "ignoring unknown msg_type '{}': {}",
+                        message.msg_type, message.payload
+                    ),
                     None,
                 );
             }
@@ -97,13 +100,22 @@ async fn handle_ticket_assignment(
     payload: &str,
     db: &Arc<Mutex<Db>>,
     config: &Config,
-    project_dir: &PathBuf,
+    project_dir: &Path,
     shutdown: &mut watch::Receiver<bool>,
     forced_provider: Option<String>,
 ) -> Result<()> {
     let spawner = Spawner::new_with_agent_config(project_dir, &config.agents)
         .with_backends(config.backends.clone());
-    handle_ticket_with_spawner(&spawner, worker_id, payload, db, config, shutdown, forced_provider).await
+    handle_ticket_with_spawner(
+        &spawner,
+        worker_id,
+        payload,
+        db,
+        config,
+        shutdown,
+        forced_provider,
+    )
+    .await
 }
 
 async fn handle_ticket_with_spawner<S: SpawnProvider>(
@@ -141,7 +153,10 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    tracing_log(worker_id, &format!("received ticket_assignment for {}", ticket_id));
+    tracing_log(
+        worker_id,
+        &format!("received ticket_assignment for {}", ticket_id),
+    );
 
     // --- (b) Mark agent as working ---
     {
@@ -233,7 +248,10 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
     match result {
         // Timed out
         Err(_elapsed) => {
-            tracing_log(worker_id, &format!("ticket {} timed out, killing process", ticket_id));
+            tracing_log(
+                worker_id,
+                &format!("ticket {} timed out, killing process", ticket_id),
+            );
 
             // --- (4a) Kill process ---
             let _ = Spawner::kill_process(pid);
@@ -241,12 +259,21 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
             // --- (4b) Update DB ---
             {
                 let db = db.lock().unwrap();
-                db.update_ticket(&ticket_id, "blocked", Some("Worker timed out"), None, Some(None))?;
+                db.update_ticket(
+                    &ticket_id,
+                    "blocked",
+                    Some("Worker timed out"),
+                    None,
+                    Some(None),
+                )?;
                 db.update_agent(worker_id, "idle", None, None)?;
                 db.log_event(
                     Some(worker_id),
                     "ticket_timeout",
-                    &format!("ticket {} timed out after {} s", ticket_id, config.manager.worker_timeout_seconds),
+                    &format!(
+                        "ticket {} timed out after {} s",
+                        ticket_id, config.manager.worker_timeout_seconds
+                    ),
                     None,
                 )?;
             }
@@ -257,7 +284,13 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
 
         // spawn_blocking itself panicked — treat as crash
         Ok(Err(join_err)) => {
-            tracing_log(worker_id, &format!("spawn_blocking error for ticket {}: {}", ticket_id, join_err));
+            tracing_log(
+                worker_id,
+                &format!(
+                    "spawn_blocking error for ticket {}: {}",
+                    ticket_id, join_err
+                ),
+            );
             {
                 let db = db.lock().unwrap();
                 db.update_ticket(&ticket_id, "pending", None, None, Some(None))?;
@@ -265,7 +298,10 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
                 db.log_event(
                     Some(worker_id),
                     "ticket_crash",
-                    &format!("ticket {} spawn_blocking join error: {}", ticket_id, join_err),
+                    &format!(
+                        "ticket {} spawn_blocking join error: {}",
+                        ticket_id, join_err
+                    ),
                     None,
                 )?;
             }
@@ -277,12 +313,14 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
             match wait_result {
                 // --- (3) Normal exit (code 0) ---
                 Ok(status) if status.success() => {
-                    tracing_log(worker_id, &format!("ticket {} completed successfully", ticket_id));
+                    tracing_log(
+                        worker_id,
+                        &format!("ticket {} completed successfully", ticket_id),
+                    );
 
                     // --- (3a) Parse log file for token usage (best effort) ---
                     let (input_tokens, output_tokens) =
-                        parse_token_usage_from_log(&spawner.log_path(worker_id))
-                            .unwrap_or((0, 0));
+                        parse_token_usage_from_log(&spawner.log_path(worker_id)).unwrap_or((0, 0));
 
                     // --- (3b) Gate merge via `cargo test` (if Rust project) ---
                     // We run tests inside the worker's worktree before the manager merges.
@@ -291,6 +329,8 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
                     // --- (3b) Update DB ---
                     {
                         let db = db.lock().unwrap();
+                        // Clear any prior rate-limit state on successful completion.
+                        let _ = db.clear_ticket_rate_limit_state(&ticket_id);
                         // Record a verifiable KB entry as proof that the worker finished.
                         // This makes it possible to validate "KB entries increase during acs run"
                         // even when the underlying model does not explicitly perform KB writes.
@@ -337,12 +377,45 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
                     let _ = spawner.remove_worktree(worker_id);
                 }
 
-                // --- (5) Non-zero exit (crash) ---
+                // --- (5) Non-zero exit (crash or rate-limit) ---
                 Ok(status) => {
                     let code = status.code().unwrap_or(-1);
-                    tracing_log(worker_id, &format!("ticket {} exited with code {}", ticket_id, code));
+                    tracing_log(
+                        worker_id,
+                        &format!("ticket {} exited with code {}", ticket_id, code),
+                    );
 
-                    {
+                    let log_path = spawner.log_path(worker_id);
+                    if detect_rate_limit_in_log(&log_path) {
+                        // Rate-limit detected — re-queue with exponential backoff
+                        let strikes = {
+                            let db = db.lock().unwrap();
+                            db.get_ticket_rate_limit_strikes(&ticket_id).unwrap_or(0)
+                        };
+                        {
+                            let db = db.lock().unwrap();
+                            db.requeue_ticket_rate_limited(&ticket_id, strikes)?;
+                            db.update_agent(worker_id, "idle", None, None)?;
+                            db.log_event(
+                                Some(worker_id),
+                                "claude_rate_limited",
+                                &format!(
+                                    "ticket {} rate-limited (strike {}), backoff applied",
+                                    ticket_id,
+                                    strikes + 1
+                                ),
+                                None,
+                            )?;
+                        }
+                        tracing_log(
+                            worker_id,
+                            &format!(
+                                "ticket {} rate-limited (strike {}), re-queued with backoff",
+                                ticket_id,
+                                strikes + 1
+                            ),
+                        );
+                    } else {
                         let db = db.lock().unwrap();
                         // Re-enqueue: set back to pending and clear assignee
                         db.update_ticket(&ticket_id, "pending", None, None, Some(None))?;
@@ -360,7 +433,10 @@ async fn handle_ticket_with_spawner<S: SpawnProvider>(
 
                 // wait() itself returned an IO error
                 Err(io_err) => {
-                    tracing_log(worker_id, &format!("wait() error for ticket {}: {}", ticket_id, io_err));
+                    tracing_log(
+                        worker_id,
+                        &format!("wait() error for ticket {}: {}", ticket_id, io_err),
+                    );
 
                     {
                         let db = db.lock().unwrap();
@@ -425,7 +501,17 @@ fn tracing_log(worker_id: &str, msg: &str) {
     eprintln!("[worker:{}] {}", worker_id, msg);
 }
 
-fn run_cargo_tests_if_rust_project(worktree: &PathBuf) -> Option<bool> {
+/// Scan the worker log file for rate-limit signals.
+///
+/// Returns `true` if any line contains the string `"rate_limit"` or `"429"`.
+pub fn detect_rate_limit_in_log(log_path: &std::path::Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(log_path) else {
+        return false;
+    };
+    contents.contains("rate_limit") || contents.contains("429")
+}
+
+fn run_cargo_tests_if_rust_project(worktree: &Path) -> Option<bool> {
     // If this doesn't look like a Rust project, we don't enforce tests.
     if !worktree.join("Cargo.toml").is_file() {
         return Some(true);
@@ -441,7 +527,11 @@ fn run_cargo_tests_if_rust_project(worktree: &PathBuf) -> Option<bool> {
     Some(output.status.success())
 }
 
-fn select_provider_for_ticket(agents: &crate::config::AgentConfig, worker_id: &str, ticket_id: &str) -> String {
+fn select_provider_for_ticket(
+    agents: &crate::config::AgentConfig,
+    worker_id: &str,
+    ticket_id: &str,
+) -> String {
     let mut order = agents.providers.clone();
     if order.is_empty() {
         order.push("claude".to_string());
@@ -483,6 +573,8 @@ mod tests {
         Crash,
         /// Spawns `sleep 60` — hangs until killed or timeout fires.
         Hang,
+        /// Exits non-zero; log contains a rate-limit signal.
+        RateLimited,
     }
 
     struct MockSpawner {
@@ -492,7 +584,10 @@ mod tests {
 
     impl MockSpawner {
         fn new(behavior: MockBehavior) -> Self {
-            MockSpawner { dir: TempDir::new().unwrap(), behavior }
+            MockSpawner {
+                dir: TempDir::new().unwrap(),
+                behavior,
+            }
         }
     }
 
@@ -511,7 +606,7 @@ mod tests {
             &self,
             _provider: &str,
             _model: Option<&str>,
-            _worker_id: &str,
+            worker_id: &str,
             _worktree: &Path,
             _prompt: &str,
             _system_prompt: &str,
@@ -520,6 +615,13 @@ mod tests {
                 MockBehavior::Success => Command::new("true").spawn()?,
                 MockBehavior::Crash => Command::new("false").spawn()?,
                 MockBehavior::Hang => Command::new("sleep").arg("60").spawn()?,
+                MockBehavior::RateLimited => {
+                    // Write rate-limit signal to the log file before spawning the exit process
+                    let log = self.dir.path().join(format!("{}.log", worker_id));
+                    std::fs::write(&log, "Error: 429 Too Many Requests rate_limit exceeded\n")
+                        .unwrap();
+                    Command::new("false").spawn()?
+                }
             };
             Ok(child)
         }
@@ -544,7 +646,6 @@ mod tests {
         cfg
     }
 
-
     fn ticket_payload(ticket_id: &str) -> String {
         serde_json::json!({
             "ticket_id": ticket_id,
@@ -565,7 +666,8 @@ mod tests {
         // Simulate the manager pushing a ticket_assignment into the worker's inbox
         {
             let db = db.lock().unwrap();
-            db.push_inbox("w-test", "ticket_assignment", &payload, "mgr").unwrap();
+            db.push_inbox("w-test", "ticket_assignment", &payload, "mgr")
+                .unwrap();
         }
 
         // Simulate what worker_loop does: pop inbox, dispatch to handler
@@ -601,7 +703,11 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "handle_ticket_with_spawner should succeed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "handle_ticket_with_spawner should succeed: {:?}",
+            result
+        );
 
         // Agent should have been set to idle after completion
         let agents = db.lock().unwrap().list_agents().unwrap();
@@ -681,7 +787,9 @@ mod tests {
         );
 
         let entry = entry.unwrap();
-        assert!(entry.value.contains(&format!("\"ticket_id\":\"{}\"", ticket_id)));
+        assert!(entry
+            .value
+            .contains(&format!("\"ticket_id\":\"{}\"", ticket_id)));
         assert!(entry.value.contains("\"tests_passed\":true"));
         assert!(entry.value.contains("\"work_type\":\"claude\""));
     }
@@ -749,7 +857,10 @@ mod tests {
         // A ticket_timeout event should have been logged
         let events = db.lock().unwrap().recent_events(10).unwrap();
         let timeout_event = events.iter().find(|e| e.event_type == "ticket_timeout");
-        assert!(timeout_event.is_some(), "expected ticket_timeout event in log");
+        assert!(
+            timeout_event.is_some(),
+            "expected ticket_timeout event in log"
+        );
 
         // Agent should be idle after timeout cleanup
         let agents = db.lock().unwrap().list_agents().unwrap();
@@ -759,5 +870,180 @@ mod tests {
         // No ticket_completed pushed to mgr
         let msg = db.lock().unwrap().pop_inbox("mgr").unwrap();
         assert!(msg.is_none(), "mgr inbox should be empty after timeout");
+    }
+
+    // ── Rate-limit detection ──────────────────────────────────────────
+
+    #[test]
+    fn rate_limit_detected_from_log_with_rate_limit_keyword() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("w-test.log");
+        std::fs::write(&log, "some output\nrate_limit exceeded\nmore output\n").unwrap();
+        assert!(detect_rate_limit_in_log(&log));
+    }
+
+    #[test]
+    fn rate_limit_detected_from_log_with_429_status_code() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("w-test.log");
+        std::fs::write(&log, "HTTP/1.1 429 Too Many Requests\n").unwrap();
+        assert!(detect_rate_limit_in_log(&log));
+    }
+
+    #[test]
+    fn no_rate_limit_detected_from_clean_log() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("w-test.log");
+        std::fs::write(&log, "ticket completed successfully\n").unwrap();
+        assert!(!detect_rate_limit_in_log(&log));
+    }
+
+    #[test]
+    fn no_rate_limit_detected_when_log_absent() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("no-such.log");
+        assert!(!detect_rate_limit_in_log(&log));
+    }
+
+    // ── Rate-limit re-queue flow ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn rate_limited_exit_requeues_ticket_with_rate_limited_note() {
+        let db = make_db();
+        {
+            let db = db.lock().unwrap();
+            db.create_ticket_with_id("t-rl", "RL Test", "desc", "general", 1).unwrap();
+        }
+        let config = make_config(30);
+        let spawner = MockSpawner::new(MockBehavior::RateLimited);
+        let (_tx, shutdown_rx) = watch::channel(false);
+        let mut shutdown_rx = shutdown_rx;
+
+        handle_ticket_with_spawner(
+            &spawner,
+            "w-test",
+            &ticket_payload("t-rl"),
+            &db,
+            &config,
+            &mut shutdown_rx,
+            Some("claude".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let ticket = db.lock().unwrap().get_ticket("t-rl").unwrap().unwrap();
+        assert_eq!(ticket.status, "pending");
+        assert!(
+            ticket.notes.contains("rate_limited"),
+            "notes should contain 'rate_limited', got: {:?}",
+            ticket.notes
+        );
+
+        let events = db.lock().unwrap().recent_events(10).unwrap();
+        let rl_event = events.iter().find(|e| e.event_type == "claude_rate_limited");
+        assert!(rl_event.is_some(), "expected claude_rate_limited event");
+
+        let agents = db.lock().unwrap().list_agents().unwrap();
+        let agent = agents.iter().find(|a| a.id == "w-test").unwrap();
+        assert_eq!(agent.status, "idle");
+
+        let msg = db.lock().unwrap().pop_inbox("mgr").unwrap();
+        assert!(msg.is_none(), "mgr inbox should be empty after rate-limit");
+    }
+
+    #[tokio::test]
+    async fn backoff_escalates_on_repeated_rate_limit_strikes() {
+        let db = make_db();
+        {
+            let db = db.lock().unwrap();
+            db.create_ticket_with_id("t-backoff", "Backoff Test", "desc", "general", 1).unwrap();
+        }
+        let config = make_config(30);
+
+        let mut prev_retry: Option<chrono::DateTime<chrono::Utc>> = None;
+        for strike in 1..=3u32 {
+            let spawner = MockSpawner::new(MockBehavior::RateLimited);
+            let (_tx, shutdown_rx) = watch::channel(false);
+            let mut shutdown_rx = shutdown_rx;
+            handle_ticket_with_spawner(
+                &spawner,
+                "w-test",
+                &ticket_payload("t-backoff"),
+                &db,
+                &config,
+                &mut shutdown_rx,
+                Some("claude".to_string()),
+            )
+            .await
+            .unwrap();
+
+            let strikes_in_db = db.lock().unwrap().get_ticket_rate_limit_strikes("t-backoff").unwrap();
+            assert_eq!(strikes_in_db, strike as i32, "strikes should be {} after {} failures", strike, strike);
+
+            let retry_after = db.lock().unwrap().get_ticket_rate_limit_retry_after("t-backoff").unwrap();
+            assert!(retry_after.is_some(), "retry_after should be set after strike {}", strike);
+            let retry_ts = retry_after.unwrap();
+            if let Some(prev) = prev_retry {
+                assert!(retry_ts > prev, "retry_after should increase with each strike");
+            }
+            prev_retry = Some(retry_ts);
+
+            // Reset ticket status to pending so the next iteration can process it again
+            {
+                let db = db.lock().unwrap();
+                db.update_ticket("t-backoff", "pending", None, None, Some(None)).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_skips_rate_limited_ticket_with_future_retry_after() {
+        let db = make_db();
+        {
+            let db = db.lock().unwrap();
+            db.create_ticket_with_id("t-skip", "Skip Test", "desc", "general", 1).unwrap();
+            db.requeue_ticket_rate_limited("t-skip", 1).unwrap();
+        }
+
+        let claimed = db.lock().unwrap().claim_next_ticket("w-other").unwrap();
+        assert!(
+            claimed.is_none() || claimed.as_ref().map(|t| t.id.as_str()) != Some("t-skip"),
+            "claim_next_ticket should skip rate-limited ticket"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_completion_clears_rate_limit_state() {
+        let db = make_db();
+        {
+            let db = db.lock().unwrap();
+            db.create_ticket_with_id("t-clear", "Clear Test", "desc", "general", 1).unwrap();
+            db.requeue_ticket_rate_limited("t-clear", 2).unwrap();
+            // Reset to pending so the worker can process it
+            db.update_ticket("t-clear", "pending", None, None, Some(None)).unwrap();
+        }
+
+        let config = make_config(30);
+        let spawner = MockSpawner::new(MockBehavior::Success);
+        let (_tx, shutdown_rx) = watch::channel(false);
+        let mut shutdown_rx = shutdown_rx;
+
+        handle_ticket_with_spawner(
+            &spawner,
+            "w-test",
+            &ticket_payload("t-clear"),
+            &db,
+            &config,
+            &mut shutdown_rx,
+            Some("claude".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let strikes = db.lock().unwrap().get_ticket_rate_limit_strikes("t-clear").unwrap();
+        assert_eq!(strikes, 0, "rate_limit_strikes should be cleared after success");
+
+        let retry_after = db.lock().unwrap().get_ticket_rate_limit_retry_after("t-clear").unwrap();
+        assert!(retry_after.is_none(), "rate_limit_retry_after should be cleared after success");
     }
 }

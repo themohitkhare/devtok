@@ -120,13 +120,19 @@ impl Db {
             );"
         )?;
 
-        // Additive migrations: add new columns to existing events tables.
+        // Additive migrations: add new columns to existing tables.
         // SQLite returns an error when the column already exists; we ignore it.
         let _ = self.conn.execute_batch(
             "ALTER TABLE events ADD COLUMN input_tokens INTEGER DEFAULT 0;
              ALTER TABLE events ADD COLUMN output_tokens INTEGER DEFAULT 0;
              ALTER TABLE events ADD COLUMN ticket_id TEXT;
              ALTER TABLE events ADD COLUMN model TEXT;",
+        );
+
+        // Rate-limit tracking columns on tickets.
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE tickets ADD COLUMN rate_limit_strikes INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE tickets ADD COLUMN rate_limit_retry_after TEXT;",
         );
 
         Ok(())
@@ -229,12 +235,94 @@ impl Db {
         Ok(())
     }
 
+    /// Re-queue a ticket as pending with exponential backoff after a rate-limit error.
+    ///
+    /// Backoff schedule (capped at 240 s): 30 s → 60 s → 120 s → 240 s.
+    /// `current_strikes` is the strike count *before* this call; the method increments it.
+    pub fn requeue_ticket_rate_limited(&self, id: &str, current_strikes: i32) -> Result<()> {
+        let new_strikes = current_strikes + 1;
+        // Backoff: 30 * 2^(strikes-1), capped at 240 s
+        let backoff_secs: u64 = (30u64 * (1u64 << (new_strikes - 1).min(3))).min(240);
+        let retry_after = (Utc::now() + chrono::Duration::seconds(backoff_secs as i64)).to_rfc3339();
+        let notes = format!("rate_limited:{}", retry_after);
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE tickets SET status = 'pending', notes = ?2, rate_limit_strikes = ?3, rate_limit_retry_after = ?4, assignee = NULL, updated_at = ?5 WHERE id = ?1",
+            params![id, notes, new_strikes, retry_after, now],
+        )?;
+        Ok(())
+    }
+
+    /// Clear rate-limit state after a ticket completes or is unblocked normally.
+    pub fn clear_ticket_rate_limit_state(&self, id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE tickets SET rate_limit_strikes = 0, rate_limit_retry_after = NULL, updated_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the current rate-limit strike count for a ticket.
+    pub fn get_ticket_rate_limit_strikes(&self, id: &str) -> Result<i32> {
+        self.conn.query_row(
+            "SELECT COALESCE(rate_limit_strikes, 0) FROM tickets WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        ).map_err(Into::into)
+    }
+
+    /// Returns the rate_limit_retry_after timestamp for a ticket, if set.
+    pub fn get_ticket_rate_limit_retry_after(
+        &self,
+        id: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let ts: Option<String> = self.conn.query_row(
+            "SELECT rate_limit_retry_after FROM tickets WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        ).optional()?.flatten();
+        match ts {
+            None => Ok(None),
+            Some(s) => {
+                let dt = chrono::DateTime::parse_from_rfc3339(&s)
+                    .map(|d| d.with_timezone(&chrono::Utc))
+                    .map_err(|e| anyhow::anyhow!("invalid retry_after timestamp: {}", e))?;
+                Ok(Some(dt))
+            }
+        }
+    }
+
+    /// Create a ticket with an explicit ID (used in tests).
+    #[cfg(test)]
+    pub fn create_ticket_with_id(
+        &self,
+        id: &str,
+        title: &str,
+        desc: &str,
+        domain: &str,
+        priority: i32,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO tickets (id, title, description, domain, priority, status, notes, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', '', ?6, ?6)",
+            params![id, title, desc, domain, priority, now],
+        )?;
+        Ok(())
+    }
+
     pub fn claim_next_ticket(&self, agent_id: &str) -> Result<Option<Ticket>> {
         let now = Utc::now().to_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
         let ticket: Option<Ticket> = tx.query_row(
-            "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2
-             WHERE id = (SELECT id FROM tickets WHERE status = 'pending' AND assignee IS NULL ORDER BY priority, created_at LIMIT 1)
+            "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2, rate_limit_retry_after = NULL
+             WHERE id = (
+                 SELECT id FROM tickets
+                 WHERE status = 'pending' AND assignee IS NULL
+                   AND (rate_limit_retry_after IS NULL OR rate_limit_retry_after <= ?2)
+                 ORDER BY priority, created_at LIMIT 1
+             )
              RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at",
             params![agent_id, now],
             Self::row_to_ticket,
@@ -523,6 +611,7 @@ impl Db {
     }
 
     /// Log an event with detailed token breakdown (input/output separate) and ticket/model metadata.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_token_event(
         &self,
         agent: Option<&str>,
@@ -865,11 +954,12 @@ impl Db {
         let now = Utc::now().to_rfc3339();
         let tx = self.conn.unchecked_transaction()?;
         let ticket: Option<Ticket> = tx.query_row(
-            "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2
+            "UPDATE tickets SET status = 'in_progress', assignee = ?1, updated_at = ?2, rate_limit_retry_after = NULL
              WHERE id = (
                  SELECT t.id FROM tickets t
                  JOIN milestone_tickets mt ON t.id = mt.ticket_id
                  WHERE t.status = 'pending' AND t.assignee IS NULL AND mt.milestone_id = ?3
+                   AND (t.rate_limit_retry_after IS NULL OR t.rate_limit_retry_after <= ?2)
                  ORDER BY t.priority, t.created_at LIMIT 1
              )
              RETURNING id, title, description, domain, priority, status, assignee, blocked_by, notes, created_at, updated_at",
@@ -920,7 +1010,7 @@ impl Db {
                  FROM quality_scores
                  WHERE ticket_id = ?1",
                 params![ticket_id],
-                |row| Self::row_to_quality_score(row),
+                Self::row_to_quality_score,
             )
             .optional()
             .map_err(Into::into)
@@ -932,7 +1022,7 @@ impl Db {
              FROM quality_scores
              ORDER BY computed_at DESC, ticket_id ASC",
         )?;
-        let rows = stmt.query_map([], |row| Self::row_to_quality_score(row))?;
+        let rows = stmt.query_map([], Self::row_to_quality_score)?;
         rows.map(|r| r.map_err(Into::into)).collect()
     }
 
