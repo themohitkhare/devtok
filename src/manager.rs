@@ -855,13 +855,13 @@ fn run_cycle(db: &Arc<Mutex<Db>>, config: &Config, project_dir: &std::path::Path
             };
 
             // Iterate pending candidates in priority order; skip conflicting tickets.
+            // Note: we do NOT filter by assignee here — a pending ticket with a stale
+            // assignee (e.g. from a killed evolve run) is still available for assignment.
+            // claim_ticket_by_id uses an atomic UPDATE...WHERE status='pending' to
+            // safely handle any concurrent claims.
             let candidates: Vec<Ticket> = {
                 let guard = db.lock().unwrap();
-                guard
-                    .list_tickets(Some("pending"))?
-                    .into_iter()
-                    .filter(|t| t.assignee.is_none())
-                    .collect()
+                guard.list_tickets(Some("pending"))?.into_iter().collect()
             };
 
             let mut ticket_opt: Option<Ticket> = None;
@@ -1489,6 +1489,43 @@ mod tests {
         assert_eq!(t2.status, "in_progress");
         // Each ticket should have a different assignee
         assert_ne!(t1.assignee, t2.assignee);
+    }
+
+    #[test]
+    fn claim_and_assign_stale_assignee_pending_ticket_still_assigned() {
+        // Regression test for t-093: when evolve is killed mid-run, pending tickets
+        // retain their assignee field. The manager must still assign them to idle workers.
+        let (db, config) = setup();
+        {
+            let g = db.lock().unwrap();
+            g.register_agent("w-1", "worker", "backend-dev").unwrap();
+            g.create_ticket("Stale Task", "Do it", "general", 1)
+                .unwrap();
+            // Simulate a stale assignee: ticket is pending but retains an old assignee value
+            // (as happens when evolve is killed mid-run before clearing the assignee).
+            g.update_ticket(
+                "t-001",
+                "pending",
+                None,
+                None,
+                Some(Some("w-old-killed")),
+            )
+            .unwrap();
+        }
+
+        run_cycle(&db, &config, std::path::Path::new("/tmp/test"), false).unwrap();
+
+        let g = db.lock().unwrap();
+        let ticket = g.get_ticket("t-001").unwrap().unwrap();
+        assert_eq!(
+            ticket.status, "in_progress",
+            "pending ticket with stale assignee must be claimed by idle worker"
+        );
+        assert_eq!(
+            ticket.assignee.as_deref(),
+            Some("w-1"),
+            "ticket must be assigned to the new idle worker, overwriting the stale assignee"
+        );
     }
 
     #[test]
